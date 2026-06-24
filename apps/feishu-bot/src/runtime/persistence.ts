@@ -259,30 +259,58 @@ export const jsonFileBackend = <V>(
 };
 
 /**
- * Persistent map of Feishu `chat_id` → t3code `ThreadId`.
+ * How a chat became bound to its thread.
+ *
+ * - `"self-created"`: the bot minted the thread on first contact
+ *   (deterministic id from `chatId`; see `bridge/chatThreadMap.deriveThreadId`).
+ * - `"resumed"`: an operator/user took over a thread that another end created,
+ *   via `/resume` (M2a). The thread id is *not* derived from `chatId` in this
+ *   case, so the origin must be persisted to drive recovery decisions.
+ */
+export type ChatBindingOrigin = "self-created" | "resumed";
+
+/**
+ * The *current* binding for a Feishu chat (M2a).
+ *
+ * M1 stored a bare {@link ThreadId} per chat. M2a promotes this to a mutable
+ * "current binding" record so a chat can be re-pointed at a different thread
+ * (`/resume` taking over another end's thread) and so the binding `origin`
+ * survives a restart. The JSON value is this object; legacy bare-string values
+ * are migrated on load (see {@link loadBackedMap}).
+ */
+export interface ChatBinding {
+  /** The t3code thread this chat is currently bound to. */
+  readonly threadId: ThreadId;
+  /** How the binding was established (drives recovery; see {@link ChatBindingOrigin}). */
+  readonly origin: ChatBindingOrigin;
+}
+
+/**
+ * Persistent map of Feishu `chat_id` → current {@link ChatBinding}.
  *
  * The first message from a chat creates a thread and records the binding here;
  * every later message re-uses it, which is what makes the conversation a true
  * shared session across restarts. Keyed by `chat_id` (Feishu private chats are
- * 1:1, so one chat ↔ one thread in M1).
+ * 1:1, so one chat ↔ one binding). M2a stores the full {@link ChatBinding}
+ * (threadId + origin), migrating M1's bare-`ThreadId` JSON on load.
  */
 export class ChatThreadMapStore extends Context.Service<
   ChatThreadMapStore,
   {
-    /** Resolve the thread bound to `chatId`, if any. */
+    /** Resolve the binding for `chatId`, if any. */
     readonly get: (
       chatId: string,
-    ) => Effect.Effect<Option.Option<ThreadId>, FeishuBotPersistenceError>;
-    /** Bind `chatId` to `threadId` (overwrites any existing binding). */
+    ) => Effect.Effect<Option.Option<ChatBinding>, FeishuBotPersistenceError>;
+    /** Bind `chatId` to `binding` (overwrites any existing binding). */
     readonly put: (
       chatId: string,
-      threadId: ThreadId,
+      binding: ChatBinding,
     ) => Effect.Effect<void, FeishuBotPersistenceError>;
     /** Drop the binding for `chatId` (no-op if absent). */
     readonly remove: (chatId: string) => Effect.Effect<void, FeishuBotPersistenceError>;
-    /** Snapshot every `[chatId, threadId]` binding (e.g. for warm-up logging). */
+    /** Snapshot every `[chatId, binding]` pair (e.g. for warm-up logging). */
     readonly entries: Effect.Effect<
-      ReadonlyArray<readonly [string, ThreadId]>,
+      ReadonlyArray<readonly [string, ChatBinding]>,
       FeishuBotPersistenceError
     >;
   }
@@ -310,18 +338,52 @@ export class SentCommandStore extends Context.Service<
  * Build an in-memory map hydrated from `backend` plus a `persist` effect that
  * snapshots the current map back through `backend.save`. Shared construction
  * for the concrete stores below: each mutation updates the map then persists.
+ *
+ * `normalize` runs on every loaded value before it enters the in-memory map,
+ * which is how a store migrates an older on-disk shape forward (e.g. M1's bare
+ * `ThreadId` string → M2a's {@link ChatBinding} object — see
+ * {@link chatThreadMapStoreLayer}). The backend is typed at the *new* value
+ * shape `V`; `normalize` receives the raw loaded value as `unknown` so it can
+ * discriminate legacy vs. current encodings. Omit it for stores whose on-disk
+ * shape has never changed (identity).
  */
-const loadBackedMap = <V>(backend: PersistenceBackend<V>) =>
+const loadBackedMap = <V>(
+  backend: PersistenceBackend<V>,
+  normalize: (raw: unknown) => V = (raw) => raw as V,
+) =>
   Effect.gen(function* () {
     const initial = yield* backend.load;
-    const map = new Map<string, V>(Object.entries(initial));
+    const map = new Map<string, V>(
+      Object.entries(initial).map(([key, value]) => [key, normalize(value)]),
+    );
     const persist = Effect.suspend(() => backend.save(Object.fromEntries(map)));
     return { map, persist } as const;
   });
 
 /**
+ * Migrate a raw on-disk binding value forward to the current {@link ChatBinding}
+ * shape. M1 persisted a bare `ThreadId` string per chat; M2a persists the full
+ * object. A legacy string is read as a `self-created` binding (the only origin
+ * M1 ever produced); a current object is narrowed to the two live fields
+ * (`threadId`, `origin`), dropping any extraneous keys an older M2a build may
+ * have written (e.g. the now-removed `lastSequence`). Pure; runs once per entry
+ * at load time.
+ */
+const migrateChatBinding = (raw: unknown): ChatBinding => {
+  if (typeof raw === "string") {
+    return { threadId: raw as ThreadId, origin: "self-created" };
+  }
+  const binding = raw as ChatBinding;
+  return { threadId: binding.threadId, origin: binding.origin };
+};
+
+/**
  * {@link ChatThreadMapStore} layer backed by a JSON file at
  * `<stateDir>/chat-thread-map.json` (override the full path via `filePath`).
+ *
+ * Loads both M1 (bare-`ThreadId` string) and M2a ({@link ChatBinding} object)
+ * on-disk shapes via {@link migrateChatBinding}; the first mutation rewrites the
+ * file in the M2a shape (atomic tmp+rename, as for every store here).
  */
 export const chatThreadMapStoreLayer = (options: {
   readonly stateDir: string;
@@ -333,13 +395,13 @@ export const chatThreadMapStoreLayer = (options: {
       const fs = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
       const file = options.filePath ?? path.join(options.stateDir, "chat-thread-map.json");
-      const backend = jsonFileBackend<ThreadId>(file, { fs, path });
-      const { map, persist } = yield* loadBackedMap(backend);
+      const backend = jsonFileBackend<ChatBinding>(file, { fs, path });
+      const { map, persist } = yield* loadBackedMap(backend, migrateChatBinding);
       return ChatThreadMapStore.of({
         get: (chatId) => Effect.sync(() => Option.fromUndefinedOr(map.get(chatId))),
-        put: (chatId, threadId) =>
+        put: (chatId, binding) =>
           Effect.suspend(() => {
-            map.set(chatId, threadId);
+            map.set(chatId, binding);
             return persist;
           }),
         remove: (chatId) =>
@@ -350,7 +412,7 @@ export const chatThreadMapStoreLayer = (options: {
             return persist;
           }),
         entries: Effect.sync(
-          () => Array.from(map.entries()) as ReadonlyArray<readonly [string, ThreadId]>,
+          () => Array.from(map.entries()) as ReadonlyArray<readonly [string, ChatBinding]>,
         ),
       });
     }),

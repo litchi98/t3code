@@ -45,7 +45,7 @@ import * as Stream from "effect/Stream";
 import type { FeishuBotConfig } from "./config.ts";
 import { resolveEnvironment, type ResolvedEnvironment } from "./auth.ts";
 import { connectionLayer } from "./runtime/connection.ts";
-import { ChatThreadMapStore, fileStoresLayer, SentCommandStore } from "./runtime/persistence.ts";
+import { fileStoresLayer, SentCommandStore } from "./runtime/persistence.ts";
 import { LarkGateway } from "./lark/index.ts";
 import { larkGatewayLayer } from "./lark/channel.ts";
 import type { BridgeHandlers, InboundMessage } from "./lark/types.ts";
@@ -55,6 +55,11 @@ import { renderThreadCard } from "./bridge/eventRenderer.ts";
 import { observeThread, type ThreadObservation } from "./bridge/session.ts";
 import { type MergedDispatch, TurnQueue, turnQueueLayer } from "./bridge/turnQueue.ts";
 import { OutboundQueue, outboundQueueLayer } from "./bridge/outbound.ts";
+import { BindingState, bindingStateLayer } from "./bridge/bindingState.ts";
+import { runShellCacheFiber, shellStatus } from "./bridge/shellCache.ts";
+import { runShellWatcherFiber } from "./bridge/shellWatcher.ts";
+import { tryHandleCommand } from "./bridge/commands/registry.ts";
+import { buildCommandTable } from "./bridge/commands/handlers.ts";
 
 /**
  * How long to wait for the first shell snapshot (i.e. a healthy, authenticated
@@ -270,10 +275,16 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
   Effect.gen(function* () {
     const registry = yield* EnvironmentRegistry;
     const gateway = yield* LarkGateway;
-    const chatThreadMap = yield* ChatThreadMapStore;
     const sent = yield* SentCommandStore;
     const outbound = yield* OutboundQueue;
     const turnQueue = yield* TurnQueue;
+    // M2a: the mutable chat↔thread binding view (in-memory, store-backed). This
+    // is now the single source of truth for "which thread backs this chat" — it
+    // replaces the M1 direct `ChatThreadMapStore` reads on the bridge hot path
+    // (ensureThread / turnQueue.threadIdFor / warm-up / reconnect). The durable
+    // `ChatThreadMapStore` remains the backend behind it (`bindings.bind`/`unbind`
+    // mirror writes through), provided to `bindingStateLayer` in `program`.
+    const bindings = yield* BindingState;
     const environmentId = resolved.target.environmentId;
 
     yield* Console.log(`[feishu-bot] connected to ${resolved.target.label} (${environmentId}).`);
@@ -438,6 +449,93 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         );
       });
 
+    // ── M2a: resident shell cache + reverse-notification watcher ─────────────
+    //
+    // Subscribe to the environment shell on a *fresh* `followStream` — NOT the
+    // `shellStream` discovery used above, which was truncated by `Stream.take(1)`
+    // and would never deliver further frames. `followStream` replays a full
+    // snapshot first and never fails (orDie'd), and `runShellCacheFiber` folds it
+    // into the resident `ShellSnapshotCache` via the SAME shell reducer the
+    // web/mobile clients use. Forked on `runBridge`'s scope, so it tears down
+    // with the connection (same lifetime as the inbox/flush fibers below).
+    const shellSubscription = registry
+      .followStream(
+        environmentId,
+        EnvironmentRpc.subscribe(ORCHESTRATION_WS_METHODS.subscribeShell, {}),
+      )
+      .pipe(Stream.orDie);
+    const shellCache = yield* runShellCacheFiber({ shellStream: shellSubscription });
+
+    // Mirror-light: a `/resume` takeover (or a self-created first contact) does
+    // not start a resident per-thread observe fiber. `startMirror` re-binds the
+    // chat as `origin: "resumed"` and pushes a single, one-off "已接管" snapshot
+    // card summarising the thread's current shell state; live streaming only
+    // resumes when the user sends the next message (the normal turn path).
+    const startMirror = (chatId: string, threadId: ThreadId): Effect.Effect<void> =>
+      Effect.gen(function* () {
+        yield* bindings.bind(chatId, { threadId, origin: "resumed" });
+        const shell = yield* shellCache.threadById(threadId);
+        const title = shell?.title ?? threadId;
+        // Map the shared `shellStatus` classifier to this card's Chinese line, so
+        // the takeover card and the `/status` tag stay in lock-step on one split.
+        const statusLine = {
+          running: "状态: 运行中",
+          "pending-approval": "状态: 有待批准操作",
+          idle: "状态: 空闲",
+          unknown: "(状态未知)",
+        }[shellStatus(shell)];
+        yield* sendNotice(
+          chatId,
+          [
+            `已接管会话: ${title}`,
+            statusLine,
+            // The shell view carries no message history; the takeover card is a
+            // status snapshot only. Be honest that full history lives elsewhere
+            // (rich in-card history is M2b's card v2, not this milestone).
+            "(完整历史请见终端/Web)",
+            "发送消息即可继续这个会话;/status 查看状态,/release 退出。",
+          ].join("\n"),
+        );
+      });
+
+    // Mirror-light teardown: no resident observe fiber to interrupt, so this is a
+    // no-op. The candidate cache lives inside `buildCommandTable`'s closure and is
+    // self-pruning (re-validated on use), so there is nothing to clear here. Kept
+    // as a hook for symmetry with `/release` and the watcher's reconciliation.
+    const stopMirror = (_chatId: string): Effect.Effect<void> => Effect.void;
+
+    // Read-only probe: is the chat busy (a turn running OR coalescing pending)?
+    // Used by `/resume` to refuse a re-bind while a turn is in flight *or* about
+    // to dispatch (the idle merge window). Reads the turn queue's busy view.
+    const isChatBusy = (chatId: string): Effect.Effect<boolean> => turnQueue.isBusy(chatId);
+
+    // Reverse-notification + reconciliation watcher. One fiber folding the shared
+    // `shellCache.changes`: it reconciles dangling bindings (thread deleted /
+    // archived elsewhere → unbind + notice) and surfaces key blind-spot events
+    // (new pending approval / failed/interrupted turn) for `origin: "resumed"`
+    // takeovers that are not live-mirroring. Forked on `runBridge`'s scope.
+    // Created before the command table so `/release` can clear a thread's dedup
+    // memory via the returned handle (the discrete unbind lifecycle reset).
+    const shellWatcher = yield* runShellWatcherFiber({
+      shellCache,
+      bindings,
+      stopMirror,
+      sendNotice,
+    });
+
+    // The slash-command table (`/help`, `/status`, `/resume`, `/release`). All
+    // deps are already-total effects (captured service values + the mirror hooks
+    // above), so every handler slots into the table as `Effect.Effect<void>`.
+    const commandTable = buildCommandTable({
+      sendNotice,
+      bindings,
+      shellCache,
+      startMirror,
+      stopMirror,
+      clearNoticeMemory: shellWatcher.clearNoticeMemory,
+      isChatBusy,
+    });
+
     // Capture a runtime that forks effects into a scoped FiberSet. This is the
     // edge between the SDK's plain `void` callbacks and the Effect world: the
     // callback offers to a queue, and a forked consumer drains it. Forked fibers
@@ -587,14 +685,13 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
      */
     type OfflineStrategy = (params: {
       readonly chatId: string;
-      readonly threadId: ThreadId;
       readonly dispatch: MergedDispatch;
       readonly feishuMessageId: string;
     }) => Effect.Effect<void, OfflineRetry>;
 
     const offlineRetry: OfflineStrategy = () => Effect.fail(new OfflineRetry());
 
-    const offlineBuffer: OfflineStrategy = ({ chatId, threadId, dispatch, feishuMessageId }) =>
+    const offlineBuffer: OfflineStrategy = ({ chatId, dispatch, feishuMessageId }) =>
       Effect.gen(function* () {
         yield* Console.log(
           `[feishu-bot] environment offline; queued turn for chat ${chatId} (⏳).`,
@@ -602,10 +699,11 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         // Buffer the full turn: on reconnect the flush re-runs `runTurn` with the
         // `offlineRetry` strategy, so a mid-flush re-drop fails the intent (keeping
         // it + its ⏳) rather than self-enqueuing under the `offlineBuffer` path.
+        // The turn target rides in `dispatch.resolvedThreadId` (B1).
         yield* outbound.enqueue({
           commandId: dispatch.commandId,
           feishuMessageId,
-          run: runTurn(chatId, threadId, dispatch, offlineRetry),
+          run: runTurn(chatId, dispatch, offlineRetry),
         });
       });
 
@@ -651,11 +749,23 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
      */
     const runTurn = (
       chatId: string,
-      threadId: ThreadId,
       dispatch: MergedDispatch,
       onOffline: OfflineStrategy,
     ): Effect.Effect<void, OfflineRetry> =>
       Effect.gen(function* () {
+        // Single source of truth for *this* turn's target (B1 re-bind TOCTOU fix).
+        // The dispatch carries the threadId resolved at the same instant its
+        // commandId was derived (`turnQueue` → `mergeMessages`); we dispatch and
+        // observe against *that* exact value. `runTurn` deliberately takes NO
+        // separate threadId argument — the caller (`handleInbound`) used to pass a
+        // threadId captured back at `ensureThread`, which a concurrent `/resume`
+        // re-bind could have made stale, leaving the commandId's embedded threadId
+        // and the turn's real target pointing at different threads. By driving
+        // both from the dispatch's own resolution, they are one and the same by
+        // construction and cannot drift. With no concurrent re-bind this equals
+        // the thread `ensureThread` ensured exists.
+        const target = dispatch.resolvedThreadId;
+
         // The held follow-up the settle drained (if any). Written by the in-lock
         // settle finalizer; read by the out-of-lock chain finalizer below. A Ref
         // (not a closure result) because the settle runs inside an `onExit`
@@ -685,10 +795,12 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
               return;
             }
 
-            // Subscribe BEFORE dispatching (M0-verified ordering trap).
-            const observation = yield* observeThread(threadId, { subscribe: subscribeThread });
+            // Subscribe BEFORE dispatching (M0-verified ordering trap). Observe
+            // the dispatch's own resolved target so card/observer follow exactly
+            // what the commandId encodes (B1).
+            const observation = yield* observeThread(target, { subscribe: subscribeThread });
 
-            const turnStart = yield* buildTurnStart(threadId, dispatch);
+            const turnStart = yield* buildTurnStart(target, dispatch);
 
             // Attempt the dispatch. If the environment is unavailable / not yet
             // connected (M8), hand off to `onOffline` (buffer live / retry on
@@ -707,16 +819,14 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
               Effect.orDie,
             );
             if (!dispatched) {
-              yield* onOffline({ chatId, threadId, dispatch, feishuMessageId: triggerMessageId });
+              yield* onOffline({ chatId, dispatch, feishuMessageId: triggerMessageId });
               return;
             }
             // Record the dispatch as sent (M9) so a later replay/flush short-circuits.
             yield* sent.add(dispatch.commandId).pipe(Effect.ignore);
-            yield* Console.log(
-              `[feishu-bot] started turn on thread ${threadId} for chat ${chatId}.`,
-            );
+            yield* Console.log(`[feishu-bot] started turn on thread ${target} for chat ${chatId}.`);
 
-            yield* driveTurn(chatId, threadId, observation);
+            yield* driveTurn(chatId, target, observation);
           }).pipe(
             // Per-turn scope: tears down the thread subscription + card update
             // fiber on this turn's exit (inside the lock so teardown completes
@@ -762,7 +872,9 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
               Effect.flatMap((next) =>
                 next === null
                   ? Effect.void
-                  : runTurn(chatId, threadId, next, offlineBuffer).pipe(Effect.ignore),
+                  : // The follow-up carries its own freshly-resolved threadId (from
+                    // `onTurnComplete`'s merge); `runTurn` dispatches against that (B1).
+                    runTurn(chatId, next, offlineBuffer).pipe(Effect.ignore),
               ),
             ),
           ),
@@ -790,12 +902,13 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
      */
     const ensureThread = (message: InboundMessage): Effect.Effect<ThreadId> =>
       Effect.gen(function* () {
-        const existing = yield* chatThreadMap.get(message.chatId).pipe(
-          Effect.map((option) => (Option.isSome(option) ? option.value : null)),
-          Effect.orElseSucceed(() => null),
-        );
+        // M2a: resolve the chat's *current* binding from the in-memory authority
+        // (BindingState), not the store directly. A `/resume` takeover may have
+        // re-pointed this chat at another end's thread (origin "resumed"); either
+        // origin is honoured here by using the binding's threadId verbatim.
+        const existing = yield* bindings.get(message.chatId);
         if (existing !== null) {
-          return existing;
+          return existing.threadId;
         }
 
         // First contact. Derive the deterministic threadId up front so both the
@@ -852,15 +965,15 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
                 worktreePath: null,
               }),
             ).pipe(
+              // Bind through the in-memory authority (BindingState), which also
+              // mirrors the write to the durable store and absorbs a persist
+              // failure (logged, not propagated) — so the create flush stays
+              // total and the next message resolves the binding from memory.
               Effect.andThen(
-                chatThreadMap.put(message.chatId, threadId).pipe(
-                  Effect.tapError((error) =>
-                    Console.error(
-                      `[feishu-bot] thread created but binding persist failed for chat ${message.chatId}: ${error.message}`,
-                    ),
-                  ),
-                  Effect.ignore,
-                ),
+                bindings.bind(message.chatId, {
+                  threadId,
+                  origin: "self-created",
+                }),
               ),
             ),
           });
@@ -882,7 +995,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
           modelSelection,
           dispatch: runOnEnv,
           generateThreadId: genId(ThreadId),
-        }).pipe(Effect.provideService(ChatThreadMapStore, chatThreadMap), Effect.exit);
+        }).pipe(Effect.provideService(BindingState, bindings), Effect.exit);
 
         if (ensuredExit._tag === "Failure") {
           yield* Effect.logWarning(
@@ -927,22 +1040,40 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
           return;
         }
 
+        // M2a command routing: a `/…` message is a control command, NOT a prompt.
+        // Route it BEFORE `ensureThread` so commands work on an unbound chat
+        // (`/help`, `/resume` listing candidates) without auto-creating a thread.
+        // A known command is fully handled; a `/`-prefixed miss gets a help hint;
+        // a non-command falls through to the normal turn path.
+        const outcome = yield* tryHandleCommand(message, commandTable);
+        if (outcome.handled) {
+          if (outcome.unknownCommand !== undefined) {
+            yield* sendNotice(message.chatId, "未知命令,/help 查看可用命令。");
+          }
+          return;
+        }
+
         // Ensure the chat↔thread binding FIRST (serialised) so the queue resolves
         // the real threadId when it merges — the stable commandId triple includes
         // the threadId, so offering before binding would derive the wrong id.
-        // Always yields a (deterministic) threadId; a brand-new offline chat gets
-        // its create + this turn buffered for the reconnect flush.
-        const threadId = yield* ensureThread(message).pipe(ensureLock.withPermits(1));
+        // We run `ensureThread` purely for its build-thread side effect (first
+        // contact: create + bind, or buffer offline); the turn's actual target is
+        // NOT taken from here but from the merged dispatch's own resolution (B1),
+        // so a concurrent `/resume` re-bind between here and the offer cannot make
+        // the dispatch target and its commandId disagree.
+        yield* ensureThread(message).pipe(ensureLock.withPermits(1));
 
         // `offer` blocks for the idle coalescing window; concurrent offers for
         // the same chat collapse via the generation-debounce into one dispatch.
+        // The returned merge carries `resolvedThreadId` — resolved at the same
+        // instant its commandId was — which `runTurn` dispatches against.
         const merged = yield* turnQueue.offer(message.chatId, message);
         if (merged === null) {
           return; // Coalesced into a peer offer, or held during a running turn.
         }
         // Live path: `offlineBuffer` buffers (succeeds) rather than signalling a
         // retry, so `OfflineRetry` is unreachable here — treat it as a defect.
-        yield* runTurn(message.chatId, threadId, merged, offlineBuffer).pipe(Effect.orDie);
+        yield* runTurn(message.chatId, merged, offlineBuffer).pipe(Effect.orDie);
       });
 
     // Consumer: fork one handler per message so the queue's idle-window coalesce
@@ -991,7 +1122,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     // prompt, not just a console line. Best-effort and bounded: notices are sent
     // serially and individually swallowed (`sendNotice` already logs failures).
     const notifyReconnect: Effect.Effect<void> = Effect.gen(function* () {
-      const entries = yield* chatThreadMap.entries.pipe(Effect.orElseSucceed(() => []));
+      const entries = yield* bindings.entries;
       yield* Console.log(
         `[feishu-bot] feishu websocket reconnected; prompting ${entries.length} known chat(s) to resend.`,
       );
@@ -1030,9 +1161,9 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     yield* gateway.connect(handlers).pipe(Effect.orDie);
     yield* Console.log("[feishu-bot] ready — listening for private-chat messages.");
 
-    // `chatThreadMap.entries` is a useful warm-up log of restored bindings.
-    const bindings = yield* chatThreadMap.entries.pipe(Effect.orElseSucceed(() => []));
-    yield* Console.log(`[feishu-bot] restored ${bindings.length} chat binding(s).`);
+    // Warm-up log of restored bindings (read from the in-memory authority).
+    const restored = yield* bindings.entries;
+    yield* Console.log(`[feishu-bot] restored ${restored.length} chat binding(s).`);
 
     // Resident: keep the scope (connection, subscriptions, fibers) open forever.
     return yield* Effect.never;
@@ -1051,24 +1182,37 @@ export const program = (
   Effect.gen(function* () {
     const resolved = yield* resolveEnvironment(config);
 
-    // Lark gateway, durable stores, and the two bridge queues are provided here.
-    // `turnQueueLayer` needs a `threadIdFor` lookup; bind it to the persistent
-    // chat→thread map (the chat is always bound before the queue dispatches).
-    const baseLayer = Layer.mergeAll(
-      connectionLayer({ target: resolved.target, accessToken: resolved.accessToken }),
-      fileStoresLayer({ stateDir: config.stateDir }),
-      larkGatewayLayer(config.feishu),
+    // Lark gateway and the durable stores. `bindingStateLayer` is the in-memory
+    // binding authority the bridge + queue both read from; it requires the
+    // `ChatThreadMapStore` that `fileStoresLayer` provides, so `provideMerge` it
+    // *with* the store set below it (the store is fed to it and both outputs are
+    // retained, so `ChatThreadMapStore` does not leak into the program's RIn).
+    const baseLayer = bindingStateLayer.pipe(
+      Layer.provideMerge(
+        Layer.mergeAll(
+          connectionLayer({ target: resolved.target, accessToken: resolved.accessToken }),
+          fileStoresLayer({ stateDir: config.stateDir }),
+          larkGatewayLayer(config.feishu),
+        ),
+      ),
     );
 
     const queuesLayer = Layer.merge(
       outboundQueueLayer,
       // The queue needs the bound threadId to derive a merged dispatch's stable
-      // commandId. That threadId is *deterministic* from the chatId
-      // (`deriveThreadId`) — the same value the persistent binding holds — so the
-      // queue resolves it purely, with no store dependency and, crucially, with no
-      // dependence on whether the binding has been persisted yet (a brand-new chat
-      // buffered while offline still gets the correct commandId).
-      turnQueueLayer((chatId) => Effect.sync(() => deriveThreadId(chatId))),
+      // commandId. M2a: resolve it from `BindingState` so a `/resume` takeover
+      // (which points the chat at a non-derived thread, origin "resumed") gets the
+      // *right* threadId in its commandId triple — and so this lookup, `ensureThread`,
+      // and the `runTurn` dispatch all read the SAME authority with the SAME
+      // `deriveThreadId` fallback (the highest-priority M2a invariant). A
+      // not-yet-bound chat (brand-new / offline-buffered) falls back to the
+      // deterministic `deriveThreadId`, matching `ensureThread`'s own derivation.
+      turnQueueLayer((chatId) =>
+        BindingState.pipe(
+          Effect.flatMap((bindingState) => bindingState.get(chatId)),
+          Effect.map((binding) => binding?.threadId ?? deriveThreadId(chatId)),
+        ),
+      ),
     ).pipe(Layer.provideMerge(baseLayer));
 
     return yield* runBridge(config, resolved).pipe(Effect.provide(queuesLayer), Effect.scoped);

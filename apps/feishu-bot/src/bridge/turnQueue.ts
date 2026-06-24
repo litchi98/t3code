@@ -55,6 +55,17 @@ export interface MergedDispatch {
   readonly prompt: string;
   /** Stable commandId for the merged dispatch. */
   readonly commandId: CommandId;
+  /**
+   * The bound threadId resolved at the *same instant* the {@link commandId} above
+   * was derived (the single `resolveThreadId(chatId)` call inside the merge). The
+   * dispatcher MUST dispatch and observe this turn against this exact value — not
+   * a threadId captured earlier/elsewhere — so the commandId's embedded threadId
+   * and the turn's actual target are, by construction, one and the same. This
+   * closes the `/resume` re-bind TOCTOU: if a takeover re-points the chat between
+   * an earlier capture and this merge, both the commandId and the dispatch follow
+   * *this* resolution together, never drifting apart.
+   */
+  readonly resolvedThreadId: ThreadId;
   /** The source messages folded into this dispatch (for receipts/diagnostics). */
   readonly sources: ReadonlyArray<QueuedMessage>;
 }
@@ -152,6 +163,18 @@ export class TurnQueue extends Context.Service<
       chatId: string,
       token: TurnToken,
     ) => Effect.Effect<MergedDispatch | null>;
+    /**
+     * Read-only: whether the chat is *busy* — a turn owns the running slot
+     * (`running`) **or** messages are coalescing in the idle merge window
+     * (`pending` non-empty). The pending case is the M2a re-bind TOCTOU window:
+     * `offer` has accepted a message and is sleeping out the ~600ms coalescing
+     * window but has not yet dispatched, so a `running`-only check would miss it
+     * even though a dispatch is imminent. The command layer refuses a `/resume`
+     * re-bind while busy (running *or* pending), so a re-point can never
+     * interleave with an in-flight or about-to-dispatch turn. Never mutates the
+     * queue's accounting.
+     */
+    readonly isBusy: (chatId: string) => Effect.Effect<boolean>;
   }
 >()("@t3tools/feishu-bot/bridge/turnQueue") {}
 
@@ -180,18 +203,23 @@ const mergeMessages = (
     message,
     commandId: deriveCommandId(chatId, threadId, message.messageId),
   }));
-  return { prompt, commandId, sources };
+  // Carry the *same* `threadId` that keyed the commandId, so the dispatcher
+  // targets exactly what the commandId encodes (single source of truth).
+  return { prompt, commandId, resolvedThreadId: threadId, sources };
 };
 
 /**
  * Build the {@link TurnQueue} layer.
  *
  * @param threadIdFor Resolve the bound threadId for a chat (the commandId triple
- *   needs it). Integrate binds this to a `ChatThreadMapStore.get`-backed lookup;
- *   the chat is always bound by the time the queue dispatches (the bridge
- *   ensures the thread before offering). The lookup's own requirements `RIn`
- *   (e.g. the store) become the layer's requirements and are captured once at
- *   build time, so the service methods stay total.
+ *   needs it). Integrate binds this to a `BindingState.get(chatId)`-backed
+ *   lookup, falling back to `deriveThreadId(chatId)` when the chat is not yet
+ *   bound (brand-new / offline-buffered) — the SAME authority and SAME
+ *   deterministic fallback `ensureThread` and the `runTurn` dispatch use, so the
+ *   commandId's embedded threadId and the turn's actual dispatch target are one
+ *   and the same (the highest-priority M2a invariant). The lookup's own
+ *   requirements `RIn` (e.g. `BindingState`) become the layer's requirements and
+ *   are captured once at build time, so the service methods stay total.
  */
 export const turnQueueLayer = <RIn>(
   threadIdFor: (chatId: string) => Effect.Effect<ThreadId, never, RIn>,
@@ -350,6 +378,18 @@ export const turnQueueLayer = <RIn>(
           return mergeMessages(chatId, threadId, drained);
         });
 
-      return TurnQueue.of({ offer, beginTurn, onTurnComplete });
+      // Read-only point query: is the chat busy (running OR coalescing pending)?
+      // Covers the idle-merge window where a dispatch is queued but not yet
+      // running — a `running`-only check would miss the re-bind TOCTOU. Never
+      // mutates.
+      const isBusy = (chatId: string): Effect.Effect<boolean> =>
+        Ref.get(states).pipe(
+          Effect.map((map) => {
+            const state = map.get(chatId);
+            return state !== undefined && (state.running || state.pending.length > 0);
+          }),
+        );
+
+      return TurnQueue.of({ offer, beginTurn, onTurnComplete, isBusy });
     }),
   );

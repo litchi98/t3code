@@ -55,6 +55,12 @@ export interface InboundAttachment {
 export interface InboundMessage {
   /** Feishu chat id; the stable key for the chat↔thread binding. */
   readonly chatId: string;
+  /**
+   * Feishu chat type (`"p2p"` private chat, `"group"`, `"topic"`, …). Passed
+   * through from the SDK so the M3 group-chat seam can route on it; M2a still
+   * only admits `p2p` (the gate is {@link lark/channel.acceptChatType}).
+   */
+  readonly chatType: string;
   /** Feishu message id; pairs with `fileKey` to download resources, and feeds
    *  the stable commandId derivation. */
   readonly messageId: string;

@@ -1,16 +1,19 @@
 /**
- * Chat ↔ thread binding (M1).
+ * Chat ↔ thread binding (M1, M2a).
  *
  * Resolves the t3code thread that backs a Feishu chat, creating one (and
- * persisting the binding via {@link ChatThreadMapStore}) on the chat's first
- * message. This is what makes the conversation a true shared session: a
- * returning chat re-uses its thread across restarts.
+ * recording the binding via {@link BindingState}) on the chat's first message.
+ * This is what makes the conversation a true shared session: a returning chat
+ * re-uses its thread across restarts.
  *
- * The store interface lives in `runtime/persistence.ts`; the `createThread`
- * dispatch is injected via {@link EnsureThreadDeps} so this module stays
- * decoupled from the registry's service shape. The `ThreadId` itself is derived
- * deterministically from the `chatId` ({@link deriveThreadId}) so first-contact
- * creation is idempotent across retries (see {@link ensureThreadForChat}).
+ * M2a: reads/writes the binding through {@link BindingState} (the in-memory
+ * authority, mirrored to the durable `ChatThreadMapStore`) rather than the store
+ * directly, so the bridge has a single source of truth for "which thread backs
+ * this chat". The `createThread` dispatch is injected via {@link EnsureThreadDeps}
+ * so this module stays decoupled from the registry's service shape. The
+ * `ThreadId` itself is derived deterministically from the `chatId`
+ * ({@link deriveThreadId}) so first-contact creation is idempotent across retries
+ * (see {@link ensureThreadForChat}).
  */
 import * as NodeCrypto from "node:crypto";
 
@@ -22,9 +25,8 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
-import * as Option from "effect/Option";
 
-import { ChatThreadMapStore, type FeishuBotPersistenceError } from "../runtime/persistence.ts";
+import { BindingState } from "./bindingState.ts";
 import { deriveCommandId } from "./commandId.ts";
 import type { EnsuredThread } from "./types.ts";
 import type { InboundMessage } from "../lark/types.ts";
@@ -87,28 +89,34 @@ export interface EnsureThreadDeps {
  * `chatId → threadId` binding before returning `{ created: true }`.
  *
  * Why deterministic: the binding is written *after* the create dispatch, so a
- * `store.put` failure (or a crash) between the two leaves no persisted binding.
- * With a random id, the chat's *next* message would mint a fresh id and create a
- * *second*, orphaned thread (unstable create commandId ⇒ no server dedup). With
- * a derived id, the retry rebuilds the *identical* `threadId` and create
- * commandId, so the server's commandReceipt store recognises the duplicate and
- * returns the original thread instead of creating another.
+ * `bind` persist failure (or a crash) between the two leaves no persisted
+ * binding. With a random id, the chat's *next* message would mint a fresh id and
+ * create a *second*, orphaned thread (unstable create commandId ⇒ no server
+ * dedup). With a derived id, the retry rebuilds the *identical* `threadId` and
+ * create commandId, so the server's commandReceipt store recognises the
+ * duplicate and returns the original thread instead of creating another.
  *
- * The `put` failure is *not* swallowed: it stays in the `FeishuBotPersistenceError`
- * channel so the caller logs/alerts (and the user can resend — safely, thanks to
- * the deterministic id + idempotent create).
+ * M2a: the binding is recorded through {@link BindingState} (the in-memory
+ * authority, mirrored to the durable store). `bind` absorbs a persist failure
+ * (logs, does not propagate), so this effect is total — the deterministic id +
+ * idempotent create make a lost persist self-heal on the next message.
  */
 export const ensureThreadForChat = (
   chatId: string,
   message: InboundMessage,
   deps: EnsureThreadDeps,
-): Effect.Effect<EnsuredThread, FeishuBotPersistenceError, ChatThreadMapStore> =>
+): Effect.Effect<EnsuredThread, never, BindingState> =>
   Effect.gen(function* () {
-    const store = yield* ChatThreadMapStore;
+    // M2a: read/write the chat↔thread binding through the in-memory authority
+    // (BindingState) rather than the durable store directly. `get` is total and
+    // returns the full `ChatBinding`; `bind` mirrors the write to the store and
+    // absorbs a persist failure (logged, not propagated), so this effect is
+    // total. A self-create records the binding with origin `"self-created"`.
+    const bindings = yield* BindingState;
 
-    const existing = yield* store.get(chatId);
-    if (Option.isSome(existing)) {
-      return { threadId: existing.value, created: false } satisfies EnsuredThread;
+    const existing = yield* bindings.get(chatId);
+    if (existing !== null) {
+      return { threadId: existing.threadId, created: false } satisfies EnsuredThread;
     }
 
     // Deterministic from `chatId` so a retried first contact rebuilds the same
@@ -139,10 +147,11 @@ export const ensureThreadForChat = (
       }),
     );
 
-    // Surface a persist failure (do NOT collapse to `none`): the binding write
-    // failed, so the next message must be able to re-derive + re-create safely.
-    // Kept in the error channel for the caller to log/alert.
-    yield* store.put(chatId, threadId);
+    // Record the binding in the in-memory authority (mirrored to the store).
+    // `bind` absorbs a persist failure (logged, not propagated): the deterministic
+    // threadId + stable create commandId make a re-create idempotent, so a lost
+    // persist self-heals on the next message rather than orphaning a thread.
+    yield* bindings.bind(chatId, { threadId, origin: "self-created" });
     return { threadId, created: true } satisfies EnsuredThread;
   });
 

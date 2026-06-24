@@ -58,6 +58,15 @@ const SOURCE_TAG = "t3tools-feishu-bot";
 const HANDSHAKE_TIMEOUT_MS = 30_000;
 
 /**
+ * Single admission point for inbound chat types (M3 group-chat seam).
+ *
+ * M2a only drives 1:1 private chats, so this admits `"p2p"` and nothing else.
+ * The M3 group-chat work flips the gate here (e.g. also admit `"group"`) without
+ * touching the handler wiring — the `message` callback routes solely on this.
+ */
+const acceptChatType = (chatType: string): boolean => chatType === "p2p";
+
+/**
  * Wrap an SDK Promise call, tagging any rejection as a {@link LarkGatewayError}.
  * The SDK rejects with `LarkChannelError` (carrying a `code`), which we carry
  * verbatim as `cause` so callers can inspect it if needed.
@@ -86,6 +95,7 @@ const normalizeInbound = (message: NormalizedMessage): InboundMessage => {
 
   return {
     chatId: message.chatId,
+    chatType: message.chatType,
     messageId: message.messageId,
     senderId: message.senderId,
     text: message.content,
@@ -149,7 +159,8 @@ export const larkGatewayLayer = (config: FeishuAppConfig): Layer.Layer<LarkGatew
           yield* Effect.sync(() =>
             channel.on({
               message: (message) => {
-                if (message.chatType !== "p2p") {
+                // Single admission point (M3 seam): M2a still admits only p2p.
+                if (!acceptChatType(message.chatType)) {
                   return;
                 }
                 handlers.onInboundMessage(normalizeInbound(message));
