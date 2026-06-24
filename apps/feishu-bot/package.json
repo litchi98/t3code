@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@effect/platform-node": "catalog:",
+    "@larksuite/channel": "^0.2.0",
     "@noble/curves": "catalog:",
     "@t3tools/client-runtime": "workspace:*",
     "@t3tools/contracts": "workspace:*",

@@ -2,11 +2,11 @@ import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 
 /**
- * Runtime configuration for the headless feishu-bot M0 client.
+ * Runtime configuration for the headless feishu-bot client.
  *
  * All inputs come from environment variables (with optional `--flag value`
- * CLI overrides). M0 deliberately keeps this tiny: no config file, no
- * persistence. See README for the supported variable names.
+ * CLI overrides). Intentionally tiny: no config file beyond these. See README
+ * for the supported variable names.
  */
 export interface FeishuBotConfig {
   /** HTTP origin of the local t3code server, e.g. `http://127.0.0.1:3000`. */
@@ -15,11 +15,52 @@ export interface FeishuBotConfig {
   readonly wsBaseUrl: string;
   /** One-time pairing credential printed by the server as `Token: ...`. */
   readonly pairingToken: string;
-  /** Prompt to send in the single M0 turn. */
-  readonly prompt: string;
+  /**
+   * Optional model override (`T3_MODEL`). When set, the bot selects the ready
+   * provider's model whose slug equals or contains this value, instead of
+   * defaulting to the project's `defaultModelSelection` / first model. Lets you
+   * avoid an unavailable auto-picked model (e.g. a gated `claude-fable-5`).
+   */
+  readonly modelOverride: string | null;
   /** Workspace root used when the bot has to create a project. */
   readonly workspaceRoot: string;
+  /** Feishu/Lark long-connection app credentials (M1+). */
+  readonly feishu: FeishuAppConfig;
+  /**
+   * Directory under which the bot's durable JSON stores live (chatThreadMap,
+   * sent commandIds). M4 swaps the backend for SQLite without changing callers.
+   */
+  readonly stateDir: string;
 }
+
+/** Which Feishu tenant the bot connects to; selects the open-platform domain. */
+export type FeishuTenant = "feishu" | "lark";
+
+/**
+ * Long-connection credentials for the Feishu/Lark open platform. The bot uses
+ * App ID + App Secret over a WebSocket transport (no scan-code, no user OAuth);
+ * the SDK auto-exchanges these for a `tenant_access_token`.
+ */
+export interface FeishuAppConfig {
+  /** Open-platform app id (`cli_...`). From `FEISHU_APP_ID`. */
+  readonly appId: string;
+  /** Open-platform app secret. From `FEISHU_APP_SECRET`. */
+  readonly appSecret: string;
+  /** Which tenant this app belongs to. From `FEISHU_TENANT` (default `feishu`). */
+  readonly tenant: FeishuTenant;
+  /**
+   * Open-platform domain derived from {@link tenant}: `feishu` →
+   * `https://open.feishu.cn`, `lark` → `https://open.larksuite.com`. Passed
+   * straight to `createLarkChannel({ domain })`.
+   */
+  readonly domain: string;
+}
+
+/** Map a {@link FeishuTenant} to its open-platform domain origin. */
+const DOMAIN_BY_TENANT: Readonly<Record<FeishuTenant, string>> = {
+  feishu: "https://open.feishu.cn",
+  lark: "https://open.larksuite.com",
+};
 
 export class FeishuBotConfigError extends Data.TaggedError("FeishuBotConfigError")<{
   readonly message: string;
@@ -29,8 +70,12 @@ const FLAG_BY_ENV: Readonly<Record<string, string>> = {
   T3_HTTP_BASE_URL: "--http-base-url",
   T3_WS_BASE_URL: "--ws-base-url",
   T3_PAIRING_TOKEN: "--pairing-token",
-  T3_PROMPT: "--prompt",
+  T3_MODEL: "--model",
   T3_WORKSPACE_ROOT: "--workspace-root",
+  FEISHU_APP_ID: "--feishu-app-id",
+  FEISHU_APP_SECRET: "--feishu-app-secret",
+  FEISHU_TENANT: "--feishu-tenant",
+  T3_STATE_DIR: "--state-dir",
 };
 
 /**
@@ -90,7 +135,7 @@ export const loadConfig: Effect.Effect<FeishuBotConfig, FeishuBotConfigError> = 
     const wsBaseUrl = resolveValue("T3_WS_BASE_URL", env, args) ?? deriveWsBaseUrl(httpBaseUrl);
     const workspaceRoot =
       resolveValue("T3_WORKSPACE_ROOT", env, args) ?? (yield* Effect.sync(() => process.cwd()));
-    const prompt = resolveValue("T3_PROMPT", env, args) ?? "Say hello from the t3code feishu-bot.";
+    const modelOverride = resolveValue("T3_MODEL", env, args) ?? null;
 
     const pairingToken = resolveValue("T3_PAIRING_TOKEN", env, args);
     if (pairingToken === undefined) {
@@ -101,15 +146,70 @@ export const loadConfig: Effect.Effect<FeishuBotConfig, FeishuBotConfigError> = 
       });
     }
 
+    const feishu = yield* resolveFeishuAppConfig(env, args);
+
+    const stateDir =
+      resolveValue("T3_STATE_DIR", env, args) ??
+      (yield* Effect.sync(() => `${process.cwd()}/.feishu-bot`));
+
     return {
       httpBaseUrl,
       wsBaseUrl,
       pairingToken,
-      prompt,
+      modelOverride,
       workspaceRoot,
+      feishu,
+      stateDir,
     } satisfies FeishuBotConfig;
   },
 );
+
+/**
+ * Resolve the Feishu/Lark app credentials from env/CLI. `appId`/`appSecret`
+ * are required (no scan-code fallback in the headless bot); `tenant` defaults
+ * to `feishu` and selects the open-platform domain. Missing/invalid values
+ * yield a clear, actionable {@link FeishuBotConfigError}.
+ */
+const resolveFeishuAppConfig = (
+  env: Readonly<Record<string, string | undefined>>,
+  args: ReadonlyMap<string, string>,
+): Effect.Effect<FeishuAppConfig, FeishuBotConfigError> =>
+  Effect.gen(function* () {
+    const appId = resolveValue("FEISHU_APP_ID", env, args);
+    if (appId === undefined) {
+      return yield* new FeishuBotConfigError({
+        message:
+          "Missing Feishu app id. Set FEISHU_APP_ID (or pass --feishu-app-id <cli_...>) " +
+          "to your open-platform app's App ID.",
+      });
+    }
+
+    const appSecret = resolveValue("FEISHU_APP_SECRET", env, args);
+    if (appSecret === undefined) {
+      return yield* new FeishuBotConfigError({
+        message:
+          "Missing Feishu app secret. Set FEISHU_APP_SECRET (or pass --feishu-app-secret <secret>) " +
+          "to your open-platform app's App Secret.",
+      });
+    }
+
+    const rawTenant = (resolveValue("FEISHU_TENANT", env, args) ?? "feishu").toLowerCase();
+    if (rawTenant !== "feishu" && rawTenant !== "lark") {
+      return yield* new FeishuBotConfigError({
+        message:
+          `Invalid FEISHU_TENANT "${rawTenant}". Expected "feishu" (open.feishu.cn) ` +
+          'or "lark" (open.larksuite.com).',
+      });
+    }
+    const tenant: FeishuTenant = rawTenant;
+
+    return {
+      appId,
+      appSecret,
+      tenant,
+      domain: DOMAIN_BY_TENANT[tenant],
+    } satisfies FeishuAppConfig;
+  });
 
 /**
  * Derive a sensible default `wsBaseUrl` from an `httpBaseUrl` by swapping the
