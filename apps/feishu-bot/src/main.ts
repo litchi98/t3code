@@ -6,11 +6,15 @@ import { loadConfig } from "./config.ts";
 import { program } from "./bot.ts";
 
 /**
- * Headless feishu-bot M0 entrypoint.
+ * Headless feishu-bot M1 entrypoint (resident).
  *
- * Loads configuration from the environment/CLI, then runs the end-to-end flow:
- * auth -> connect -> discover/create project -> create thread -> start turn ->
- * print the event stream until the turn completes.
+ * Loads configuration from the environment/CLI, then runs the long-lived bridge:
+ * auth -> connect to the t3code server -> discover/create project -> connect the
+ * Feishu long connection -> route every private-chat message into a true shared
+ * t3code session, streaming the agent's reply back as a CardKit card. The
+ * program never returns on its own (it parks on `Effect.never`); the process
+ * stays up until interrupted (Ctrl-C / SIGTERM), at which point the scoped
+ * connection and Feishu socket tear down cleanly.
  */
 const main = Effect.gen(function* () {
   const config = yield* loadConfig;
