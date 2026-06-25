@@ -16,14 +16,24 @@ export interface FeishuBotConfig {
   /** One-time pairing credential printed by the server as `Token: ...`. */
   readonly pairingToken: string;
   /**
-   * Optional model override (`T3_MODEL`). When set, the bot selects the ready
+   * Escape hatch — non-standard use only. When set, the bot selects the ready
    * provider's model whose slug equals or contains this value, instead of
    * defaulting to the project's `defaultModelSelection` / first model. Lets you
-   * avoid an unavailable auto-picked model (e.g. a gated `claude-fable-5`).
+   * force a specific model when connecting to a bare/unconfigured server (e.g. a
+   * gated `claude-fable-5` that the project's default would miss). Set via
+   * `T3_MODEL` / `--model`. When connecting to an already-configured server this
+   * is normally unnecessary — the server's project carries its own default.
    */
   readonly modelOverride: string | null;
-  /** Workspace root used when the bot has to create a project. */
-  readonly workspaceRoot: string;
+  /**
+   * Escape hatch — non-standard use only. Workspace root used only when the bot
+   * has to create a new project because the server has none. `null` (the
+   * default) means the bot connects to an already-configured server and inherits
+   * its project — `createProject` is never called. Set a non-null path only when
+   * running against a bare server (no projects yet) and you need the bot to
+   * create one. Set via `T3_WORKSPACE_ROOT` / `--workspace-root`.
+   */
+  readonly workspaceRoot: string | null;
   /** Feishu/Lark long-connection app credentials (M1+). */
   readonly feishu: FeishuAppConfig;
   /**
@@ -133,8 +143,7 @@ export const loadConfig: Effect.Effect<FeishuBotConfig, FeishuBotConfigError> = 
 
     const httpBaseUrl = resolveValue("T3_HTTP_BASE_URL", env, args) ?? "http://127.0.0.1:3000";
     const wsBaseUrl = resolveValue("T3_WS_BASE_URL", env, args) ?? deriveWsBaseUrl(httpBaseUrl);
-    const workspaceRoot =
-      resolveValue("T3_WORKSPACE_ROOT", env, args) ?? (yield* Effect.sync(() => process.cwd()));
+    const workspaceRoot = resolveValue("T3_WORKSPACE_ROOT", env, args) ?? null;
     const modelOverride = resolveValue("T3_MODEL", env, args) ?? null;
 
     const pairingToken = resolveValue("T3_PAIRING_TOKEN", env, args);

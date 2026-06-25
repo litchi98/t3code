@@ -51,12 +51,14 @@
  */
 import type { OrchestrationThreadShell, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import type { BindingState, ChatBinding } from "./bindingState.ts";
 import type { ShellSnapshotCache } from "./shellCache.ts";
+import { NoticeMemoryStore } from "../runtime/persistence.ts";
 
 /**
  * The binding-state service *shape* (its read/write surface). `BindingState` is
@@ -119,10 +121,54 @@ export interface ShellWatcherDeps {
   readonly stopMirror: (chatId: string) => Effect.Effect<void>;
   /** Push a single plain-text notice card to `chatId`. */
   readonly sendNotice: (chatId: string, text: string) => Effect.Effect<void>;
+  /**
+   * Surface a *new* pending approval/user-input on `threadId` as an actionable card
+   * in `chatId`, if one is pending that Feishu has not already rendered a card for
+   * (M2b-2 修法 B). Injected by the bot so the watcher stays decoupled from the
+   * gateway / card-render / `CardHandle` concretes.
+   *
+   * It is the bot's `surfacePendingApprovalIfNew`: a one-shot thread-snapshot read
+   * that derives the *top* pending requestId, dedups against the persisted
+   * `CardHandle.pendingRequestId` (the single source of truth for "already
+   * surfaced"), and only sends + persists a new card on a genuinely new request.
+   * That requestId-keyed dedup is what makes calling this on *every* frame the
+   * resumed thread is `hasPendingApprovals` safe — the same approval pending across
+   * many frames is surfaced exactly once; a later, distinct approval re-surfaces.
+   *
+   * The effect handles its own robustness (`catchCause` → warn) and never fails, but
+   * the watcher still wraps the call so a surface attempt can never wedge or starve
+   * the shared reconciliation/notification fold.
+   */
+  readonly surfacePendingApproval: (chatId: string, threadId: ThreadId) => Effect.Effect<void>;
+  /**
+   * Persistent store for per-thread notice dedup state. Replaces the
+   * process-local `Ref<Map>` so dedup survives a bot restart: a cold (re)start
+   * no longer re-sends notifications for events that were already delivered
+   * before the restart. Supplied by the caller (already included in
+   * `fileStoresLayer`, so no extra `provide` call is needed at the call site).
+   */
+  readonly noticeMemoryStore: NoticeMemoryStore["Service"];
 }
 
 /** Handle returned by {@link runShellWatcherFiber}. */
 export interface ShellWatcherHandle {
+  /**
+   * Fork the reconciliation/notification fold loop into the caller's scope. This
+   * is split out from constructing the handle so the caller controls *when* the
+   * loop starts relative to the rest of startup.
+   *
+   * The bot defers this until AFTER its M18 restart-recovery pass has run (and
+   * after the gateway is connected): recovery updates each chat's
+   * `CardHandle.pendingRequestId` (the single-source dedup baseline) on the main
+   * fiber, so by the time the watcher's first frame lands the baseline is already
+   * in place and the watcher's `surfacePendingApproval` dedups against it instead
+   * of racing recovery to post a second card. The handle (and its
+   * {@link clearNoticeMemory}) is available immediately — only the fold is
+   * deferred — so the command table can wire `/release` before the loop starts.
+   *
+   * Idempotency is the caller's responsibility (call exactly once).
+   */
+  readonly start: Effect.Effect<void, never, Scope.Scope>;
   /**
    * Drop the per-thread dedup memory for `threadId`. Called on the discrete
    * `/release` / unbind lifecycle events so a later `/resume` of the same thread
@@ -134,21 +180,24 @@ export interface ShellWatcherHandle {
 }
 
 /**
- * Fork the shell-watcher loop into the caller's scope. It runs until the scope
- * closes (the surrounding `subscribeShell` is torn down with it). Never fails:
- * a notice / unbind / mirror-teardown error for one binding is logged and
- * swallowed so it cannot wedge the shared fold loop or starve other bindings.
+ * Construct the shell watcher. Returns a {@link ShellWatcherHandle} whose
+ * {@link ShellWatcherHandle.start} forks the reconciliation/notification fold
+ * loop into the caller's scope (it runs until the scope closes — the surrounding
+ * `subscribeShell` is torn down with it). The fold never fails: a notice /
+ * unbind / mirror-teardown error for one binding is logged and swallowed so it
+ * cannot wedge the shared fold loop or starve other bindings.
  *
- * Returns a {@link ShellWatcherHandle} so the `/release` / unbind paths can clear
- * a thread's dedup memory (see {@link ShellWatcherHandle.clearNoticeMemory}).
+ * The loop is NOT forked here; the caller invokes `start` once it is ready (the
+ * bot does so after M18 restart-recovery so the dedup baseline is already set —
+ * see {@link ShellWatcherHandle.start}). The handle and its
+ * {@link ShellWatcherHandle.clearNoticeMemory} are usable immediately.
+ *
+ * Constructing the handle needs no `Scope` (the fork moved into `start`); only
+ * `start` requires the caller's `Scope`.
  */
-export const runShellWatcherFiber = (
-  deps: ShellWatcherDeps,
-): Effect.Effect<ShellWatcherHandle, never, Scope.Scope> =>
+export const runShellWatcherFiber = (deps: ShellWatcherDeps): Effect.Effect<ShellWatcherHandle> =>
   Effect.gen(function* () {
-    // Per-thread dedup memory. Keyed by `ThreadId` (stable identity) so a
-    // reconnect's full-snapshot replay does not re-trigger notifications.
-    const memory = yield* Ref.make<Map<ThreadId, NoticeMemory>>(new Map());
+    const store = deps.noticeMemoryStore;
 
     // Cold-start guard. On the *first* frame this fiber processes, we cannot tell
     // a genuinely-new approval/failed turn from state that already existed before
@@ -205,11 +254,9 @@ export const runShellWatcherFiber = (
           yield* deps.stopMirror(chatId);
           yield* deps.sendNotice(chatId, "⚠️ 你接管的会话已被删除/归档,请用 /resume 重新选择");
           // Drop dedup memory so a future thread reusing this id starts clean.
-          yield* Ref.update(memory, (m) => {
-            const next = new Map(m);
-            next.delete(binding.threadId);
-            return next;
-          });
+          // Best-effort: a persistence failure must not abort the unbind/notify
+          // work already done above (unbind + stopMirror + sendNotice succeeded).
+          yield* store.remove(binding.threadId).pipe(Effect.ignore);
           return;
         }
 
@@ -217,21 +264,30 @@ export const runShellWatcherFiber = (
         // First frame: record the current state as the baseline WITHOUT emitting
         // any notice, so state that already existed before this (re)start is not
         // replayed as a fresh edge. Subsequent frames notify relative to it.
+        // With the persistent store a genuinely-cold restart (no stored state)
+        // still seeds; a warm restart (stored state already present) skips the
+        // seed so the persisted record is preserved as-is and dedup continues.
         if (isFirstFrame) {
-          const latestTurn = shell.latestTurn;
-          const baseline: NoticeMemory = {
-            approvalNotified: shell.hasPendingApprovals,
-            lastFailedTurnId:
-              noticeTurnState(latestTurn) !== null && latestTurn !== null
-                ? (latestTurn.turnId as string)
-                : null,
-          };
-          yield* Ref.update(memory, (m) => new Map(m).set(binding.threadId, baseline));
+          const existing = yield* store.get(binding.threadId);
+          if (Option.isNone(existing)) {
+            const latestTurn = shell.latestTurn;
+            const baseline: NoticeMemory = {
+              approvalNotified: shell.hasPendingApprovals,
+              lastFailedTurnId:
+                noticeTurnState(latestTurn) !== null && latestTurn !== null
+                  ? (latestTurn.turnId as string)
+                  : null,
+            };
+            // Best-effort: a seed-write failure is non-fatal — the worst
+            // outcome is a single duplicate notice on the next restart; the
+            // frame still returns cleanly so the binding is not wedged.
+            yield* store.put(binding.threadId, baseline).pipe(Effect.ignore);
+          }
           return;
         }
 
         // ── Key notifications (blind-spot B) ──────────────────────────────
-        const prior = (yield* Ref.get(memory)).get(binding.threadId) ?? EMPTY_MEMORY;
+        const prior = Option.getOrElse(yield* store.get(binding.threadId), () => EMPTY_MEMORY);
         const title = shell.title;
 
         // ① Pending-approval episode tracking (M2b-1: notice SUPPRESSED).
@@ -243,6 +299,39 @@ export const runShellWatcherFiber = (
         // state consistent for the cold-start baseline seed and `/release` reset;
         // only the user-facing `sendNotice` call is removed.
         const approvalNotified = shell.hasPendingApprovals;
+
+        // M2b-2 (修法 B): surface follow-on / chained approvals AND user-inputs for a
+        // resumed thread. After a `/resume` takeover the bridge is NOT live-mirroring,
+        // so an approval/user-input the turn raises *after* the first one (approve #1 →
+        // turn continues → #2, or the turn pauses on a user-input prompt) is invisible
+        // to Feishu — 修法 A only surfaced what was pending at takeover. This resident
+        // fiber is the one observer that still sees the resumed thread's shell, so when
+        // it shows EITHER a pending approval or a pending user-input we hand off to the
+        // bot's `surfacePendingApproval`, which does a one-shot snapshot read and
+        // surfaces a fresh actionable card *only if it is a new request* (dedup against
+        // the persisted `CardHandle.pendingRequestId`). The same request pending across
+        // many frames is therefore surfaced once.
+        //
+        // READ-ONLY GATE: only call when `hasPendingApprovals` OR `hasPendingUserInput`
+        // is true, so a thread with nothing pending never triggers the (relatively
+        // costly) one-shot snapshot read — the cheap shell flags gate the expensive
+        // read; the requestId dedup inside the helper then gates the actual card send.
+        // (修法 A in `startMirror` calls the helper unconditionally and already surfaces
+        // user-input correctly; this gate is the only path that previously dropped it
+        // by checking `hasPendingApprovals` alone.)
+        //
+        // Best-effort: `surfacePendingApproval` already swallows its own failures, but
+        // wrap the call so even an unexpected defect cannot break this frame's
+        // reconciliation / turn-terminal notice / dedup-write below.
+        if (shell.hasPendingApprovals || shell.hasPendingUserInput) {
+          yield* deps
+            .surfacePendingApproval(chatId, binding.threadId)
+            .pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("[feishu-bot] shellWatcher surfacePendingApproval failed", cause),
+              ),
+            );
+        }
 
         // ② Latest turn in a notable terminal (error / interrupted), deduped by
         // turnId. Distinct text per state so an interrupt from another end is not
@@ -263,11 +352,11 @@ export const runShellWatcherFiber = (
           }
         }
 
-        yield* Ref.update(memory, (m) => {
-          const next = new Map(m);
-          next.set(binding.threadId, { approvalNotified, lastFailedTurnId });
-          return next;
-        });
+        // Best-effort: a write failure must not abort the frame or suppress
+        // a notice that was already sent — the next frame retries the write.
+        yield* store
+          .put(binding.threadId, { approvalNotified, lastFailedTurnId })
+          .pipe(Effect.ignore);
       }).pipe(
         // One binding's IO failure must not wedge the shared fold or starve its
         // peers; log and move on (the next frame retries).
@@ -276,9 +365,12 @@ export const runShellWatcherFiber = (
         ),
       );
 
-    // Single fold over `shellCache.changes`; forked into the caller's scope so
-    // it is interrupted when the resident shell subscription is torn down.
-    yield* deps.shellCache.changes.pipe(
+    // Single fold over `shellCache.changes`; forked into the caller's scope so it
+    // is interrupted when the resident shell subscription is torn down. Deferred
+    // into `start` (not forked at construction) so the caller controls when the
+    // loop begins — the bot starts it AFTER M18 restart-recovery has seeded the
+    // per-chat dedup baseline (see {@link ShellWatcherHandle.start}).
+    const start: Effect.Effect<void, never, Scope.Scope> = deps.shellCache.changes.pipe(
       Stream.runForEach(() => onFrame),
       Effect.forkScoped,
       Effect.asVoid,
@@ -286,15 +378,15 @@ export const runShellWatcherFiber = (
 
     // Discrete lifecycle reset (NOT per-frame): drop a thread's dedup memory so a
     // future `/resume` of the same thread re-evaluates its notices from scratch.
+    // Now delegates to the persistent store so the reset survives a bot restart.
     const clearNoticeMemory = (threadId: ThreadId): Effect.Effect<void> =>
-      Ref.update(memory, (m) => {
-        if (!m.has(threadId)) {
-          return m;
-        }
-        const next = new Map(m);
-        next.delete(threadId);
-        return next;
-      });
+      store
+        .remove(threadId)
+        .pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("[feishu-bot] clearNoticeMemory store.remove failed", cause),
+          ),
+        );
 
-    return { clearNoticeMemory } satisfies ShellWatcherHandle;
+    return { start, clearNoticeMemory } satisfies ShellWatcherHandle;
   });
