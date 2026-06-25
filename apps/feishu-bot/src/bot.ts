@@ -45,6 +45,7 @@ import * as Data from "effect/Data";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FiberSet from "effect/FiberSet";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -53,6 +54,7 @@ import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Result from "effect/Result";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
@@ -64,12 +66,13 @@ import { connectionLayer } from "./runtime/connection.ts";
 import {
   AuditStore,
   CallbackNonceStore,
+  type CardHandle,
   CardHandleStore,
   fileStoresLayer,
   NoticeMemoryStore,
   SentCommandStore,
 } from "./runtime/persistence.ts";
-import { LarkGateway } from "./lark/index.ts";
+import { LarkGateway, type StreamingCard } from "./lark/index.ts";
 import { larkGatewayLayer } from "./lark/channel.ts";
 import type { BridgeHandlers, CardActionEvent, InboundMessage } from "./lark/types.ts";
 import { CallbackAuth, computePolicyFingerprint } from "./bridge/callbackAuth.ts";
@@ -394,6 +397,14 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     const bindings = yield* BindingState;
     const environmentId = resolved.target.environmentId;
 
+    // M2b-3: the bridge's own (root) scope, captured from `program`'s
+    // `Effect.scoped` wrapper. Resident observe fibers (the cross-end mirror of a
+    // takeover's running turn) are `forkIn(rootScope)`'d onto it so they live the
+    // whole bridge lifetime and are interrupted only when the bridge tears down —
+    // unless a stronger source (a new bridge-driven turn, `/release`, the watcher's
+    // reconciliation) interrupts them first via `stopObserve`.
+    const rootScope = yield* Effect.scope;
+
     yield* Console.log(`[feishu-bot] connected to ${resolved.target.label} (${environmentId}).`);
     yield* Console.log("[feishu-bot] discovering project...");
 
@@ -673,6 +684,12 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     // the M2a shell-status text notice.
     const startMirror = (chatId: string, threadId: ThreadId): Effect.Effect<void> =>
       Effect.gen(function* () {
+        // M2b-3: a `/resume` may re-point a chat that is already mirroring a previous
+        // thread. Tear down any existing observe fiber first so the new takeover's
+        // `ensureObserving` below is not deduped out by a stale entry under this
+        // chatId (which would leave the chat observing the OLD thread). Idempotent
+        // no-op when nothing is observing.
+        yield* stopObserve(chatId);
         yield* bindings.bind(chatId, { threadId, origin: "resumed" });
         const shell = yield* shellCache.threadById(threadId);
         const title = shell?.title ?? threadId;
@@ -705,6 +722,36 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
           onNone: () => null as OrchestrationThread | null,
           onSome: (item) => (item.kind === "snapshot" ? item.snapshot.thread : null),
         });
+
+        // ── M2b-3: live-mirror a takeover of an *already-running* turn ───────────
+        // If the snapshot shows a turn currently running (`session.activeTurnId`),
+        // start a resident observe fiber that mirrors its progress/approvals/result
+        // onto a live streaming card until it ends — then `ensureObserving` itself
+        // returns and the chat falls back to mirror-light. When observe DID start we
+        // RETURN here, skipping both the transcript card AND 修法 A's one-shot surface:
+        // the observe card already carries the full live state *and* the interaction
+        // controls (via `buildInteraction` per tick), so a transcript + a separate
+        // approval card would be a redundant double-post for the same takeover. With
+        // no active turn we keep the existing mirror-light behaviour (transcript +
+        // 修法 A). `ensureObserving`'s own gates (isChatBusy / dedup) make this safe to
+        // call unconditionally.
+        //
+        // Safety net — `ensureObserving` may decline to start (e.g. `isChatBusy`, or a
+        // claim it then self-evicts). When it does, `isObserving` stays false and we
+        // must NOT silently swallow the takeover: fall through to the transcript + 修法
+        // A path so the operator still sees the current state and any pending approval
+        // (修法 A's dedup compares the real top requestId against the handle, so it
+        // never double-posts the same request). With the Bug-C defer gate removed, an
+        // outstanding-approval takeover now normally observes (and the observe fiber
+        // adopts the recovered card), so this fall-through rarely fires — but it is a
+        // harmless backstop.
+        if (snapshotThread?.session?.activeTurnId != null) {
+          yield* ensureObserving(chatId, threadId, snapshotThread.session.activeTurnId);
+          if (yield* isObserving(chatId)) {
+            return;
+          }
+        }
+
         const transcript =
           snapshotThread === null ? null : renderTranscriptMarkdown(snapshotThread.messages);
 
@@ -763,16 +810,215 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         yield* surfacePendingApprovalIfNew(chatId, threadId, snapshotThread);
       });
 
-    // Mirror-light teardown: no resident observe fiber to interrupt, so this is a
-    // no-op. The candidate cache lives inside `buildCommandTable`'s closure and is
-    // self-pruning (re-validated on use), so there is nothing to clear here. Kept
-    // as a hook for symmetry with `/release` and the watcher's reconciliation.
-    const stopMirror = (_chatId: string): Effect.Effect<void> => Effect.void;
-
     // Read-only probe: is the chat busy (a turn running OR coalescing pending)?
     // Used by `/resume` to refuse a re-bind while a turn is in flight *or* about
     // to dispatch (the idle merge window). Reads the turn queue's busy view.
     const isChatBusy = (chatId: string): Effect.Effect<boolean> => turnQueue.isBusy(chatId);
+
+    // ── M2b-3: resident observe-fiber registry (cross-end turn mirroring) ────────
+    //
+    // A `/resume` takeover (or a follow-on turn web starts after takeover) of a turn
+    // the bridge did NOT drive must be mirrored live onto a Feishu card until it
+    // ends. `ensureObserving` forks one `runObserveFiber` per chat and registers it
+    // here.
+    //
+    // Dedup is keyed on CHAT-ID PRESENCE + SELF-EVICTION — NOT per-turn. The registry
+    // holds at most one entry per `chatId`; `ensureObserving` skips when one is
+    // already present (`map.has(chatId)`), and the fiber removes its own entry on exit
+    // (self-eviction). The consequence is deliberate: a chat's CONSECUTIVE turns reuse
+    // the SAME observe fiber and the SAME card — on an A→B turn rotation that never
+    // surfaces `activeTurnId === null` between the two (a direct chain), fiber A keeps
+    // folding the same thread subscription and mirrors B's progress onto its existing
+    // card (continuous mirror). B's own `ensureObserving` is deduped out by the present
+    // chat-id entry. This is the intended "纳入接管后新 turn" behaviour; it is NOT a
+    // per-turn fiber rotation (that would break the continuous mirror). The only
+    // identity used by guards is the per-attempt `token`; nothing keys on a turnId.
+    //
+    // Each per-chat entry carries a unique `token` (a fresh monotonic counter value)
+    // plus the `fiber` (for interruption); the token — NOT a fiber reference — is the
+    // identity used by every guard, so the claim→install→self-evict handshake is
+    // immune to fiber-completion timing (a fiber that finishes before its handle is
+    // even installed still evicts exactly its own token, never a newer entry).
+    //
+    // ALL reads/writes go through `Ref.modify` (atomic; Effect's cooperative
+    // scheduling means no interleaving mid-`modify`), and `Fiber.interrupt` ALWAYS
+    // runs AFTER the modify, outside the lock — the exact `turnQueue.ts` "decide in
+    // modify, side-effect outside" pattern; the equality guard is on `token`.
+    interface ObserveState {
+      /** The forked observe fiber, or `null` in the claim→install window. */
+      readonly fiber: Fiber.Fiber<void> | null;
+      /** Unique per observe attempt; the sole identity used by every guard. */
+      readonly token: number;
+    }
+    const activeRenderFibers = yield* Ref.make<ReadonlyMap<string, ObserveState>>(new Map());
+    // Monotonic source for {@link ObserveState.token}s; never reused.
+    const nextObserveToken = yield* Ref.make<number>(1);
+
+    // Read-only: is an observe fiber currently registered for this chat? Used as
+    // `surfacePendingApprovalIfNew`'s second door (an observe card already carries
+    // the interaction, so a surface would double-post) and inside `ensureObserving`.
+    const isObserving = (chatId: string): Effect.Effect<boolean> =>
+      Ref.get(activeRenderFibers).pipe(Effect.map((map) => map.has(chatId)));
+
+    // Atomically remove this chat's observe entry and interrupt its fiber (outside
+    // the modify). No-op if none. `stopMirror` (so `/release` + watcher teardown
+    // tear the mirror down) and `runTurn`'s pre-dispatch preemption both call it.
+    const stopObserve = (chatId: string): Effect.Effect<void> =>
+      Ref.modify(
+        activeRenderFibers,
+        (map): readonly [Fiber.Fiber<void> | null, ReadonlyMap<string, ObserveState>] => {
+          const existing = map.get(chatId);
+          if (existing === undefined) {
+            return [null, map];
+          }
+          const next = new Map(map);
+          next.delete(chatId);
+          return [existing.fiber, next];
+        },
+      ).pipe(
+        // Interrupt OUTSIDE the modify (lock), per the turnQueue Ref.modify+side-
+        // effect-after pattern. Closing the fiber tears down its child scope →
+        // unsubscribes the observed thread (see `runObserveFiber`). The fiber's own
+        // self-evict finalizer is then a no-op (its token is already gone).
+        Effect.flatMap((fiber) => (fiber === null ? Effect.void : Fiber.interrupt(fiber))),
+      );
+
+    // Mirror-light teardown is now the real observe teardown (M2b-3): interrupt the
+    // chat's resident observe fiber (if any) so a `/release` / unbind / reconcile
+    // stops the cross-end mirror. The candidate cache lives inside
+    // `buildCommandTable`'s closure and is self-pruning, so there is nothing else to
+    // clear here.
+    const stopMirror = (chatId: string): Effect.Effect<void> => stopObserve(chatId);
+
+    // Central trigger gate for cross-end turn mirroring. Forks a `runObserveFiber`
+    // for `chatId`/`threadId` iff a turn is genuinely running on `threadId` that the
+    // bridge is NOT itself driving and is NOT already observing.
+    //
+    // Gating (in order):
+    //  1. `activeTurnId == null` → no live turn to mirror → skip.
+    //  2. `isChatBusy(chatId)` → the bridge is driving (or about to dispatch) a turn
+    //     for this chat; `driveTurn` owns the card. Observing too would double-render
+    //     this end's own turn → skip. (driveTurn > observe; `runTurn` also preempts.)
+    //  3. Atomic reservation (TOCTOU-free): a SINGLE `Ref.modify` both dedups and
+    //     claims. If an entry already exists for this chat (observing, or a claim in
+    //     flight) → return `false`, change nothing — this is the CHAT-ID-presence
+    //     dedup, so a chat's later turn reuses the in-place fiber rather than starting
+    //     a second one. Otherwise mint a fresh `token`, write the CLAIM marker
+    //     `{ fiber: null, token }`, and return `true`. Because the dedup-check and the
+    //     claim-write are the same atomic modify, two racing callers (startMirror on
+    //     one fiber, the shellWatcher on another) can never BOTH see "free" and both
+    //     fork — exactly one wins the claim; the loser sees the claim and skips. The
+    //     winner forks (forking cannot happen inside a modify) and installs the real
+    //     fiber into the slot — but only if its own `token` is still the current entry
+    //     (guarded), so a concurrent `stopObserve` or self-evict wins and the just-
+    //     forked fiber is interrupted, never leaked.
+    const ensureObserving = (
+      chatId: string,
+      threadId: ThreadId,
+      activeTurnId: TurnId | null,
+    ): Effect.Effect<void> =>
+      Effect.gen(function* () {
+        if (activeTurnId === null) {
+          return;
+        }
+        // driveTurn (this end's own turn) wins over observe: never mirror a turn the
+        // bridge is itself driving for this chat (would double-render).
+        if (yield* isChatBusy(chatId)) {
+          return;
+        }
+        // Bug C — an outstanding M2b-2 / M18 approval card does NOT block observe.
+        // When a resumed chat was blocked on an approval at restart, M18 recovery
+        // (`recoverApprovalCards`) re-renders that approval onto the EXISTING card
+        // (old `messageId`) and writes a handle with `pendingRequestId != null`.
+        // Rather than DEFER (which left a chat that is simultaneously running AND
+        // awaiting an approval with no progress mirror — the normal §11E case — and
+        // could pin forever on a stale cross-thread handle), `runObserveFiber` ADOPTS
+        // that recovered card: if the persisted handle still solicits a currently-
+        // live-pending request it continues rendering onto the same `messageId` via
+        // `updateCard` (no new card, no `persistHandle(null)` clobber, operator
+        // re-signed from the handle); otherwise it opens a fresh streaming card.
+        // So we proceed to claim/observe unconditionally here — the adopt-vs-open
+        // decision is made inside the fiber once it has the authoritative first frame.
+        // Atomic dedup + claim (see the block comment above). Mint the token first;
+        // the modify only consumes it (writes the claim) when the slot is free, so an
+        // unused token on the dedup path is harmless (it is simply never installed).
+        const token = yield* Ref.modify(nextObserveToken, (n) => [n, n + 1] as const);
+        const claimed = yield* Ref.modify(
+          activeRenderFibers,
+          (map): readonly [boolean, ReadonlyMap<string, ObserveState>] => {
+            if (map.has(chatId)) {
+              // Already observing (a fiber is registered, or a claim is in flight) →
+              // do not start a second one for this chat.
+              return [false, map];
+            }
+            // Free: place the claim marker (fiber filled in after fork).
+            return [true, new Map(map).set(chatId, { fiber: null, token })];
+          },
+        );
+        if (!claimed) {
+          return;
+        }
+        // We own the claim. Fork the observe fiber (cannot fork inside `modify`) — it
+        // carries our `token` and self-evicts by it on exit — then install the real
+        // fiber into the slot, but only if OUR token is still the current entry. A
+        // concurrent `stopObserve` (preemption) or a fast self-evict (the turn was
+        // already terminal) may have removed/replaced it; if so the fiber is orphaned
+        // and we interrupt it so it does not leak an open thread subscription.
+        const fiber = yield* runObserveFiber(chatId, threadId, token);
+        const installed = yield* Ref.modify(
+          activeRenderFibers,
+          (map): readonly [boolean, ReadonlyMap<string, ObserveState>] => {
+            const existing = map.get(chatId);
+            if (existing !== undefined && existing.token === token) {
+              return [true, new Map(map).set(chatId, { fiber, token })];
+            }
+            return [false, map];
+          },
+        );
+        if (!installed) {
+          yield* Fiber.interrupt(fiber);
+          return;
+        }
+        // Bug A — close the `isChatBusy`-gate ↔ claim TOCTOU. The `isChatBusy` check
+        // above (turnQueue.states Ref) and the claim (activeRenderFibers Ref) are two
+        // independent atomics with a yield point between them, so a concurrent
+        // `runTurn` can interleave: it does `beginTurn` (sets running=true) → then
+        // `stopObserve` (which is a no-op if our claim wasn't installed yet). The bad
+        // window is `runTurn`'s `stopObserve` running while our slot is empty (claim
+        // minted, fiber not yet installed): `driveTurn` then opens its own card AND we
+        // install our observe fiber → two streaming cards fight, and `runTurn`'s
+        // one-shot `stopObserve` already ran, so observe is never torn down.
+        //
+        // Re-read `isChatBusy` AFTER a successful install. Invariant that closes the
+        // window: `runTurn` calls `beginTurn` (running=true) BEFORE its `stopObserve`.
+        //  • If our install lands AFTER `runTurn`'s `stopObserve`, then `beginTurn`
+        //    already ran, so this re-check sees `isChatBusy === true` and we evict
+        //    ourselves here.
+        //  • If our install lands BEFORE `runTurn`'s `stopObserve`, that `stopObserve`
+        //    sees our installed fiber and interrupts it.
+        // Either way the just-installed observe is torn down — no double render. The
+        // eviction uses the SAME token/fiber identity guard as `stopObserve`/self-
+        // evict: only remove the slot if it still carries OUR token (a preempting
+        // install must never be clobbered), and `Fiber.interrupt` runs AFTER the
+        // `modify`, outside the lock (the turnQueue.ts pattern).
+        if (yield* isChatBusy(chatId)) {
+          const evicted = yield* Ref.modify(
+            activeRenderFibers,
+            (map): readonly [Fiber.Fiber<void> | null, ReadonlyMap<string, ObserveState>] => {
+              const existing = map.get(chatId);
+              if (existing === undefined || existing.token !== token) {
+                return [null, map];
+              }
+              const next = new Map(map);
+              next.delete(chatId);
+              return [existing.fiber, next];
+            },
+          );
+          if (evicted !== null) {
+            yield* Fiber.interrupt(evicted);
+          }
+        }
+      });
 
     // Capture a runtime that forks effects into a scoped FiberSet. This is the
     // edge between the SDK's plain `void` callbacks and the Effect world: the
@@ -972,7 +1218,13 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         // (`turnQueue.isBusy`): never mutates the queue's token accounting. (修法 B
         // / the watcher only reconciles `origin: "resumed"` chats; a resumed user
         // sending a live message is exactly when this collision happens.)
-        if (yield* isChatBusy(chatId)) {
+        //
+        // M2b-3 second door: likewise skip while an observe fiber is mirroring this
+        // chat — the observe card already renders the interaction (`buildInteraction`
+        // per tick), so a surface here would double-post the same approval. (修法 B
+        // calls this on every `hasPendingApprovals` frame; without this gate it would
+        // race the live observe card.) `isObserving` is read-only on the registry.
+        if ((yield* isChatBusy(chatId)) || (yield* isObserving(chatId))) {
           return;
         }
 
@@ -1092,6 +1344,9 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
       stopMirror,
       sendNotice,
       surfacePendingApproval: surfacePendingApprovalIfNew,
+      // M2b-3: the watcher mirrors a turn web/terminal starts after a takeover by
+      // handing the resumed thread's running turn off to the bot's observe registry.
+      ensureObserving,
       noticeMemoryStore,
     });
 
@@ -1110,6 +1365,383 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
       clearResolvedNotices: clearChatResolvedNotices,
       isChatBusy,
     });
+
+    // ── M2b-3: pure render loop shared by `driveTurn` and `runObserveFiber` ──
+    //
+    // Given an OPEN streaming card `handle` plus a thread `observation`, mirror
+    // that observation onto the card until it completes: per-tick render (interaction
+    // + currentTurnId scoping + persist the top pending requestId on change) forked
+    // onto the caller's `Scope`, then a single terminal render once `completion`
+    // resolves. This is the EXACT render behaviour `driveTurn` had inline — extracted
+    // verbatim (DRY) so the cross-end observe fiber (`runObserveFiber`) reuses the
+    // identical card pipeline. Each call gets its OWN `currentTurnIdRef` /
+    // `lastPendingId` closure state (created here), so two concurrent callers on
+    // different chats never share write-once / dedup state.
+    //
+    // It does NOT open or close the card (the caller owns that, including the
+    // `cardDone` producer-release in `driveTurn` and the child scope in
+    // `runObserveFiber`) and NEVER touches the turn queue — it is pure observation →
+    // card. Requires a `Scope` for the `forkScoped` per-tick updater.
+    const renderObservationToCard = (
+      chatId: string,
+      threadId: ThreadId,
+      observation: ThreadObservation,
+      handle: StreamingCard,
+      // M2b-3 adopt path: optional operator override forwarded to every
+      // `buildInteraction` here. The live `driveTurn`/streaming paths omit it and
+      // resolve the operator from the in-process `chatOperators` Ref. When this
+      // observe fiber ADOPTS an M18-recovered card after a restart the Ref is empty,
+      // so the adopt branch passes the operator captured on the persisted handle —
+      // exactly as M18 `recoverApprovalCards` re-signs its buttons — so the adopted
+      // approval's buttons verify when clicked instead of dead-ending on an empty
+      // open id. A non-empty override wins inside `buildInteraction`; otherwise it
+      // falls back to the Ref (live behaviour unchanged).
+      operatorOverride?: string,
+    ): Effect.Effect<void, never, Scope.Scope> =>
+      Effect.gen(function* () {
+        // The turnId of the turn being rendered. Captured from the first tick whose
+        // folded session carries a non-null `activeTurnId` (turn now running), then
+        // held — so once the turn completes and `activeTurnId` flips back to `null`,
+        // the final/terminal render still filters tools/reasoning/error/body to
+        // *this* turn instead of letting the whole thread's history flood in. `null`
+        // only until the running frame lands (before which the renderer falls back to
+        // `activeTurnId`).
+        const currentTurnIdRef = yield* Ref.make<TurnId | null>(null);
+        const captureCurrentTurnId = (thread: OrchestrationThread) =>
+          Ref.update(currentTurnIdRef, (seen) => seen ?? thread.session?.activeTurnId ?? null);
+
+        // The pendingRequestId last persisted to the card handle. Persist a handle
+        // update only when it *changes* (the JSON store writes on every `put`), not
+        // on every render tick — so recovery (M2b-2) still sees the outstanding
+        // approval without per-tick file churn.
+        const lastPendingId = yield* Ref.make<string | null | undefined>(undefined);
+        const persistHandle = (pendingRequestId: string | null) =>
+          Ref.get(lastPendingId).pipe(
+            Effect.flatMap((seen) =>
+              seen === pendingRequestId
+                ? Effect.void
+                : // Capture the chat's *current* real operator open id (#0/#1):
+                  // the verify side reads `evt.operator.openId`, the same source
+                  // `handleInbound` writes into `chatOperators` — so persisting it
+                  // here lets M18 restart recovery re-sign approval buttons for the
+                  // real operator instead of an empty string (which would never
+                  // match at verify time, permanently dead-ending the button).
+                  //
+                  // Bug C — do NOT blank a recoverable operator. After a restart the
+                  // `chatOperators` Ref is empty even though a durable handle may still
+                  // carry the operator who triggered the prior (M18-recovered) card.
+                  // Unconditionally writing `""` here would poison that handle, so on
+                  // the next restart M18 sees an empty operator and DROPS the handle
+                  // (downgrading to a "send a message" nudge). Fall back to the existing
+                  // handle's `operatorOpenId` when the Ref has none. Empty string is
+                  // only written when BOTH are genuinely unknown.
+                  Effect.all([
+                    Ref.get(chatOperators),
+                    cardHandles
+                      .get(chatId)
+                      .pipe(Effect.orElseSucceed(() => Option.none<CardHandle>())),
+                  ]).pipe(
+                    Effect.flatMap(([operators, existing]) =>
+                      cardHandles
+                        .put(chatId, {
+                          messageId: handle.messageId,
+                          pendingRequestId,
+                          lastSequence: 0,
+                          operatorOpenId:
+                            operators.get(chatId) ??
+                            (Option.isSome(existing) ? existing.value.operatorOpenId : ""),
+                        })
+                        .pipe(
+                          Effect.ignore,
+                          Effect.andThen(Ref.set(lastPendingId, pendingRequestId)),
+                        ),
+                    ),
+                  ),
+            ),
+          );
+        // Record the card handle once up front (no pending yet) so M2b-2 recovery can
+        // re-render an outstanding approval card across a restart.
+        yield* persistHandle(null);
+        yield* observation.ticks.pipe(
+          Stream.runForEach((thread) =>
+            captureCurrentTurnId(thread).pipe(
+              Effect.andThen(Ref.get(currentTurnIdRef)),
+              Effect.flatMap((currentTurnId) =>
+                buildInteraction(chatId, thread, operatorOverride).pipe(
+                  Effect.flatMap((interaction) =>
+                    handle
+                      .update(
+                        renderThreadCard(thread, {
+                          streaming: true,
+                          currentTurnId,
+                          ...(interaction ? { interaction } : {}),
+                        }).card,
+                      )
+                      .pipe(
+                        Effect.ignore,
+                        // Refresh the handle's `pendingRequestId` to the top open
+                        // request (approval first, then user-input — the same
+                        // priority `surfacePendingApprovalIfNew` derives its
+                        // `topRequestId` with) — only when it changed. #2: a
+                        // user-input-only turn must NOT persist `null` here, or M18
+                        // restart recovery (which skips a handle whose
+                        // `pendingRequestId === null`) would never recover the
+                        // user-input card.
+                        Effect.andThen(
+                          persistHandle(
+                            derivePendingApprovals(thread.activities)[0]?.requestId ??
+                              derivePendingUserInputs(thread.activities)[0]?.requestId ??
+                              null,
+                          ),
+                        ),
+                      ),
+                  ),
+                ),
+              ),
+              Effect.ignore,
+            ),
+          ),
+          Effect.forkScoped,
+        );
+
+        // Wait for the turn to reach a terminal state.
+        const outcome = yield* observation.completion;
+        yield* Console.log(
+          `[feishu-bot] turn ${outcome.kind} on thread ${threadId}` +
+            (outcome.kind === "failed" ? ` (status=${outcome.status}).` : "."),
+        );
+
+        // Final card render from the fold's authoritative state. By now the turn has
+        // completed and `finalThread.session.activeTurnId` is null, so we pass the
+        // captured `currentTurnId` to keep the terminal card scoped to *this* turn's
+        // tools/reasoning/error/body (otherwise the whole thread's history would
+        // surface).
+        const finalThread = yield* observation.current;
+        if (finalThread !== null) {
+          const interaction = yield* buildInteraction(chatId, finalThread, operatorOverride);
+          const currentTurnId = yield* Ref.get(currentTurnIdRef);
+          yield* handle
+            .update(
+              renderThreadCard(finalThread, {
+                streaming: false,
+                currentTurnId,
+                ...(interaction ? { interaction } : {}),
+              }).card,
+            )
+            .pipe(Effect.ignore);
+          // #2: top open request (approval first, then user-input) so a turn that
+          // ends paused on a user-input prompt persists a non-null requestId and is
+          // recoverable across a restart (M18 skips null-pendingRequestId handles).
+          yield* persistHandle(
+            derivePendingApprovals(finalThread.activities)[0]?.requestId ??
+              derivePendingUserInputs(finalThread.activities)[0]?.requestId ??
+              null,
+          );
+        }
+      });
+
+    // ── M2b-3: cross-end observe fiber (mirror a takeover's running turn) ────────
+    //
+    // Resident fiber that opens its OWN streaming card and mirrors `threadId`'s
+    // current turn onto it via the shared `renderObservationToCard`, until the turn
+    // reaches a terminal state. Unlike `driveTurn`, it dispatches NOTHING and touches
+    // the turn queue NOT AT ALL — it is pure observation (the bridge is mirroring a
+    // turn another end started, e.g. on web/terminal, after a `/resume` takeover, or
+    // a follow-on turn web starts while the chat is taken over).
+    //
+    // Self-contained child scope (`Effect.scoped`): `observeThread`'s fold loop is
+    // `forkScoped` onto THIS scope, so interrupting this fiber (via `stopObserve` /
+    // root-scope teardown) closes the child scope → interrupts the fold → unsubscribes
+    // the thread (no leaked subscription). `renderObservationToCard`'s per-tick
+    // updater is likewise `forkScoped` here and torn down on completion/interrupt.
+    //
+    // Robustness: NOTHING inside may crash the bot. `startStreamingCard` failure is
+    // caught (warn) and skips the render (the observe fiber just exits — the watcher
+    // re-triggers `ensureObserving` on the next frame if the turn is still running);
+    // `handle.update` is already `Effect.ignore` inside the helper; any residual
+    // defect is `catchCause`'d so the forked fiber always succeeds (`E = never`).
+    //
+    // Self-eviction: the body has an `Effect.ensuring` finalizer that, on EVERY exit
+    // (success / interrupt / defect), removes this chat's registry entry IFF it still
+    // carries OUR `token`. Keying on the unique per-attempt token (not a fiber
+    // reference) makes eviction immune to claim→install timing: even a turn already
+    // terminal at fork time evicts exactly its own claim, and a preempting
+    // `driveTurn`/`ensureObserving` that installed a newer entry (different token) is
+    // never clobbered. Forked into `rootScope` so the observe outlives the triggering
+    // message fiber (the takeover turn runs long after `/resume` returns) yet tears
+    // down on bridge shutdown.
+    const runObserveFiber = (
+      chatId: string,
+      threadId: ThreadId,
+      token: number,
+    ): Effect.Effect<Fiber.Fiber<void>, never, never> => {
+      const body: Effect.Effect<void> = Effect.scoped(
+        Effect.gen(function* () {
+          const observation = yield* observeThread(threadId, { subscribe: subscribeThread });
+
+          // Bug D — turn already over before the new subscription's first frame:
+          // `ensureObserving` triggered us because a snapshot/shellCache frame
+          // showed `activeTurnId != null`, but the turn can finish in the gap
+          // between that decision and this fresh subscription's first folded
+          // frame. If so, `observeThread`'s `turnObserved` latch never sets (it
+          // only ever sees a null `activeTurnId`), so `completion` would NOT resolve
+          // until the 10-min TURN_TIMEOUT — the observe card would hang empty in
+          // streaming state, this fiber would never self-evict, and `isObserving`
+          // would suppress 修法 A/B for ~10min. Wait for the fold's FIRST
+          // authoritative frame (`current` is `null` until the replayed snapshot
+          // lands — the fold loop is `forkScoped`, so it has not necessarily run by
+          // the time `observeThread` returns; poll until non-null, bounded so a
+          // never-delivering subscription can't pin us). If that first frame's
+          // `activeTurnId` is already null, the turn is over — exit immediately (no
+          // card opened, fiber self-evicts) rather than long-waiting `completion`.
+          // Safe precisely because we only triggered on `activeTurnId != null`: a
+          // null first frame here confirms the turn ended in the trigger→subscribe
+          // gap. (TURN_TIMEOUT stays the backstop for a turn that genuinely runs
+          // then wedges.) A read timeout just falls through to the normal path.
+          const firstCurrent = yield* observation.current.pipe(
+            Effect.repeat({
+              until: (thread) => thread !== null,
+              schedule: Schedule.spaced(Duration.millis(50)),
+            }),
+            Effect.timeoutOrElse({
+              duration: Duration.seconds(10),
+              orElse: () => Effect.succeed(null as OrchestrationThread | null),
+            }),
+          );
+          if (firstCurrent !== null && firstCurrent.session?.activeTurnId == null) {
+            return;
+          }
+
+          // ── M2b-3: ADOPT an already-recovered approval card (reuse-card) ─────────
+          // When a resumed chat was blocked on an approval at restart, M18 recovery
+          // (`recoverApprovalCards`) re-rendered that approval onto the EXISTING card
+          // (`existing.messageId`) and persisted a handle with that request id +
+          // operator. If that SAME request is still live-pending in this fold's first
+          // authoritative frame, opening a fresh streaming card would post a SECOND
+          // card for it (and `persistHandle(null)` would clobber the durable handle's
+          // operator → dead buttons). Instead ADOPT: keep rendering onto the recovered
+          // `messageId` via `updateCard`, re-signing the approval for the operator
+          // captured on the handle (the `chatOperators` Ref is empty right after a
+          // restart — same as M18). A STALE handle from an old turn whose request is
+          // NOT in this thread's live-pending set is ignored → we fall through and open
+          // a fresh card (no mis-adoption). The adopt path has NO streaming producer,
+          // so it creates NO `cardDone` (a dangling `cardDone` would never resolve).
+          const livePending = new Set<string>([
+            ...(firstCurrent === null ? [] : derivePendingApprovals(firstCurrent.activities)).map(
+              (a) => a.requestId,
+            ),
+            ...(firstCurrent === null ? [] : derivePendingUserInputs(firstCurrent.activities)).map(
+              (u) => u.requestId,
+            ),
+          ]);
+          const existing = yield* cardHandles
+            .get(chatId)
+            .pipe(Effect.orElseSucceed(() => Option.none<CardHandle>()));
+
+          // Operator fallback shared by BOTH render branches (adopt AND fresh card).
+          // The live `chatOperators` Ref is the authoritative source while the bot has
+          // seen an inbound/`/resume` for this chat — but it is EMPTY right after a
+          // restart, even though a durable handle may still carry the operator who
+          // triggered the recovered (M18) card. When the Ref has this chat, pass
+          // `undefined` so `buildInteraction` resolves from the Ref (live behaviour
+          // unchanged); when it does not, fall back to the persisted handle's
+          // `operatorOpenId` so an approval that surfaces post-restart is still signed
+          // for the recovered operator instead of an empty open id (dead buttons). The
+          // fresh-card branch previously passed NO override, so on a restart where
+          // observe lost the adopt race (the first live-pending request already
+          // resolved) its approval buttons would dead-end — this fallback fixes that.
+          const liveOperators = yield* Ref.get(chatOperators);
+          const operatorFallback = liveOperators.has(chatId)
+            ? undefined
+            : Option.isSome(existing) && existing.value.operatorOpenId.length > 0
+              ? existing.value.operatorOpenId
+              : undefined;
+
+          if (
+            Option.isSome(existing) &&
+            existing.value.messageId.length > 0 &&
+            existing.value.pendingRequestId !== null &&
+            livePending.has(existing.value.pendingRequestId)
+          ) {
+            // Adopt: a static handle that patches the recovered card in place. No
+            // streaming producer ⇒ no `cardDone`. `updateCard` failures are swallowed
+            // (a bad patch must never crash the observe fiber); the operator override
+            // (handle's captured operator, falling back to the live Ref when present)
+            // re-signs the approval so its buttons verify across the restart.
+            const recovered = existing.value;
+            const adoptHandle: StreamingCard = {
+              messageId: recovered.messageId,
+              update: (card) => gateway.updateCard(recovered.messageId, card).pipe(Effect.ignore),
+            };
+            yield* renderObservationToCard(
+              chatId,
+              threadId,
+              observation,
+              adoptHandle,
+              operatorFallback,
+            );
+            return;
+          }
+
+          // Bug B — `cardDone` must resolve on EVERY exit of this whole block, not
+          // just around `renderObservationToCard`: the SDK streaming producer
+          // (`startStreamingCard`'s `done`) parks on `Deferred.await(cardDone)`, so
+          // any exit that opened the card but left `cardDone` unresolved — a
+          // `Fiber.interrupt` (all four `stopObserve` sites) landing in/after
+          // `startStreamingCard` but before the inner render-`ensuring`, or the
+          // `handle === null` early return — would leave the producer parked forever
+          // (card stuck streaming). Mirror `driveTurn`: create `cardDone`, then wrap
+          // the start→handle-check→render block in a single `Effect.ensuring` that
+          // resolves it on success / failure / interrupt / early return alike.
+          const cardDone = yield* Deferred.make<void>();
+          yield* Effect.gen(function* () {
+            // Open this observe fiber's own streaming card; its producer settles when
+            // the turn reaches a terminal state (the `cardDone` released below). A
+            // failed start must NOT crash the fiber — skip the render and exit; the
+            // watcher re-triggers on the next frame if the turn is still running.
+            const initial = renderThreadCard(placeholderThread, { streaming: true }).card;
+            const card = yield* gateway
+              .startStreamingCard(chatId, initial, { done: Deferred.await(cardDone) })
+              .pipe(
+                Effect.tapError((error) =>
+                  Console.error(
+                    `[feishu-bot] observe streaming card failed to start for chat ${chatId}: ${error.message}`,
+                  ),
+                ),
+                Effect.option,
+              );
+            const handle = Option.isSome(card) ? card.value : null;
+            if (handle === null) {
+              return;
+            }
+            yield* renderObservationToCard(chatId, threadId, observation, handle, operatorFallback);
+          }).pipe(
+            // Always release the SDK producer so the card settles into its terminal
+            // (non-streaming) form instead of parking forever (mirrors `driveTurn`).
+            Effect.ensuring(Deferred.succeed(cardDone, undefined)),
+          );
+        }),
+      ).pipe(
+        // No observe failure/defect may crash the bot; the fiber always succeeds.
+        Effect.catchCause((cause) =>
+          Effect.logWarning(`[feishu-bot] observe fiber failed for chat ${chatId}.`, cause),
+        ),
+        // Self-evict by token on every exit (see the block comment above).
+        Effect.ensuring(
+          Ref.update(activeRenderFibers, (map) => {
+            const existing = map.get(chatId);
+            if (existing === undefined || existing.token !== token) {
+              return map;
+            }
+            const next = new Map(map);
+            next.delete(chatId);
+            return next;
+          }),
+        ),
+      );
+
+      return Effect.forkIn(body, rootScope);
+    };
 
     // Drive the live card + observer + completion for an already-dispatched turn.
     // `cardDone` is resolved on EVERY exit (success/failure/interrupt) so the SDK
@@ -1137,134 +1769,13 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
               Effect.option,
             );
 
-          // The turnId of the turn this `driveTurn` is driving. Captured from the
-          // first tick whose folded session carries a non-null `activeTurnId`
-          // (turn now running), then held — so once the turn completes and
-          // `activeTurnId` flips back to `null`, the final/terminal render still
-          // filters tools/reasoning/error/body to *this* turn instead of letting
-          // the whole thread's history flood in. `null` only until the running
-          // frame lands (before which the renderer falls back to `activeTurnId`).
-          const currentTurnIdRef = yield* Ref.make<TurnId | null>(null);
-          const captureCurrentTurnId = (thread: OrchestrationThread) =>
-            Ref.update(currentTurnIdRef, (seen) => seen ?? thread.session?.activeTurnId ?? null);
-
           // Push each render tick to the card (best-effort; throttled by the SDK).
           const handle = Option.isSome(card) ? card.value : null;
           if (handle !== null) {
-            // The pendingRequestId last persisted to the card handle. Persist a
-            // handle update only when it *changes* (the JSON store writes on every
-            // `put`), not on every render tick — so recovery (M2b-2) still sees
-            // the outstanding approval without per-tick file churn.
-            const lastPendingId = yield* Ref.make<string | null | undefined>(undefined);
-            const persistHandle = (pendingRequestId: string | null) =>
-              Ref.get(lastPendingId).pipe(
-                Effect.flatMap((seen) =>
-                  seen === pendingRequestId
-                    ? Effect.void
-                    : // Capture the chat's *current* real operator open id (#0/#1):
-                      // the verify side reads `evt.operator.openId`, the same source
-                      // `handleInbound` writes into `chatOperators` — so persisting it
-                      // here lets M18 restart recovery re-sign approval buttons for the
-                      // real operator instead of an empty string (which would never
-                      // match at verify time, permanently dead-ending the button).
-                      // Empty string is only written when the operator is genuinely
-                      // unknown (no inbound message captured yet for this chat).
-                      Ref.get(chatOperators).pipe(
-                        Effect.flatMap((operators) =>
-                          cardHandles
-                            .put(chatId, {
-                              messageId: handle.messageId,
-                              pendingRequestId,
-                              lastSequence: 0,
-                              operatorOpenId: operators.get(chatId) ?? "",
-                            })
-                            .pipe(
-                              Effect.ignore,
-                              Effect.andThen(Ref.set(lastPendingId, pendingRequestId)),
-                            ),
-                        ),
-                      ),
-                ),
-              );
-            // Record the card handle once up front (no pending yet) so M2b-2
-            // recovery can re-render an outstanding approval card across a restart.
-            yield* persistHandle(null);
-            yield* observation.ticks.pipe(
-              Stream.runForEach((thread) =>
-                captureCurrentTurnId(thread).pipe(
-                  Effect.andThen(Ref.get(currentTurnIdRef)),
-                  Effect.flatMap((currentTurnId) =>
-                    buildInteraction(chatId, thread).pipe(
-                      Effect.flatMap((interaction) =>
-                        handle
-                          .update(
-                            renderThreadCard(thread, {
-                              streaming: true,
-                              currentTurnId,
-                              ...(interaction ? { interaction } : {}),
-                            }).card,
-                          )
-                          .pipe(
-                            Effect.ignore,
-                            // Refresh the handle's `pendingRequestId` to the top open
-                            // request (approval first, then user-input — the same
-                            // priority `surfacePendingApprovalIfNew` derives its
-                            // `topRequestId` with) — only when it changed. #2: a
-                            // user-input-only turn must NOT persist `null` here, or M18
-                            // restart recovery (which skips a handle whose
-                            // `pendingRequestId === null`) would never recover the
-                            // user-input card.
-                            Effect.andThen(
-                              persistHandle(
-                                derivePendingApprovals(thread.activities)[0]?.requestId ??
-                                  derivePendingUserInputs(thread.activities)[0]?.requestId ??
-                                  null,
-                              ),
-                            ),
-                          ),
-                      ),
-                    ),
-                  ),
-                  Effect.ignore,
-                ),
-              ),
-              Effect.forkScoped,
-            );
-
-            // Wait for the turn to reach a terminal state.
-            const outcome = yield* observation.completion;
-            yield* Console.log(
-              `[feishu-bot] turn ${outcome.kind} on thread ${threadId}` +
-                (outcome.kind === "failed" ? ` (status=${outcome.status}).` : "."),
-            );
-
-            // Final card render from the fold's authoritative state. By now the
-            // turn has completed and `finalThread.session.activeTurnId` is null,
-            // so we pass the captured `currentTurnId` to keep the terminal card
-            // scoped to *this* turn's tools/reasoning/error/body (otherwise the
-            // whole thread's history would surface).
-            const finalThread = yield* observation.current;
-            if (finalThread !== null) {
-              const interaction = yield* buildInteraction(chatId, finalThread);
-              const currentTurnId = yield* Ref.get(currentTurnIdRef);
-              yield* handle
-                .update(
-                  renderThreadCard(finalThread, {
-                    streaming: false,
-                    currentTurnId,
-                    ...(interaction ? { interaction } : {}),
-                  }).card,
-                )
-                .pipe(Effect.ignore);
-              // #2: top open request (approval first, then user-input) so a turn that
-              // ends paused on a user-input prompt persists a non-null requestId and is
-              // recoverable across a restart (M18 skips null-pendingRequestId handles).
-              yield* persistHandle(
-                derivePendingApprovals(finalThread.activities)[0]?.requestId ??
-                  derivePendingUserInputs(finalThread.activities)[0]?.requestId ??
-                  null,
-              );
-            }
+            // The whole render loop (per-tick + terminal render + handle persistence)
+            // is the shared `renderObservationToCard` helper (M2b-3 DRY): identical
+            // behaviour to the prior inline body.
+            yield* renderObservationToCard(chatId, threadId, observation, handle);
           } else {
             // No card handle: still wait for the turn to settle (so the SDK
             // producer / completion path resolves identically).
@@ -1386,6 +1897,15 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
           // A flushed/replay turn (which bypassed `offer`) sets `running` here, so
           // messages arriving while it runs are held — never steering it.
           const token = yield* turnQueue.beginTurn(chatId);
+
+          // M2b-3: driveTurn > observe. The bridge is now driving its OWN turn for
+          // this chat, so it must be the single render source — preempt any resident
+          // cross-end observe fiber (a takeover mirror) before `driveTurn` opens its
+          // card, or two streaming cards would fight over the same chat. Interrupting
+          // the observe closes its child scope (unsubscribes the thread); idempotent
+          // no-op when nothing is observing. `ensureObserving`'s `isChatBusy` gate
+          // then keeps observe from restarting while this turn owns the running slot.
+          yield* stopObserve(chatId);
 
           yield* Effect.gen(function* () {
             // Local idempotency pre-check (M9): a stable commandId already recorded
@@ -2120,6 +2640,20 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
             return;
           }
 
+          // 修法 3: seed the in-process `chatOperators` Ref with the recovered operator.
+          // That Ref is empty right after a restart (it is only written by inbound /
+          // `/resume`), so every render path that resolves the operator from it —
+          // observe (修法 2), 修法 A/B (`surfacePendingApprovalIfNew`), `driveTurn` —
+          // would sign post-restart approval buttons with an empty open id (dead
+          // buttons) until the next inbound message. Planting the durable handle's
+          // operator here means those paths pick up the recovered operator immediately,
+          // so the buttons verify across the restart even when observe lands on a fresh
+          // card (修法 1 starts observe right below). 1:1 private chats: the takeover
+          // operator is the chat owner, so this open id is valid for follow-on requests.
+          yield* Ref.update(chatOperators, (map) =>
+            new Map(map).set(chatId, handle.operatorOpenId),
+          );
+
           // #7: bound the one-shot snapshot read. `subscribeThread` is `orDie`'d and
           // retries the subscription forever on an expected failure, so a thread
           // that was deleted/archived while the bot was down (or a server that never
@@ -2211,6 +2745,32 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
             yield* Console.log(
               `[feishu-bot] recovered outstanding approval card for chat ${chatId} (request ${renderedRequestId}).`,
             );
+
+            // 修法 1 (core): if the recovered turn is STILL RUNNING, start observe NOW
+            // so it ADOPTS this just-recovered card instead of opening a second one
+            // later. The bug it fixes: with the turn paused on an approval the shell
+            // stops pushing frames, so observe's adopt trigger (the shellWatcher's 2nd
+            // frame) never fires while paused; it only fires after the user approves #1
+            // and the turn resumes — by which point request #1 is resolved and NOT in
+            // observe's live-pending set, so the adopt branch misses and observe opens a
+            // FRESH card for #2 (with, pre-修法 2/3, an empty-operator signature → dead
+            // buttons). Starting observe here, while #1 is still live-pending, makes
+            // observe's adopt branch HIT immediately: it keeps rendering onto THIS
+            // `messageId` (single card) and 修法 2 forwards the recovered operator, so
+            // follow-on #2 renders on the same card with verifiable buttons.
+            //
+            // `recoverApprovalCards` runs BEFORE `shellWatcher.start`, inside this same
+            // `runBridge` gen scope, so `ensureObserving` is callable here. Its own
+            // gates apply: `isChatBusy` (turnQueue empty post-restart → false) lets it
+            // through, and the atomic claim dedups per-chat (multiple bindings each get
+            // their own observe, keyed by `chatId`). A null `activeTurnId` (turn already
+            // settled) makes `ensureObserving` a no-op. `Effect.ignore` keeps any
+            // observe-start failure from aborting this chat's recovery (the per-chat
+            // `catchCause` below is the second backstop, so startup never crashes).
+            const recoveredActiveTurnId = snapshotThread.session?.activeTurnId ?? null;
+            if (recoveredActiveTurnId !== null) {
+              yield* ensureObserving(chatId, threadId, recoveredActiveTurnId).pipe(Effect.ignore);
+            }
           }
         }).pipe(
           // Per-chat isolation: a failure recovering one chat must not abort the
