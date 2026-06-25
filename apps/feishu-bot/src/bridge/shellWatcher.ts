@@ -49,7 +49,7 @@
  * / mirror-teardown / notice send through injected hooks so it stays decoupled
  * from `bindingState`'s and the gateway's concrete shapes.
  */
-import type { OrchestrationThreadShell, ThreadId } from "@t3tools/contracts";
+import type { OrchestrationThreadShell, ThreadId, TurnId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -140,6 +140,30 @@ export interface ShellWatcherDeps {
    * the shared reconciliation/notification fold.
    */
   readonly surfacePendingApproval: (chatId: string, threadId: ThreadId) => Effect.Effect<void>;
+  /**
+   * Start (or no-op) a resident cross-end observe fiber that live-mirrors a running
+   * turn on `threadId` onto a Feishu card in `chatId`, until it ends (M2b-3). The
+   * watcher calls this for a `resumed` binding whose shell shows a turn running
+   * (`session.activeTurnId`), so a turn web/terminal starts *after* the takeover —
+   * which 修法 A/B never see (they only surface pending approvals) — is mirrored too.
+   *
+   * It is the bot's `ensureObserving`: its own gates (skip when `activeTurnId` is
+   * null, skip when the bridge is driving this chat's own turn, skip when an
+   * outstanding approval card already exists, and an atomic dedup+claim keyed on the
+   * chat's PRESENCE in the observe registry — self-evicting on exit) make calling it
+   * on EVERY frame the resumed thread is running safe. Dedup is per-chatId, NOT
+   * per-turn: at most one observe fiber/card per chat, and a chat's consecutive turns
+   * reuse it — a chained A→B turn that never shows `activeTurnId === null` between the
+   * two keeps being mirrored onto the same card (continuous mirror), and B's call here
+   * is simply deduped out. A fresh observe is only started after the prior one self-
+   * evicts (turn reached a terminal state). Decoupled from the gateway/observe
+   * concretes.
+   */
+  readonly ensureObserving: (
+    chatId: string,
+    threadId: ThreadId,
+    activeTurnId: TurnId | null,
+  ) => Effect.Effect<void>;
   /**
    * Persistent store for per-thread notice dedup state. Replaces the
    * process-local `Ref<Map>` so dedup survives a bot restart: a cold (re)start
@@ -299,6 +323,31 @@ export const runShellWatcherFiber = (deps: ShellWatcherDeps): Effect.Effect<Shel
         // state consistent for the cold-start baseline seed and `/release` reset;
         // only the user-facing `sendNotice` call is removed.
         const approvalNotified = shell.hasPendingApprovals;
+
+        // ── M2b-3: live-mirror a turn web/terminal started AFTER the takeover ──────
+        // The user accepted "也纳入接管后 web 又起的新 turn 也要镜像": once a chat is
+        // taken over, a turn another end starts later must be mirrored just like the
+        // one that was running at takeover. 修法 A/B only surface *pending approvals*;
+        // they never mirror a turn's progress/result. This resident fiber is the one
+        // observer of the resumed thread's shell, so whenever it shows a turn running
+        // (`session.activeTurnId`) we hand off to `ensureObserving`, which forks a
+        // cross-end observe card (and no-ops if already observing / if the bridge is
+        // driving this chat's own turn / if an outstanding approval card already
+        // exists). Its atomic dedup is keyed on the chat's PRESENCE in the observe
+        // registry (NOT per-turn), with the fiber self-evicting on exit, so calling it
+        // on every running frame is safe — one observe fiber/card per chat, reused
+        // across a chat's consecutive turns (continuous mirror); a fresh one starts
+        // only after the prior self-evicts. Best-effort: `ensureObserving` never
+        // fails, but wrap defensively so it cannot break this frame.
+        if (shell.session?.activeTurnId != null) {
+          yield* deps
+            .ensureObserving(chatId, binding.threadId, shell.session.activeTurnId)
+            .pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("[feishu-bot] shellWatcher ensureObserving failed", cause),
+              ),
+            );
+        }
 
         // M2b-2 (修法 B): surface follow-on / chained approvals AND user-inputs for a
         // resumed thread. After a `/resume` takeover the bridge is NOT live-mirroring,
