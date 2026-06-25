@@ -454,8 +454,8 @@ export interface ChatComposerProps {
 
   // Pending approvals / inputs
   activePendingApproval: PendingApproval | null;
-  pendingApprovals: PendingApproval[];
-  pendingUserInputs: PendingUserInput[];
+  pendingApprovals: readonly PendingApproval[];
+  pendingUserInputs: readonly PendingUserInput[];
   activePendingProgress: {
     questionIndex: number;
     isLastQuestion: boolean;

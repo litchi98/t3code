@@ -10,6 +10,7 @@
  * directly — it only sees the shapes declared here.
  */
 import type {
+  CardActionEvent,
   CardStreamController,
   LarkChannelError,
   NormalizedMessage,
@@ -20,6 +21,7 @@ import type {
 // Re-export the SDK types other layers legitimately need to name, so that the
 // bridge depends on `lark/types` rather than reaching into `@larksuite/channel`.
 export type {
+  CardActionEvent,
   CardStreamController,
   LarkChannelError,
   NormalizedMessage,
@@ -86,6 +88,15 @@ export interface InboundMessage {
 export interface BridgeHandlers {
   /** A new normalised private-chat message arrived. */
   readonly onInboundMessage: (message: InboundMessage) => void;
+  /**
+   * A card interaction (button click / form submit) fired. Unlike
+   * {@link onInboundMessage} this is *not* gated on chat type — interaction
+   * cards live only in the private chats the bridge already drives, so the SDK
+   * delivers every `cardAction` straight through (M2b-1). The evt carries the
+   * card `messageId`, originating `chatId`, the `operator`, and the signed
+   * `action` payload the bridge verifies.
+   */
+  readonly onCardAction: (evt: CardActionEvent) => void;
   /** The underlying WebSocket dropped and is being re-established. */
   readonly onReconnecting: () => void;
   /** The WebSocket reconnected (inbound replay is not available — M7). */

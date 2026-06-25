@@ -189,13 +189,14 @@ const payloadString = (
  * null branch below). While a turn runs we otherwise only consider messages
  * belonging to it (empty ⇒ the caller shows "Working…").
  *
- * When `activeTurnId` is null (the final render after completion, or before the
- * turn starts) we fall back to the most recent assistant message overall — which
- * is this turn's reply once it has completed. This fallback's correctness relies
- * on the bridge serializing turns single-ended: with one end's turn at a time,
- * "most recent" *is* this turn. M2 TODO: under cross-end concurrency this can
- * pick up a *different* end's reply at the completed terminal — the body then
- * needs anchoring on this turn's own `turnId` rather than "latest overall".
+ * The `activeTurnId` argument is the resolved filter basis (the caller passes
+ * `opts.currentTurnId ?? thread.session.activeTurnId`). On the `driveTurn` path
+ * this stays non-null through completion (it carries this turn's id), so the
+ * terminal card shows *this turn's* reply rather than "latest assistant
+ * overall". When the basis is null (a non-`driveTurn` render, or before the turn
+ * starts) we fall back to the most recent assistant message overall — which is
+ * this turn's reply once it has completed, given the bridge serialises turns
+ * single-ended.
  *
  * Providers may emit several assistant messages per turn (commentary between
  * tool calls); we render the most recent matching one as the primary body.
@@ -226,13 +227,17 @@ const latestAssistantText = (
 /**
  * True when an activity belongs to the turn being rendered.
  *
- * Mirrors {@link latestAssistantText}'s body scope so the reasoning/tool panels
- * don't show the *previous* turn's activity during a reused thread's
- * `_thinking…_` window. Same turnId=null tolerance: when `activeTurnId` is null
- * (no turn folded in yet, or final post-completion render) every activity is in
- * scope; when a turn is running we keep activities tagged for it **plus** those
- * with an untagged (null) turnId — only activities *explicitly* tagged for a
- * different turn are dropped.
+ * Mirrors {@link latestAssistantText}'s body scope so the reasoning/tool/error
+ * panels don't show the *previous* turn's activity during a reused thread's
+ * `_thinking…_` window — or the *whole thread's* history on a completed turn's
+ * terminal card. The `activeTurnId` argument is the resolved filter basis
+ * (`opts.currentTurnId ?? thread.session.activeTurnId`): when `driveTurn` passes
+ * `currentTurnId`, this stays non-null through completion and keeps the terminal
+ * render pinned to this turn. Same turnId=null tolerance: when the basis is null
+ * (no turn folded in yet, or a non-`driveTurn` post-completion render) every
+ * activity is in scope; when scoped we keep activities tagged for it **plus**
+ * those with an untagged (null) turnId — only activities *explicitly* tagged for
+ * a different turn are dropped.
  */
 const activityInTurn = (
   activity: OrchestrationThreadActivity,
@@ -399,15 +404,24 @@ const renderTools = (
 
 /**
  * Render the error footer from session.lastError and any error-tone activities.
+ *
+ * Error-tone activities are turn-scoped via {@link activityInTurn} (same basis
+ * as reasoning/tools) so a completed turn's terminal card doesn't fold in
+ * earlier turns' errors. `session.lastError` is session-level (not turn-tagged)
+ * and is left as-is — it already reflects the latest error on the session.
  */
-const renderError = (thread: OrchestrationThread, maxBytes: number): MarkdownElement | null => {
+const renderError = (
+  thread: OrchestrationThread,
+  maxBytes: number,
+  activeTurnId: TurnId | null,
+): MarkdownElement | null => {
   const parts: Array<string> = [];
   const lastError = thread.session?.lastError ?? null;
   if (lastError) {
     parts.push(lastError);
   }
   for (const activity of thread.activities) {
-    if (isErrorActivity(activity)) {
+    if (isErrorActivity(activity) && activityInTurn(activity, activeTurnId)) {
       const detail = payloadString(activity.payload, "detail");
       parts.push(detail.length > 0 ? `${activity.summary}: ${detail}` : activity.summary);
     }
@@ -479,13 +493,21 @@ export const renderThreadCard = (
   const elements: Array<CardElement> = [];
   let degraded = false;
 
-  // Turn scope shared by the body and the reasoning/tool panels so a reused
-  // thread's `_thinking…_` window doesn't surface the previous turn's content
-  // (see latestAssistantText / activityInTurn).
-  const activeTurnId = thread.session?.activeTurnId ?? null;
+  // Turn scope shared by the body and the reasoning/tool/error panels so a
+  // reused thread's `_thinking…_` window doesn't surface the previous turn's
+  // content (see latestAssistantText / activityInTurn).
+  //
+  // Basis = `opts.currentTurnId ?? thread.session.activeTurnId`. `driveTurn`
+  // drives one specific turn and passes that turn's id as `currentTurnId`, so
+  // the scope survives the turn completing: once the turn ends `activeTurnId`
+  // flips to `null` (which would otherwise let the whole thread's history
+  // through), but `currentTurnId` keeps the terminal card pinned to this turn.
+  // Other render paths omit `currentTurnId` and fall back to `activeTurnId`,
+  // preserving the prior behaviour.
+  const turnIdForFilter = opts.currentTurnId ?? thread.session?.activeTurnId ?? null;
 
   // 1. Assistant body (primary). Empty → "thinking" placeholder while streaming.
-  const assistant = latestAssistantText(thread.messages, activeTurnId);
+  const assistant = latestAssistantText(thread.messages, turnIdForFilter);
   if (assistant.length > 0) {
     const trimmed = trimToBytes(assistant, contentBytes);
     degraded = degraded || trimmed.cut;
@@ -495,14 +517,14 @@ export const renderThreadCard = (
   }
 
   // 2. Reasoning (folded by default).
-  const reasoning = renderReasoning(thread.activities, contentBytes, activeTurnId);
+  const reasoning = renderReasoning(thread.activities, contentBytes, turnIdForFilter);
   if (reasoning) {
     elements.push(reasoning.element);
     degraded = degraded || reasoning.degraded;
   }
 
   // 3. Tools (inline when few, folded when ≥ threshold).
-  const tools = renderTools(thread.activities, contentBytes, activeTurnId);
+  const tools = renderTools(thread.activities, contentBytes, turnIdForFilter);
   if (tools) {
     if (elements.length > 0) {
       elements.push(divider());
@@ -511,8 +533,24 @@ export const renderThreadCard = (
     degraded = degraded || tools.degraded;
   }
 
-  // 4. Error footer (already byte-clamped inside renderError).
-  const error = renderError(thread, contentBytes);
+  // 4. Interaction section (pre-rendered by interactionCard, injected via opts).
+  // Each element passes through the same clampElement byte-degradation guard so
+  // oversized interaction elements can't abort the stream. eventRenderer stays
+  // pure: it receives already-rendered CardElement values and knows nothing about
+  // callbackAuth or interactionCard internals.
+  if (opts.interaction && opts.interaction.elements.length > 0) {
+    if (elements.length > 0) {
+      elements.push(divider());
+    }
+    for (const interactionElement of opts.interaction.elements) {
+      elements.push(interactionElement);
+    }
+  }
+
+  // 5. Error footer (already byte-clamped inside renderError). Turn-scoped to
+  // match the body/reasoning/tools so a completed turn's terminal card doesn't
+  // surface earlier turns' errors.
+  const error = renderError(thread, contentBytes, turnIdForFilter);
   if (error) {
     elements.push(divider());
     elements.push(error);

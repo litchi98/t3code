@@ -3,10 +3,24 @@ import {
   EnvironmentRegistry,
   EnvironmentSupervisor,
 } from "@t3tools/client-runtime/connection";
-import { createProject, createThread, startThreadTurn } from "@t3tools/client-runtime/operations";
+import {
+  createProject,
+  createThread,
+  respondToThreadApproval,
+  respondToThreadUserInput,
+  startThreadTurn,
+} from "@t3tools/client-runtime/operations";
 import * as EnvironmentRpc from "@t3tools/client-runtime/rpc";
 import type { RemoteEnvironmentRequestError } from "@t3tools/client-runtime/rpc";
 import {
+  derivePendingApprovals,
+  derivePendingUserInputs,
+  isStalePendingRequestFailureDetail,
+  type PendingApproval,
+} from "@t3tools/client-runtime/state/thread-activity";
+import {
+  ApprovalRequestId,
+  CommandId,
   type EnvironmentId,
   isProviderAvailable,
   MessageId,
@@ -15,14 +29,17 @@ import {
   type OrchestrationMessage,
   type OrchestrationShellStreamItem,
   type OrchestrationThread,
+  type OrchestrationThreadActivity,
   type OrchestrationThreadStreamItem,
   ProjectId,
   type ServerProvider,
   ThreadId,
+  type TurnId,
   TrimmedNonEmptyString,
   WS_METHODS,
 } from "@t3tools/contracts";
 import { resolveSelectableModel } from "@t3tools/shared/model";
+import * as Clock from "effect/Clock";
 import * as Console from "effect/Console";
 import * as Crypto from "effect/Crypto";
 import * as Data from "effect/Data";
@@ -45,10 +62,24 @@ import * as Stream from "effect/Stream";
 import type { FeishuBotConfig } from "./config.ts";
 import { resolveEnvironment, type ResolvedEnvironment } from "./auth.ts";
 import { connectionLayer } from "./runtime/connection.ts";
-import { fileStoresLayer, SentCommandStore } from "./runtime/persistence.ts";
+import {
+  AuditStore,
+  CallbackNonceStore,
+  CardHandleStore,
+  fileStoresLayer,
+  SentCommandStore,
+} from "./runtime/persistence.ts";
 import { LarkGateway } from "./lark/index.ts";
 import { larkGatewayLayer } from "./lark/channel.ts";
-import type { BridgeHandlers, InboundMessage } from "./lark/types.ts";
+import type { BridgeHandlers, CardActionEvent, InboundMessage } from "./lark/types.ts";
+import { CallbackAuth, computePolicyFingerprint } from "./bridge/callbackAuth.ts";
+import {
+  actionToApprovalDecision,
+  formValueToAnswers,
+  type InteractionContext,
+  parseCardActionValue,
+  renderInteractionSection,
+} from "./bridge/interactionCard.ts";
 import { deriveThreadId, ensureThreadForChat } from "./bridge/chatThreadMap.ts";
 import { deriveCommandId } from "./bridge/commandId.ts";
 import { renderThreadCard } from "./bridge/eventRenderer.ts";
@@ -263,6 +294,50 @@ const makeBrandedId = <A>(brand: { readonly make: (value: string) => A }) =>
  */
 const decodeTrimmedNonEmpty = Schema.decodeEffect(TrimmedNonEmptyString);
 
+/**
+ * The set of request ids whose pending approval/user-input was force-resolved by
+ * a *stale/unknown* provider respond failure (M11). Scans the activity log for
+ * `provider.{approval,user-input}.respond.failed` activities whose detail matches
+ * {@link isStalePendingRequestFailureDetail}, surfacing their `requestId` so the
+ * interaction renderer greys those controls out ("请求已失效") instead of leaving
+ * a dead button. Pure; mirrors the same failed-kind detection the shared derive
+ * helpers and the web/mobile clients use.
+ */
+const staleRequestIdsOf = (
+  activities: ReadonlyArray<OrchestrationThreadActivity>,
+): ReadonlySet<string> => {
+  const stale = new Set<string>();
+  for (const activity of activities) {
+    if (
+      activity.kind !== "provider.approval.respond.failed" &&
+      activity.kind !== "provider.user-input.respond.failed"
+    ) {
+      continue;
+    }
+    const payload =
+      activity.payload && typeof activity.payload === "object"
+        ? (activity.payload as Record<string, unknown>)
+        : null;
+    const requestId = typeof payload?.requestId === "string" ? payload.requestId : null;
+    const detail = payload && typeof payload.detail === "string" ? payload.detail : undefined;
+    if (requestId && isStalePendingRequestFailureDetail(detail)) {
+      stale.add(requestId);
+    }
+  }
+  return stale;
+};
+
+/** TTL for a callback button token: 24h (the card outlives a single turn). */
+const CALLBACK_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Feishu's client locks a submitted form for ~1s (FORM_SETTLE_MS). Updating the
+ * card before that lock clears rolls the update back, so a user-input *form*
+ * submit echo waits this long before re-rendering. An approval (plain button)
+ * echo is immediate.
+ */
+const FORM_SETTLE_DELAY = Duration.seconds(1);
+
 // ── Resident bridge core ─────────────────────────────────────────────────────
 
 /**
@@ -278,6 +353,19 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     const sent = yield* SentCommandStore;
     const outbound = yield* OutboundQueue;
     const turnQueue = yield* TurnQueue;
+    // M2b-1 interaction-kernel stores: the durable nonce guard (single-use
+    // callback tokens), the append-only audit log (who clicked what), and the
+    // chat → latest interaction-card handle (for re-render / recovery). All three
+    // come from `fileStoresLayer` (no baseLayer change needed).
+    const nonceStore = yield* CallbackNonceStore;
+    const audit = yield* AuditStore;
+    const cardHandles = yield* CardHandleStore;
+    // A stable, synchronous view of the live nonce map for `CallbackAuth.verify`
+    // (which is sync and IO-free). Yielded once; its reference never changes
+    // because the backing `Map` is mutated in place — it always reflects the
+    // latest state. Durable consumption is the handler's job (await
+    // `nonceStore.consume` after verify succeeds, before routing).
+    const nonceProbe = yield* nonceStore.probe;
     // M2a: the mutable chat↔thread binding view (in-memory, store-backed). This
     // is now the single source of truth for "which thread backs this chat" — it
     // replaces the M1 direct `ChatThreadMapStore` reads on the bridge hot path
@@ -337,6 +425,50 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     // operations (which need `Crypto` for any auto-generated ids) can have that
     // requirement discharged here, leaving a fully-total effect for the bridge.
     const crypto = yield* Crypto.Crypto;
+
+    // M2b-1 callback-button HMAC auth. Single key (version 1) seeded from the
+    // Feishu app secret; the synchronous nonce probe lets `verify` reject
+    // replays in memory while the handler awaits the durable `consume`. A
+    // re-signed token binds each rendered button to its exact
+    // `(chat, thread, runtimeMode, operator, action)` context (policy
+    // fingerprint) so a stale or cross-context click fails verification.
+    const auth = new CallbackAuth({
+      keys: [{ version: 1, secret: config.feishu.appSecret }],
+      nonces: nonceProbe,
+    });
+
+    // E④: chatId → operator open id, captured from each inbound message. The
+    // interaction card binds its buttons to the operator known at render time
+    // (private chats are 1:1, so the last sender is the chat's operator); the
+    // cardAction verify re-checks the actual clicker against the token's `o`.
+    const chatOperators = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
+
+    // P2: per-chat resolved overlay — chatId → (requestId → "✅ 已由 @… 允许\n…").
+    // The cardAction handler writes a resolved notice here on a successful
+    // respond; the live `driveTurn` render reads it (via `buildInteraction`) so a
+    // subsequent streaming tick — which has no operator knowledge of its own —
+    // keeps the resolved request greyed out for the whole turn AND after it ends,
+    // instead of the echo being overwritten by the next plain re-render. Cleared
+    // for a chat on `/release` (the overlay is bound to the chat's session).
+    const chatResolvedNotices = yield* Ref.make<ReadonlyMap<string, ReadonlyMap<string, string>>>(
+      new Map(),
+    );
+    const clearChatResolvedNotices = (chatId: string): Effect.Effect<void> =>
+      Ref.update(chatResolvedNotices, (map) => {
+        if (!map.has(chatId)) {
+          return map;
+        }
+        const next = new Map(map);
+        next.delete(chatId);
+        return next;
+      });
+
+    // P3: openId → resolved Feishu display name. The cardAction echo prefers the
+    // name the event already carried (`evt.operator.name`), then this in-process
+    // cache, then a one-off `gateway.getUser` contact lookup (cached on success).
+    // A lookup failure (missing `contact:user.base:readonly` scope → 403, etc.)
+    // is swallowed and falls back to the raw openId — never blocking the echo.
+    const operatorNames = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
 
     /**
      * Run an environment-scoped orchestration command on the connected
@@ -533,6 +665,9 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
       startMirror,
       stopMirror,
       clearNoticeMemory: shellWatcher.clearNoticeMemory,
+      // P2: `/release` drops the chat's resolved overlay so a future session in
+      // the same chat does not inherit stale "✅ 已由 …" greyed-out controls.
+      clearResolvedNotices: clearChatResolvedNotices,
       isChatBusy,
     });
 
@@ -612,6 +747,63 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         ),
       );
 
+    /**
+     * Build the interaction section (approval buttons / user-input form / stale
+     * notices) for one folded thread state, signed for `chatId`'s current
+     * operator. Pure derivation from `thread.activities`:
+     *  - `derivePendingApprovals` / `derivePendingUserInputs` open the live
+     *    pending requests (shared client-runtime logic, the same web/mobile use);
+     *  - `staleRequestIdsOf` greys out any request a stale/unknown respond failure
+     *    already force-resolved (M11);
+     *  - each button is HMAC-signed via `auth.sign` bound to
+     *    `(chatId, threadId, runtimeMode, operator, action)` (the policy
+     *    fingerprint), with `runtimeMode = thread.runtimeMode` (E②: the render
+     *    side uses the thread's own runtimeMode).
+     * Returns the `RenderOptions.interaction` value (or `undefined` when there is
+     * nothing pending — so the renderer adds no empty section).
+     */
+    const buildInteraction = (
+      chatId: string,
+      thread: OrchestrationThread,
+    ): Effect.Effect<{ readonly elements: ReadonlyArray<object> } | undefined> =>
+      Effect.gen(function* () {
+        const pendingApprovals = derivePendingApprovals(thread.activities);
+        const pendingUserInputs = derivePendingUserInputs(thread.activities);
+        // P2: read the resolved overlay BEFORE the early-return so a turn with no
+        // live pending requests but one resolved this session still renders the
+        // greyed-out echo ("✅ 已由 @… 允许") — during the turn AND after it completes
+        // (when pending is empty). The streaming render has no operator knowledge, so
+        // the overlay is the only carrier of the echo. Empty overlay → live state.
+        const resolvedNotice =
+          (yield* Ref.get(chatResolvedNotices)).get(chatId) ?? new Map<string, string>();
+        if (
+          pendingApprovals.length === 0 &&
+          pendingUserInputs.length === 0 &&
+          resolvedNotice.size === 0
+        ) {
+          return undefined;
+        }
+        const operators = yield* Ref.get(chatOperators);
+        const operatorOpenId = operators.get(chatId) ?? "";
+        const staleSet = staleRequestIdsOf(thread.activities);
+        const ctx: InteractionContext = {
+          chatId,
+          threadId: thread.id,
+          operatorOpenId,
+          runtimeMode: thread.runtimeMode,
+          auth,
+          ttlMs: CALLBACK_TOKEN_TTL_MS,
+        };
+        const elements = renderInteractionSection(
+          pendingApprovals,
+          pendingUserInputs,
+          staleSet,
+          resolvedNotice,
+          ctx,
+        );
+        return { elements };
+      });
+
     // Drive the live card + observer + completion for an already-dispatched turn.
     // `cardDone` is resolved on EVERY exit (success/failure/interrupt) so the SDK
     // stream producer always exits and `stream()` settles — never a parked
@@ -638,34 +830,116 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
               Effect.option,
             );
 
+          // The turnId of the turn this `driveTurn` is driving. Captured from the
+          // first tick whose folded session carries a non-null `activeTurnId`
+          // (turn now running), then held — so once the turn completes and
+          // `activeTurnId` flips back to `null`, the final/terminal render still
+          // filters tools/reasoning/error/body to *this* turn instead of letting
+          // the whole thread's history flood in. `null` only until the running
+          // frame lands (before which the renderer falls back to `activeTurnId`).
+          const currentTurnIdRef = yield* Ref.make<TurnId | null>(null);
+          const captureCurrentTurnId = (thread: OrchestrationThread) =>
+            Ref.update(currentTurnIdRef, (seen) => seen ?? thread.session?.activeTurnId ?? null);
+
           // Push each render tick to the card (best-effort; throttled by the SDK).
           const handle = Option.isSome(card) ? card.value : null;
           if (handle !== null) {
+            // The pendingRequestId last persisted to the card handle. Persist a
+            // handle update only when it *changes* (the JSON store writes on every
+            // `put`), not on every render tick — so recovery (M2b-2) still sees
+            // the outstanding approval without per-tick file churn.
+            const lastPendingId = yield* Ref.make<string | null | undefined>(undefined);
+            const persistHandle = (pendingRequestId: string | null) =>
+              Ref.get(lastPendingId).pipe(
+                Effect.flatMap((seen) =>
+                  seen === pendingRequestId
+                    ? Effect.void
+                    : cardHandles
+                        .put(chatId, {
+                          messageId: handle.messageId,
+                          pendingRequestId,
+                          lastSequence: 0,
+                        })
+                        .pipe(
+                          Effect.ignore,
+                          Effect.andThen(Ref.set(lastPendingId, pendingRequestId)),
+                        ),
+                ),
+              );
+            // Record the card handle once up front (no pending yet) so M2b-2
+            // recovery can re-render an outstanding approval card across a restart.
+            yield* persistHandle(null);
             yield* observation.ticks.pipe(
               Stream.runForEach((thread) =>
-                handle
-                  .update(renderThreadCard(thread, { streaming: true }).card)
-                  .pipe(Effect.ignore),
+                captureCurrentTurnId(thread).pipe(
+                  Effect.andThen(Ref.get(currentTurnIdRef)),
+                  Effect.flatMap((currentTurnId) =>
+                    buildInteraction(chatId, thread).pipe(
+                      Effect.flatMap((interaction) =>
+                        handle
+                          .update(
+                            renderThreadCard(thread, {
+                              streaming: true,
+                              currentTurnId,
+                              ...(interaction ? { interaction } : {}),
+                            }).card,
+                          )
+                          .pipe(
+                            Effect.ignore,
+                            // Refresh the handle's `pendingRequestId` to the first
+                            // open approval (if any) — only when it changed.
+                            Effect.andThen(
+                              persistHandle(
+                                derivePendingApprovals(thread.activities)[0]?.requestId ?? null,
+                              ),
+                            ),
+                          ),
+                      ),
+                    ),
+                  ),
+                  Effect.ignore,
+                ),
               ),
               Effect.forkScoped,
             );
-          }
 
-          // Wait for the turn to reach a terminal state.
-          const outcome = yield* observation.completion;
-          yield* Console.log(
-            `[feishu-bot] turn ${outcome.kind} on thread ${threadId}` +
-              (outcome.kind === "failed" ? ` (status=${outcome.status}).` : "."),
-          );
+            // Wait for the turn to reach a terminal state.
+            const outcome = yield* observation.completion;
+            yield* Console.log(
+              `[feishu-bot] turn ${outcome.kind} on thread ${threadId}` +
+                (outcome.kind === "failed" ? ` (status=${outcome.status}).` : "."),
+            );
 
-          // Final card render from the fold's authoritative state.
-          if (handle !== null) {
+            // Final card render from the fold's authoritative state. By now the
+            // turn has completed and `finalThread.session.activeTurnId` is null,
+            // so we pass the captured `currentTurnId` to keep the terminal card
+            // scoped to *this* turn's tools/reasoning/error/body (otherwise the
+            // whole thread's history would surface).
             const finalThread = yield* observation.current;
             if (finalThread !== null) {
+              const interaction = yield* buildInteraction(chatId, finalThread);
+              const currentTurnId = yield* Ref.get(currentTurnIdRef);
               yield* handle
-                .update(renderThreadCard(finalThread, { streaming: false }).card)
+                .update(
+                  renderThreadCard(finalThread, {
+                    streaming: false,
+                    currentTurnId,
+                    ...(interaction ? { interaction } : {}),
+                  }).card,
+                )
                 .pipe(Effect.ignore);
+              yield* persistHandle(
+                derivePendingApprovals(finalThread.activities)[0]?.requestId ?? null,
+              );
             }
+          } else {
+            // No card handle: still wait for the turn to settle (so the SDK
+            // producer / completion path resolves identically).
+            const outcome = yield* observation.completion;
+            yield* Console.log(
+              `[feishu-bot] turn ${outcome.kind} on thread ${threadId}` +
+                (outcome.kind === "failed" ? ` (status=${outcome.status}).` : "."),
+            );
           }
         }).pipe(
           // Whatever happens, release the SDK producer so the card settles into
@@ -1028,6 +1302,14 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
      */
     const handleInbound = (message: InboundMessage): Effect.Effect<void> =>
       Effect.gen(function* () {
+        // E④: remember who this chat's operator is (private chats are 1:1, so the
+        // latest sender is the chat owner). The interaction card binds its buttons
+        // to this open id at render time; the cardAction verify re-checks the
+        // actual clicker against the token's `o`.
+        yield* Ref.update(chatOperators, (map) =>
+          new Map(map).set(message.chatId, message.senderId),
+        );
+
         // Content filter (M16): M1 dispatches text only. A message with no text
         // (image/file-only, or an empty body) must NOT become an empty-prompt
         // turn — reply with an explicit "text only" notice and skip dispatch.
@@ -1074,6 +1356,269 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         // Live path: `offlineBuffer` buffers (succeeds) rather than signalling a
         // retry, so `OfflineRetry` is unreachable here — treat it as a defect.
         yield* runTurn(message.chatId, merged, offlineBuffer).pipe(Effect.orDie);
+      });
+
+    // ── M2b-1: cardAction (button click / form submit) → shared respond RPC ──
+    //
+    // Echo an outcome onto the very card that was clicked. `messageId` is taken
+    // from the event (E④), so this never queries the card-handle store. Failures
+    // degrade the card to a "已失效/已接管" notice rather than crashing the fiber.
+    const updateCardNotice = (messageId: string, text: string): Effect.Effect<void> =>
+      gateway
+        .updateCard(messageId, renderThreadCard(makeNoticeThread(text), { streaming: false }).card)
+        .pipe(
+          Effect.tapError((error) =>
+            Console.error(`[feishu-bot] card update failed for ${messageId}: ${error.message}`),
+          ),
+          Effect.ignore,
+        );
+
+    // P3: resolve the operator's display name for the echo. Priority: the name
+    // the cardAction event already carried → the in-process cache → a one-off
+    // `gateway.getUser` contact lookup (cached on success). Every lookup failure
+    // (missing scope → 403, network) degrades gracefully to the raw openId — the
+    // echo must never block or throw on name resolution.
+    const resolveOperatorName = (operator: {
+      readonly openId: string;
+      readonly name?: string;
+    }): Effect.Effect<string> =>
+      Effect.gen(function* () {
+        const openId = operator.openId;
+        const eventName = operator.name?.trim();
+        if (eventName) {
+          return eventName;
+        }
+        const cached = (yield* Ref.get(operatorNames)).get(openId);
+        if (cached !== undefined) {
+          return cached;
+        }
+        const looked = yield* gateway.getUser(openId).pipe(
+          Effect.map((user): string | null => user.name?.trim() ?? null),
+          // Missing `contact:user.base:readonly` scope (403), network, etc. → fall
+          // back to the openId; never block or fail the echo.
+          Effect.orElseSucceed((): string | null => null),
+        );
+        const resolved = looked && looked.length > 0 ? looked : openId;
+        yield* Ref.update(operatorNames, (map) => new Map(map).set(openId, resolved));
+        return resolved;
+      });
+
+    // P4: friendly Chinese name for an approval's request kind (the operation type
+    // shown in the resolved echo header, e.g. "命令 ✅ 已由 @… 允许").
+    const approvalKindLabel = (kind: PendingApproval["requestKind"]): string => {
+      switch (kind) {
+        case "command":
+          return "命令";
+        case "file-read":
+          return "读取文件";
+        case "file-change":
+          return "文件改动";
+      }
+    };
+
+    /**
+     * Handle one cardAction (button click / form submit) end to end (contract B9
+     * §9). The bridge is a thin *shared* client: it verifies the signed token,
+     * durably consumes its single-use nonce, then routes the operator's decision
+     * through the SAME shared respond RPC (`respondToThreadApproval` /
+     * `respondToThreadUserInput`) every other end uses — no bridge-private
+     * approval state. Every step that can't proceed degrades the clicked card to
+     * a plain notice instead of leaving a dead button.
+     */
+    const handleCardAction = (evt: CardActionEvent): Effect.Effect<void> =>
+      Effect.gen(function* () {
+        // 1. Parse the callback value. A foreign / legacy button → ignore.
+        const parsed = parseCardActionValue(evt.action.value);
+        if (parsed === null) {
+          return;
+        }
+
+        // 2. Resolve the chat's bound thread. No binding → the chat is not (or no
+        //    longer) driving a session; tell the operator and stop.
+        const binding = yield* bindings.get(evt.chatId);
+        if (binding === null) {
+          yield* updateCardNotice(evt.messageId, "会话未接管,无法响应此操作。");
+          return;
+        }
+        const threadId = binding.threadId;
+
+        // 3. Read the thread's *current* runtimeMode from the shell cache (E②:
+        //    the verify side uses the shell's runtimeMode, which may lag the
+        //    render side's by <1s). Absent shell → treat the button as stale.
+        const shell = yield* shellCache.threadById(threadId);
+        if (shell === null) {
+          yield* updateCardNotice(evt.messageId, "⚠️ 此操作已失效。");
+          return;
+        }
+
+        // 4. Recompute the policy fingerprint for the verify context.
+        const fp = computePolicyFingerprint(evt.chatId, threadId, shell.runtimeMode);
+
+        // 5. Verify the token against the expected context (no `action` — it is
+        //    carried by and routed from the signed payload, adjustment 2).
+        const res = auth.verify(parsed.token, {
+          runId: threadId,
+          scope: evt.chatId,
+          chatId: evt.chatId,
+          operatorOpenId: evt.operator.openId,
+          policyFingerprint: fp,
+        });
+
+        // 6. Verification failure → degrade the card; never route.
+        if (!res.ok) {
+          yield* Console.log(
+            `[feishu-bot] cardAction rejected for chat ${evt.chatId} (${res.reason}).`,
+          );
+          yield* updateCardNotice(evt.messageId, "⚠️ 按钮已失效,请回到最新卡片重新操作。");
+          return;
+        }
+
+        // 7. The request must still be open & pending (it may have been answered
+        //    elsewhere, or force-resolved stale). Take a one-shot snapshot of the
+        //    thread (the subscribe stream replays a full snapshot first) and
+        //    re-derive the pending set, then locate the matching request. The
+        //    `Stream.take(1)` closes the subscription immediately (scoped read).
+        const firstFrame = yield* Stream.runHead(
+          subscribeThread(threadId).pipe(Stream.take(1)),
+        ).pipe(Effect.scoped);
+        const snapshotThread = Option.match(firstFrame, {
+          onNone: () => null as OrchestrationThread | null,
+          onSome: (item) => (item.kind === "snapshot" ? item.snapshot.thread : null),
+        });
+        const activities = snapshotThread?.activities ?? [];
+        const pendingApprovals = derivePendingApprovals(activities);
+        const pendingUserInputs = derivePendingUserInputs(activities);
+        const matchedApproval = pendingApprovals.find(
+          (approval) => approval.requestId === parsed.requestId,
+        );
+        const matchedUserInput = pendingUserInputs.find(
+          (userInput) => userInput.requestId === parsed.requestId,
+        );
+        if (matchedApproval === undefined && matchedUserInput === undefined) {
+          yield* updateCardNotice(evt.messageId, "⚠️ 此操作已失效(请求已被处理或过期)。");
+          return;
+        }
+
+        // 8. Durably consume the single-use nonce BEFORE routing (adjustment 1:
+        //    no crash-replay window). A `false` means another delivery already
+        //    consumed it → replay; degrade and stop.
+        const consumed = yield* nonceStore
+          .consume(res.payload.n, res.payload.exp)
+          .pipe(Effect.orElseSucceed(() => false));
+        if (!consumed) {
+          yield* updateCardNotice(evt.messageId, "⚠️ 此操作已失效(重复点击)。");
+          return;
+        }
+
+        // 9. One commandId for both the respond RPC and the audit row (adjustment
+        //    6) so the durable ledger keys exactly the dispatched command.
+        const commandId = yield* genId(CommandId);
+        const requestId = ApprovalRequestId.make(parsed.requestId);
+
+        // 10. Route through the shared respond RPC. `runOnEnv` discharges
+        //     Crypto/EnvironmentSupervisor and orDies any unexpected failure.
+        const isApproval = matchedApproval !== undefined;
+        if (isApproval) {
+          const decision = actionToApprovalDecision(res.payload.a);
+          if (decision === null) {
+            yield* updateCardNotice(evt.messageId, "⚠️ 无法识别的操作。");
+            return;
+          }
+          yield* runOnEnv(respondToThreadApproval({ threadId, requestId, decision, commandId }));
+        } else {
+          const questions = matchedUserInput?.questions ?? [];
+          // The unified user-input form submits natively, so the answers ride in
+          // `evt.action.formValue`. `parsed.formValue` is a legacy fallback (the
+          // removed single-select button group) kept for value-shape stability.
+          const answers = formValueToAnswers(evt.action.formValue ?? parsed.formValue, questions);
+          yield* runOnEnv(respondToThreadUserInput({ threadId, requestId, answers, commandId }));
+        }
+
+        // 11. Append the immutable audit row under the SAME commandId.
+        const ts = yield* Clock.currentTimeMillis;
+        yield* audit
+          .append(commandId, {
+            operatorOpenId: evt.operator.openId,
+            chatId: evt.chatId,
+            threadId,
+            command: res.payload.a,
+            ts,
+          })
+          .pipe(Effect.ignore);
+
+        // 12. Echo the outcome onto the clicked card by RE-RENDERING the same
+        //     thread snapshot with this request's interaction controls greyed out,
+        //     preserving the thread body — never replacing the whole card with a
+        //     bare notice (which would drop the conversation). The resolved-notice
+        //     text (P4) leads with the operation type + decision verb and lists the
+        //     operation detail, attributed to the operator's resolved name (P3).
+        //     We persist that text into the chat's resolved overlay (P2) so every
+        //     subsequent `driveTurn` render tick keeps this request greyed out for
+        //     the whole turn and after it ends, then echo it onto this card now.
+        const who = yield* resolveOperatorName(evt.operator);
+        const verb = isApproval ? (res.payload.a === "approval:accept" ? "允许" : "拒绝") : "提交";
+        // P4: "<操作类型> ✅ 已由 @<name> <verb>\n<detail>". For an approval the type
+        // is the request kind (命令/读取文件/文件改动) and the detail is the approval's
+        // detail; a user-input submit has no kind/detail, so it is just the header.
+        const kindLabel = matchedApproval ? approvalKindLabel(matchedApproval.requestKind) : "回答";
+        const detailLine = matchedApproval?.detail?.trim();
+        const resolvedText =
+          `${kindLabel} ✅ 已由 @${who} ${verb}` + (detailLine ? `\n${detailLine}` : "");
+
+        // P2: record the overlay BEFORE echoing so any render tick racing this
+        // handler already sees the request as resolved.
+        yield* Ref.update(chatResolvedNotices, (map) => {
+          const forChat = new Map(map.get(evt.chatId) ?? new Map<string, string>());
+          forChat.set(parsed.requestId, resolvedText);
+          return new Map(map).set(evt.chatId, forChat);
+        });
+
+        const echoResolved = (): Effect.Effect<void> => {
+          if (snapshotThread === null) {
+            return updateCardNotice(evt.messageId, resolvedText);
+          }
+          const operatorOpenId = evt.operator.openId;
+          const ctx: InteractionContext = {
+            chatId: evt.chatId,
+            threadId,
+            operatorOpenId,
+            runtimeMode: shell.runtimeMode,
+            auth,
+            ttlMs: CALLBACK_TOKEN_TTL_MS,
+          };
+          const resolvedNotice = new Map<string, string>([[parsed.requestId, resolvedText]]);
+          const elements = renderInteractionSection(
+            pendingApprovals,
+            pendingUserInputs,
+            staleRequestIdsOf(activities),
+            resolvedNotice,
+            ctx,
+          );
+          const card = renderThreadCard(snapshotThread, {
+            streaming: false,
+            interaction: { elements },
+          }).card;
+          return gateway.updateCard(evt.messageId, card).pipe(
+            Effect.tapError((error) =>
+              Console.error(`[feishu-bot] card echo failed for ${evt.messageId}: ${error.message}`),
+            ),
+            Effect.ignore,
+          );
+        };
+
+        // Approval (plain button) echoes immediately. A user-input *form* submit
+        // is gated by Feishu's ~1s client-side form lock (FORM_SETTLE_MS); a
+        // button-group tap is not a native form submit so it echoes immediately
+        // too. Native form submit is detected by `evt.action.formValue != null`
+        // (the SDK only fills it on a form submit; a button-group tap carries its
+        // answer in `parsed.formValue`/`value`). The settled echo is fired off
+        // the handler so the cardAction callback returns promptly.
+        const isNativeFormSubmit = !isApproval && evt.action.formValue != null;
+        if (isNativeFormSubmit) {
+          runFork(Effect.sleep(FORM_SETTLE_DELAY).pipe(Effect.andThen(echoResolved())));
+        } else {
+          yield* echoResolved();
+        }
       });
 
     // Consumer: fork one handler per message so the queue's idle-window coalesce
@@ -1141,6 +1686,21 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     const handlers: BridgeHandlers = {
       onInboundMessage: (message) => {
         runFork(Queue.offer(inbox, message));
+      },
+      onCardAction: (evt) => {
+        // The cardAction handler degrades every failure to a card notice and
+        // orDies only on a genuine defect; fork it on the bridge runtime so the
+        // SDK callback returns immediately (non-blocking edge).
+        runFork(
+          handleCardAction(evt).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logError(
+                `[feishu-bot] cardAction handler failed for chat ${evt.chatId}.`,
+                cause,
+              ),
+            ),
+          ),
+        );
       },
       onReconnecting: () => {
         runFork(Console.log("[feishu-bot] feishu websocket reconnecting..."));

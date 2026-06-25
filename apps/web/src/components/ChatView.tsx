@@ -60,9 +60,8 @@ import {
   collapseExpandedComposerCursor,
   parseStandaloneComposerSlashCommand,
 } from "../composer-logic";
+import { derivePendingApprovals, derivePendingUserInputs } from "@t3tools/client-runtime/state/thread-activity";
 import {
-  derivePendingApprovals,
-  derivePendingUserInputs,
   derivePhase,
   deriveTimelineEntries,
   deriveActiveWorkStartedAt,

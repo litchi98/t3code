@@ -56,6 +56,12 @@ export interface CommandDeps {
    */
   readonly clearNoticeMemory: (threadId: ThreadId) => Effect.Effect<void>;
   /**
+   * Drop the chat's resolved-interaction overlay (the per-chat "✅ 已由 …" greyed
+   * notices the cardAction echo persists), called on `/release` so a later
+   * session in the same chat does not inherit stale resolved controls (P2).
+   */
+  readonly clearResolvedNotices: (chatId: string) => Effect.Effect<void>;
+  /**
    * Whether the chat is *busy* — a turn is running **or** messages are coalescing
    * in the idle merge window (a dispatch is imminent). A `/resume` re-bind is
    * refused while busy, so a re-point never interleaves with an in-flight or
@@ -245,6 +251,9 @@ export const buildCommandTable = (deps: CommandDeps): ReadonlyMap<string, Comman
       if (binding !== null) {
         yield* deps.clearNoticeMemory(binding.threadId);
       }
+      // P2: clear the chat's resolved-interaction overlay too, so a future session
+      // here starts with no stale greyed-out "✅ 已由 …" controls.
+      yield* deps.clearResolvedNotices(chatId);
       yield* deps.stopMirror(chatId);
       yield* deps.sendNotice(chatId, "已退出当前会话。");
     });

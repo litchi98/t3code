@@ -6,10 +6,9 @@ import { Atom } from "effect/unstable/reactivity";
 
 import { threadEnvironment } from "../state/threads";
 import { scopedRequestKey } from "../lib/scopedEntities";
+import { derivePendingApprovals, derivePendingUserInputs } from "@t3tools/client-runtime/state/thread-activity";
 import {
   buildPendingUserInputAnswers,
-  derivePendingApprovals,
-  derivePendingUserInputs,
   setPendingUserInputCustomAnswer,
   type PendingUserInputDraftAnswer,
 } from "../lib/threadActivity";

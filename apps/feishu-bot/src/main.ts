@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 
 import { loadConfig } from "./config.ts";
 import { program } from "./bot.ts";
+import { installProcessGuards } from "./processGuard.ts";
 
 /**
  * Headless feishu-bot M1 entrypoint (resident).
@@ -20,5 +21,13 @@ const main = Effect.gen(function* () {
   const config = yield* loadConfig;
   yield* program(config);
 }).pipe(Effect.scoped, Effect.provide(NodeServices.layer));
+
+// Last line of defence against SDK-internal async failures that escape the
+// Effect runtime — chiefly the streaming-card controller's throttled
+// `patchCard`, which the SDK fires on an un-awaited timer, so a rejected card
+// (a bad payload / 400 / transient Feishu error) would otherwise crash the
+// resident bridge as an unhandledRejection. Installed before `runMain` so it
+// covers the whole process lifetime. See `processGuard.ts`.
+installProcessGuards();
 
 NodeRuntime.runMain(main);
