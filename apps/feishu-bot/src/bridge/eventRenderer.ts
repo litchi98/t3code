@@ -1,5 +1,5 @@
 /**
- * Pure renderer: reducer state → CardKit 2.0 card JSON (M6).
+ * Pure renderer: reducer state → CardKit 2.0 card JSON (M6, v2 card render M2b-2).
  *
  * Consumes an {@link OrchestrationThread} (the local state maintained by
  * `session.ts` via `applyThreadDetailEvent`) and produces the card to push.
@@ -9,18 +9,61 @@
  * truncated reasoning, trimmed long output) to stay under Feishu's ~30KB
  * per-element ceiling — exceeding it aborts the whole stream with a 400.
  *
+ * Card layout (v2): header line (🧵 title + runtime badge) → subtitle
+ * (📁 workspace · 🌿 branch · 🔒 runtimeMode) → assistant body (or a "⏳ 处理中…"
+ * working indicator while streaming and empty) → reasoning panel (🧠, dynamic
+ * expand/collapse) → tools panel (single 🔧 collapsible, one row per tool) →
+ * interaction section (injected) → error footer. Every element — including the
+ * header/subtitle/working/tool rows — passes through {@link clampElement}.
+ *
  * Strictly pure: no IO, no clock, no randomness. The card JSON is hand-built
- * CardKit 2.0 DSL (the SDK treats it as an opaque `object`).
+ * CardKit 2.0 DSL (the SDK treats it as an opaque `object`). Only CardKit 2.0
+ * tags are used (markdown / hr / collapsible_panel — never `checkbox`, which
+ * 400s the whole stream).
  */
 import type {
   OrchestrationMessage,
   OrchestrationThread,
   OrchestrationThreadActivity,
+  RuntimeMode,
   TurnId,
 } from "@t3tools/contracts";
 
 import type { CardElement, CardJson } from "../lark/card.ts";
-import type { RenderOptions, RenderResult } from "./types.ts";
+import type { RenderOptions as BaseRenderOptions, RenderResult } from "./types.ts";
+
+/**
+ * Forward seam for M3 group-chat noise control. `card` is the full v2 layout
+ * (header + subtitle + body + reasoning + tools + interaction + error); the
+ * other modes are reserved (today they fall back to `card`).
+ */
+export type RenderDensity = "card" | "markdown" | "text";
+
+/**
+ * Render options consumed by {@link renderThreadCard}. Extends the bridge-shared
+ * {@link BaseRenderOptions} (streaming / currentTurnId / maxElementBytes /
+ * interaction) with the renderer-local {@link RenderDensity} seam. Kept here
+ * (not in `bridge/types.ts`) because `density` is purely a renderer concern.
+ */
+export interface RenderOptions extends BaseRenderOptions {
+  /**
+   * Output density. Defaults to `card`. Only `card` is implemented; `markdown`
+   * and `text` currently fall back to the `card` layout (see the density switch
+   * in {@link renderThreadCard}). TODO(M3): 群聊降噪密度.
+   */
+  readonly density?: RenderDensity;
+  /**
+   * Whether to render the v2 chrome: header line (🧵 title + runtime badge) and
+   * subtitle (📁 workspace · 🌿 branch · 🔒 runtimeMode). Defaults to `true`.
+   *
+   * Set to `false` for notice/status cards (makeNoticeThread / sendNotice paths)
+   * that carry only a short text body — the chrome is meaningless there (the
+   * notice thread has no real title or workspace) and adds visual noise. All
+   * other sections (body, reasoning, tools, interaction, error footer) are
+   * unaffected; every element still passes through {@link clampElement}.
+   */
+  readonly chrome?: boolean;
+}
 
 /** Feishu's per-element size limit. Elements estimated above this are degraded. */
 export const MAX_ELEMENT_BYTES = 30_000;
@@ -32,16 +75,16 @@ export const MAX_ELEMENT_BYTES = 30_000;
 const SAFE_ELEMENT_BYTES = 28_000;
 /** Reasoning panels are folded and trimmed hard — they're secondary content. */
 const REASONING_MAX_CHARS = 1_500;
-/** A single tool's inline output before it gets folded/trimmed. */
+/** A single tool's detail line before it gets trimmed. */
 const TOOL_DETAIL_MAX_CHARS = 800;
-/**
- * Fold tool activity into one collapsible once this many *distinct tools*
- * appear. Counted per tool instance (started/updated/completed of one call
- * collapse to one), not per lifecycle activity row.
- */
-const TOOL_FOLD_THRESHOLD = 3;
 /** Marker appended to any text we had to cut. */
 const TRUNCATION_MARKER = "\n\n… [truncated]";
+/**
+ * Appended to a tool detail row when its content was truncated. Diff/file-change
+ * tools can carry far more than {@link TOOL_DETAIL_MAX_CHARS}; rather than mint a
+ * deep link we point the operator at the terminal/Web where the full diff lives.
+ */
+const DIFF_OVERFLOW_HINT = " (diff 较大,完整内容请见终端/Web)";
 
 // ── Byte estimation ─────────────────────────────────────────────────────────
 
@@ -214,8 +257,8 @@ const latestAssistantText = (
     // different turn. A null `message.turnId` means the provider didn't tag this
     // streaming chunk's turn (some providers omit it on streaming text) — we
     // treat unknown-turn as the current turn and let it through, otherwise the
-    // whole turn would stay stuck on `_thinking…_` and this turn's text would be
-    // wrongly dropped.
+    // whole turn would stay stuck on the `⏳ 处理中…` working indicator and this
+    // turn's text would be wrongly dropped.
     if (activeTurnId !== null && message.turnId !== null && message.turnId !== activeTurnId) {
       continue;
     }
@@ -229,7 +272,7 @@ const latestAssistantText = (
  *
  * Mirrors {@link latestAssistantText}'s body scope so the reasoning/tool/error
  * panels don't show the *previous* turn's activity during a reused thread's
- * `_thinking…_` window — or the *whole thread's* history on a completed turn's
+ * working-indicator (`⏳ 处理中…`) window — or the *whole thread's* history on a completed turn's
  * terminal card. The `activeTurnId` argument is the resolved filter basis
  * (`opts.currentTurnId ?? thread.session.activeTurnId`): when `driveTurn` passes
  * `currentTurnId`, this stays non-null through completion and keeps the terminal
@@ -245,15 +288,24 @@ const activityInTurn = (
 ): boolean => activeTurnId === null || activity.turnId === null || activity.turnId === activeTurnId;
 
 /**
- * Render the reasoning panel from `task.progress` activities. Folded by default;
- * prefers `payload.summary` (the reasoning_summary_text) over `payload.detail`.
+ * Render the reasoning panel from `task.progress` activities. Prefers
+ * `payload.summary` (the reasoning_summary_text) over `payload.detail`.
  * Hard-trimmed to {@link REASONING_MAX_CHARS} then to bytes. Scoped to
  * `activeTurnId` (see {@link activityInTurn}) to stay consistent with the body.
+ *
+ * Dynamic expand/collapse (v2): while the turn is still running we surface the
+ * thinking expanded with a "🧠 思考中…" header so the operator sees it stream;
+ * once the turn completes we collapse it to "🧠 思考完成,点击查看" so the terminal
+ * card stays compact. Either way the (possibly large) joined content is byte-
+ * clamped here AND again by the global {@link clampElement} guard. This panel
+ * appears ONLY when there is real reasoning activity — it is never the working
+ * indicator (that is `⏳ 处理中…` in the body position).
  */
 const renderReasoning = (
   activities: ReadonlyArray<OrchestrationThreadActivity>,
   maxBytes: number,
   activeTurnId: TurnId | null,
+  inProgress: boolean,
 ): { readonly element: CollapsiblePanelElement; readonly degraded: boolean } | null => {
   const lines: Array<string> = [];
   for (const activity of activities) {
@@ -273,8 +325,9 @@ const renderReasoning = (
   const joined = lines.join("\n\n");
   const byChars = trimToChars(joined, REASONING_MAX_CHARS);
   const byBytes = trimToBytes(byChars.text, maxBytes);
+  const title = inProgress ? "🧠 思考中…" : "🧠 思考完成,点击查看";
   return {
-    element: collapsible("🧠 Reasoning", byBytes.text, false),
+    element: collapsible(title, byBytes.text, inProgress),
     degraded: byChars.cut || byBytes.cut,
   };
 };
@@ -357,27 +410,80 @@ const isLaterPhase = (
 };
 
 /**
- * Render one aggregated tool instance as a single markdown line: its (de-suffixed)
- * label plus the terminal-phase detail, truncated.
+ * Terminal status of one aggregated tool instance, derived from its kept phase.
+ * `tool.completed` → completed/failed (failed when its status payload says so or
+ * its tone flipped to error); anything earlier (started/updated) → inProgress.
  */
-const renderToolLine = (activity: OrchestrationThreadActivity): string => {
-  const detail = payloadString(activity.payload, "detail");
-  const head = `\`${toolInstanceLabel(activity)}\``;
-  if (detail.length === 0) {
-    return head;
+type ToolStatus = "completed" | "inProgress" | "failed";
+
+const toolStatus = (activity: OrchestrationThreadActivity): ToolStatus => {
+  if (activity.tone === "error") {
+    return "failed";
   }
-  const trimmed = trimToChars(detail, TOOL_DETAIL_MAX_CHARS).text;
-  return `${head}\n${trimmed}`;
+  if (activity.kind === "tool.completed") {
+    const status = payloadString(activity.payload, "status").toLowerCase();
+    return status === "failed" || status === "error" ? "failed" : "completed";
+  }
+  return "inProgress";
+};
+
+const TOOL_STATUS_ICON: Readonly<Record<ToolStatus, string>> = {
+  completed: "✓",
+  inProgress: "⏳",
+  failed: "✗",
 };
 
 /**
- * Render tool activity. Lifecycle rows are first aggregated to one entry per
- * tool instance (started/updated/completed → its terminal state), so the fold
- * threshold and degraded flag reflect the real tool count, not the activity
- * count. ≤ {@link TOOL_FOLD_THRESHOLD} tools render inline as a markdown
- * element; more fold into a single collapsed panel. Either way the combined
- * content is byte-clamped. Scoped to `activeTurnId` (see {@link activityInTurn})
- * to stay consistent with the body.
+ * Render one aggregated tool instance as a single markdown line inside the tools
+ * panel: `<status icon> \`<label>\`  <truncated detail>`.
+ *
+ * Truncation suffix policy (no double-suffix):
+ * - Not truncated → detail as-is.
+ * - Truncated, NOT a diff/file_change type → detail ends with
+ *   {@link TRUNCATION_MARKER} (already baked in by {@link trimToChars}).
+ * - Truncated AND diff/file_change → replace the generic
+ *   {@link TRUNCATION_MARKER} suffix with {@link DIFF_OVERFLOW_HINT} so the
+ *   operator knows where to see the full diff without a redundant double-suffix.
+ */
+const renderToolLine = (activity: OrchestrationThreadActivity): string => {
+  const icon = TOOL_STATUS_ICON[toolStatus(activity)] ?? "•";
+  const head = `${icon} \`${toolInstanceLabel(activity)}\``;
+  const detail = payloadString(activity.payload, "detail");
+  if (detail.length === 0) {
+    return head;
+  }
+  const clipped = trimToChars(detail, TOOL_DETAIL_MAX_CHARS);
+  let tail: string;
+  if (clipped.cut) {
+    const itemType = payloadString(activity.payload, "itemType");
+    const isDiff = itemType === "file_change" || itemType.includes("diff");
+    if (isDiff) {
+      // Strip the generic TRUNCATION_MARKER already embedded by trimToChars and
+      // replace it with the diff-specific hint. The marker is a fixed string so
+      // slicing it off is safe and allocation-minimal.
+      const base = clipped.text.endsWith(TRUNCATION_MARKER)
+        ? clipped.text.slice(0, clipped.text.length - TRUNCATION_MARKER.length)
+        : clipped.text;
+      tail = `${base}${DIFF_OVERFLOW_HINT}`;
+    } else {
+      // Non-diff truncation: TRUNCATION_MARKER is already baked into clipped.text.
+      tail = clipped.text;
+    }
+  } else {
+    tail = clipped.text;
+  }
+  return `${head}  ${tail}`;
+};
+
+/**
+ * Render tool activity (v2). Lifecycle rows are first aggregated to one entry
+ * per tool instance (started/updated/completed → its terminal state). Regardless
+ * of count, every tool renders into ONE collapsed `collapsible_panel`: the
+ * folded header reads `🔧 N 个工具 (X✓ Y⏳ [Z✗])` (Z omitted when no failures) and
+ * the expanded body is one markdown line per tool. The combined body is byte-
+ * clamped here and again by the global {@link clampElement} guard. Returns null
+ * when there are no tools (0-tool turns render nothing). Scoped to `activeTurnId`
+ * (see {@link activityInTurn}) to stay consistent with the body.
  */
 const renderTools = (
   activities: ReadonlyArray<OrchestrationThreadActivity>,
@@ -388,18 +494,27 @@ const renderTools = (
   if (tools.length === 0) {
     return null;
   }
-  const lines = tools.map(renderToolLine);
-  const joined = lines.join("\n\n");
-  const fold = tools.length >= TOOL_FOLD_THRESHOLD;
-  const byBytes = trimToBytes(joined, maxBytes);
-  const degraded = fold || byBytes.cut;
-  if (fold) {
-    return {
-      element: collapsible(`🛠️ Tools (${tools.length})`, byBytes.text, false),
-      degraded: true,
-    };
+  let completed = 0;
+  let inProgress = 0;
+  let failed = 0;
+  for (const tool of tools) {
+    const status = toolStatus(tool);
+    if (status === "completed") {
+      completed += 1;
+    } else if (status === "failed") {
+      failed += 1;
+    } else {
+      inProgress += 1;
+    }
   }
-  return { element: markdown(byBytes.text), degraded };
+  const counts = `${completed}✓ ${inProgress}⏳` + (failed > 0 ? ` ${failed}✗` : "");
+  const title = `🔧 ${tools.length} 个工具 (${counts})`;
+  const joined = tools.map(renderToolLine).join("\n\n");
+  const byBytes = trimToBytes(joined, maxBytes);
+  return {
+    element: collapsible(title, byBytes.text, false),
+    degraded: byBytes.cut,
+  };
 };
 
 /**
@@ -431,6 +546,72 @@ const renderError = (
   }
   const body = `**⚠️ Error**\n${parts.join("\n")}`;
   return markdown(trimToBytes(body, maxBytes).text);
+};
+
+// ── Header + subtitle (v2) ───────────────────────────────────────────────────
+
+/**
+ * Emoji badge for a runtime mode, surfaced in the header line so the operator
+ * sees at a glance what the agent is allowed to do. `approval-required` (🔒) is
+ * the only gated mode; `full-access` (✅) and `auto-accept-edits` (✏️) run
+ * un-gated. Unknown modes fall back to 🔒 (treat-as-gated, never under-warn).
+ */
+const RUNTIME_BADGE: Readonly<Record<RuntimeMode, string>> = {
+  "approval-required": "🔒",
+  "auto-accept-edits": "✏️",
+  "full-access": "✅",
+};
+const runtimeBadge = (mode: RuntimeMode): string => RUNTIME_BADGE[mode] ?? "🔒";
+
+/**
+ * The runtime mode in effect for the render: the live session's mode when the
+ * session exists (it can drift from the thread default mid-turn), else the
+ * thread's configured mode.
+ */
+const effectiveRuntimeMode = (thread: OrchestrationThread): RuntimeMode =>
+  thread.session?.runtimeMode ?? thread.runtimeMode;
+
+/**
+ * Best-effort workspace/project label for the subtitle: the basename of the
+ * thread's worktree path (the closest project-scoped string the renderer is
+ * handed — the project title itself lives on `OrchestrationProject`, which this
+ * pure renderer never receives). Returns "" when no worktree is set so the
+ * caller can gracefully omit the field rather than invent one.
+ */
+const workspaceLabel = (thread: OrchestrationThread): string => {
+  const path = thread.worktreePath;
+  if (path === null) {
+    return "";
+  }
+  const segments = path.split("/").filter((segment) => segment.length > 0);
+  return segments.length > 0 ? (segments[segments.length - 1] ?? "") : "";
+};
+
+/**
+ * Header line: `🧵 <title>  <runtime badge>`. Always renderable (`title` is a
+ * required non-empty field). Small markdown element; still byte-clamped globally.
+ */
+const renderHeader = (thread: OrchestrationThread): MarkdownElement =>
+  markdown(`🧵 **${thread.title}**  ${runtimeBadge(effectiveRuntimeMode(thread))}`);
+
+/**
+ * Subtitle line: `📁 <workspace> · 🌿 <branch> · 🔒 <runtimeMode>`. Each segment
+ * is included only when its source field is present — a missing workspace or a
+ * null branch is gracefully omitted (no placeholder/invented value). The runtime
+ * mode is always present, so the subtitle always carries at least that segment.
+ */
+const renderSubtitle = (thread: OrchestrationThread): MarkdownElement => {
+  const mode = effectiveRuntimeMode(thread);
+  const segments: Array<string> = [];
+  const workspace = workspaceLabel(thread);
+  if (workspace.length > 0) {
+    segments.push(`📁 ${workspace}`);
+  }
+  if (thread.branch !== null) {
+    segments.push(`🌿 ${thread.branch}`);
+  }
+  segments.push(`${runtimeBadge(mode)} ${mode}`);
+  return markdown(segments.join(" · "));
 };
 
 // ── Card envelope ───────────────────────────────────────────────────────────
@@ -469,10 +650,18 @@ const clampElement = (
 /**
  * Render the current thread state into a card.
  *
- * Element order: assistant body → reasoning (folded) → tools → error footer.
+ * Element order (v2): header (🧵 title + runtime badge) → subtitle
+ * (📁 workspace · 🌿 branch · 🔒 runtimeMode) → assistant body (or `⏳ 处理中…`
+ * working indicator while streaming with no body yet) → reasoning panel (🧠,
+ * expanded while the turn runs, collapsed once it completes) → tools panel
+ * (single 🔧 collapsible, one row per tool) → interaction section → error footer.
  * Every element is byte-estimated and degraded to stay under
  * `opts.maxElementBytes ?? MAX_ELEMENT_BYTES`. `streaming_mode` is set from
  * `opts.streaming`.
+ *
+ * `opts.density` is a forward seam for M3 group-chat noise control. Only `card`
+ * (the full layout above) is implemented today; `markdown`/`text` fall back to
+ * the `card` behaviour (see the density switch below).
  *
  * NOTE on streaming: the card-producer path (`lark.stream`) refreshes the whole
  * card via throttled full patches — it does NOT drive Feishu's native per-text
@@ -490,12 +679,24 @@ export const renderThreadCard = (
   // JSON envelope can't push us over the actual wire limit.
   const contentBytes = Math.min(SAFE_ELEMENT_BYTES, Math.max(0, ceiling - 2_000));
 
+  // Density seam (M2b-2). Resolve to a layout mode; only `card` is implemented.
+  // TODO(M3): 群聊降噪密度 — `markdown` (drop chrome, body-only) / `text` (plain
+  // line) for noisy group chats. Until then both fall back to the `card` layout.
+  const density = opts.density ?? "card";
+  switch (density) {
+    case "markdown":
+    case "text":
+    // TODO(M3): 群聊降噪密度 — distinct low-noise layouts. Fall through to `card`.
+    case "card":
+      break;
+  }
+
   const elements: Array<CardElement> = [];
   let degraded = false;
 
   // Turn scope shared by the body and the reasoning/tool/error panels so a
-  // reused thread's `_thinking…_` window doesn't surface the previous turn's
-  // content (see latestAssistantText / activityInTurn).
+  // reused thread's working-indicator (`⏳ 处理中…`) window doesn't surface the
+  // previous turn's content (see latestAssistantText / activityInTurn).
   //
   // Basis = `opts.currentTurnId ?? thread.session.activeTurnId`. `driveTurn`
   // drives one specific turn and passes that turn's id as `currentTurnId`, so
@@ -506,24 +707,49 @@ export const renderThreadCard = (
   // preserving the prior behaviour.
   const turnIdForFilter = opts.currentTurnId ?? thread.session?.activeTurnId ?? null;
 
-  // 1. Assistant body (primary). Empty → "thinking" placeholder while streaming.
+  // Turn-in-progress signal: the session is mid-turn (a turn is active, or the
+  // provider status is `running`/`starting`). Drives the reasoning panel's
+  // expand/collapse. `streaming` alone isn't enough — it's a card-state marker
+  // the caller sets — so we also read the live session. Session-less placeholder
+  // threads (notices) read as not-in-progress: their `activeTurnId` is absent,
+  // not null, so we check the session exists before trusting it.
+  const sessionStatus = thread.session?.status ?? null;
+  const inProgress =
+    opts.streaming ||
+    (thread.session != null && thread.session.activeTurnId !== null) ||
+    sessionStatus === "running" ||
+    sessionStatus === "starting";
+
+  // 1. Header + subtitle (always renderable: title/runtimeMode are required).
+  // Skipped when `opts.chrome === false` (notice/status cards that carry only a
+  // short text body and have no meaningful title or workspace to surface).
+  const withChrome = opts.chrome !== false;
+  if (withChrome) {
+    elements.push(renderHeader(thread));
+    elements.push(renderSubtitle(thread));
+  }
+
+  // 2. Assistant body (primary). Empty while streaming → `⏳ 处理中…` working
+  // indicator (a working signal, NOT "thinking" — real reasoning lives in the
+  // 🧠 panel below). Rendered in the body position, never as a fold.
   const assistant = latestAssistantText(thread.messages, turnIdForFilter);
   if (assistant.length > 0) {
     const trimmed = trimToBytes(assistant, contentBytes);
     degraded = degraded || trimmed.cut;
     elements.push(markdown(trimmed.text));
   } else if (opts.streaming) {
-    elements.push(markdown("_thinking…_"));
+    elements.push(markdown("⏳ 处理中…"));
   }
 
-  // 2. Reasoning (folded by default).
-  const reasoning = renderReasoning(thread.activities, contentBytes, turnIdForFilter);
+  // 3. Reasoning (🧠). Expanded while the turn runs ("🧠 思考中…"), collapsed once
+  // it completes ("🧠 思考完成,点击查看"). Only present with real reasoning activity.
+  const reasoning = renderReasoning(thread.activities, contentBytes, turnIdForFilter, inProgress);
   if (reasoning) {
     elements.push(reasoning.element);
     degraded = degraded || reasoning.degraded;
   }
 
-  // 3. Tools (inline when few, folded when ≥ threshold).
+  // 4. Tools (single 🔧 collapsible, one row per tool; 0 tools → nothing).
   const tools = renderTools(thread.activities, contentBytes, turnIdForFilter);
   if (tools) {
     if (elements.length > 0) {
@@ -533,7 +759,7 @@ export const renderThreadCard = (
     degraded = degraded || tools.degraded;
   }
 
-  // 4. Interaction section (pre-rendered by interactionCard, injected via opts).
+  // 5. Interaction section (pre-rendered by interactionCard, injected via opts).
   // Each element passes through the same clampElement byte-degradation guard so
   // oversized interaction elements can't abort the stream. eventRenderer stays
   // pure: it receives already-rendered CardElement values and knows nothing about
@@ -547,7 +773,7 @@ export const renderThreadCard = (
     }
   }
 
-  // 5. Error footer (already byte-clamped inside renderError). Turn-scoped to
+  // 6. Error footer (already byte-clamped inside renderError). Turn-scoped to
   // match the body/reasoning/tools so a completed turn's terminal card doesn't
   // surface earlier turns' errors.
   const error = renderError(thread, contentBytes, turnIdForFilter);

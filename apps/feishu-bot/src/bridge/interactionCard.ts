@@ -83,6 +83,26 @@ export interface InteractionContext {
 }
 
 /**
+ * One resolved-notice overlay entry (M2b-2). Replaces the bare string that M2b-1
+ * stored in the `resolvedNotice` map. The renderer uses these fields to emit:
+ *   - approval accepted  → `✅ 已由 @<operatorName> 授权 · <commandSummary>`
+ *   - approval declined  → `🚫 已由 @<operatorName> 拒绝 · <commandSummary>`
+ *   - user-input submit  → `✅ 已由 @<operatorName> 提交`  (decision = "submit")
+ *
+ * `commandSummary` comes from the approval's `detail` text (trimmed, then
+ * truncated to {@link RESOLVED_SUMMARY_MAX_CHARS} characters). It is `null` for
+ * user-input resolves (which have no single-line detail to surface).
+ *
+ * `operatorName` is the Feishu display name resolved by `resolveOperatorName`
+ * in bot.ts; it falls back to the raw `openId` when the lookup fails.
+ */
+export interface ResolvedNoticeEntry {
+  readonly operatorName: string;
+  readonly commandSummary: string | null;
+  readonly decision: "accept" | "decline" | "submit";
+}
+
+/**
  * The typed view of a callback button's `value` object. `t` is the signed token,
  * `rid` indexes back to the originating pending request. `q` is a legacy slot
  * (formerly the answered question id for single-question button groups, removed
@@ -106,17 +126,35 @@ export interface ParsedCardAction {
 const PLACEHOLDER_DETAIL = "(无详情)";
 
 /**
+ * Maximum visible characters for a command summary in a resolved-notice line.
+ * Keeps the greyed-out echo well inside CardKit's soft per-element byte limit.
+ * Strings beyond this length are truncated with a trailing `…`.
+ */
+const RESOLVED_SUMMARY_MAX_CHARS = 60;
+
+/** Truncate `text` to {@link RESOLVED_SUMMARY_MAX_CHARS} chars, appending `…`. */
+const truncateSummary = (text: string): string =>
+  text.length <= RESOLVED_SUMMARY_MAX_CHARS
+    ? text
+    : `${text.slice(0, RESOLVED_SUMMARY_MAX_CHARS)}…`;
+
+/**
  * Render the "interaction" section: pending approvals first, then pending
  * user-inputs, each with an overlay for stale (request expired) or resolved
  * (already answered) state. Returns a flat element array the caller splices into
  * the card body (it does **not** include a leading divider unless there is at
  * least one block to render).
+ *
+ * `resolvedNotice` is now keyed by requestId → {@link ResolvedNoticeEntry},
+ * replacing the bare-string shape from M2b-1. Each entry carries the operator
+ * display name, the approval command summary, and the decision, so the renderer
+ * can emit `✅ 已由 @X 授权 · <命令摘要>` or `🚫 已由 @X 拒绝 · <命令摘要>`.
  */
 export const renderInteractionSection = (
   pendingApprovals: ReadonlyArray<PendingApproval>,
   pendingUserInputs: ReadonlyArray<PendingUserInput>,
   staleRequestIds: ReadonlySet<string>,
-  resolvedNotice: ReadonlyMap<string, string>,
+  resolvedNotice: ReadonlyMap<string, ResolvedNoticeEntry>,
   ctx: InteractionContext,
 ): ReadonlyArray<CardElement> => {
   const elements: CardElement[] = [];
@@ -145,15 +183,15 @@ const pushBlock = (target: CardElement[], block: ReadonlyArray<CardElement>): vo
 const renderApprovalBlock = (
   approval: PendingApproval,
   staleRequestIds: ReadonlySet<string>,
-  resolvedNotice: ReadonlyMap<string, string>,
+  resolvedNotice: ReadonlyMap<string, ResolvedNoticeEntry>,
   ctx: InteractionContext,
 ): ReadonlyArray<CardElement> => {
   const requestId = approval.requestId;
   const detail = approval.detail?.trim() || PLACEHOLDER_DETAIL;
 
-  const resolved = resolvedNotice.get(requestId);
-  if (resolved) {
-    return [resolvedMarkdown(`⚠️ 需批准:${detail}`, resolved)];
+  const entry = resolvedNotice.get(requestId);
+  if (entry) {
+    return [resolvedMarkdown(formatResolvedEntry(entry))];
   }
   if (staleRequestIds.has(requestId)) {
     return [staleMarkdown(`⚠️ 需批准:${detail}`)];
@@ -179,16 +217,16 @@ const renderApprovalBlock = (
 const renderUserInputBlock = (
   userInput: PendingUserInput,
   staleRequestIds: ReadonlySet<string>,
-  resolvedNotice: ReadonlyMap<string, string>,
+  resolvedNotice: ReadonlyMap<string, ResolvedNoticeEntry>,
   ctx: InteractionContext,
 ): ReadonlyArray<CardElement> => {
   const requestId = userInput.requestId;
   const questions = userInput.questions;
   const heading = questions[0]?.header?.trim() || "需要你的输入";
 
-  const resolved = resolvedNotice.get(requestId);
-  if (resolved) {
-    return [resolvedMarkdown(`💬 ${heading}`, resolved)];
+  const entry = resolvedNotice.get(requestId);
+  if (entry) {
+    return [resolvedMarkdown(formatResolvedEntry(entry))];
   }
   if (staleRequestIds.has(requestId)) {
     return [staleMarkdown(`💬 ${heading}`)];
@@ -338,10 +376,30 @@ const staleMarkdown = (title: string): CardElement => ({
   content: `${title}\n<font color='grey'>请求已失效</font>`,
 });
 
-/** Greyed-out "already resolved" notice (e.g. "✅ 已由 @op 允许"). */
-const resolvedMarkdown = (title: string, notice: string): CardElement => ({
+/**
+ * Format a {@link ResolvedNoticeEntry} into a single markdown line:
+ *   - accepted approval → `✅ 已由 @<operatorName> 授权 · <commandSummary>`
+ *   - declined approval → `🚫 已由 @<operatorName> 拒绝 · <commandSummary>`
+ *   - user-input submit → `✅ 已由 @<operatorName> 提交`
+ *
+ * `commandSummary` is truncated to {@link RESOLVED_SUMMARY_MAX_CHARS} chars.
+ * When absent (user-input), the `· <summary>` suffix is omitted.
+ */
+const formatResolvedEntry = (entry: ResolvedNoticeEntry): string => {
+  const { operatorName, commandSummary, decision } = entry;
+  const icon = decision === "decline" ? "🚫" : "✅";
+  const verb = decision === "accept" ? "授权" : decision === "decline" ? "拒绝" : "提交";
+  const base = `${icon} 已由 @${operatorName} ${verb}`;
+  if (commandSummary === null || commandSummary.trim().length === 0) {
+    return base;
+  }
+  return `${base} · ${truncateSummary(commandSummary.trim())}`;
+};
+
+/** Greyed-out "already resolved" notice rendered from a {@link ResolvedNoticeEntry}. */
+const resolvedMarkdown = (notice: string): CardElement => ({
   tag: "markdown",
-  content: `${title}\n<font color='grey'>${notice}</font>`,
+  content: `<font color='grey'>${notice}</font>`,
 });
 
 const callbackButton = (options: {

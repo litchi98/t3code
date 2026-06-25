@@ -543,6 +543,24 @@ export class AuditStore extends Context.Service<
 >()("@t3tools/feishu-bot/runtime/persistence/AuditStore") {}
 
 /**
+ * Persisted per-thread notification-memory for the shellWatcher (M2b-2).
+ *
+ * Tracks whether an outstanding approval/user-input was already notified to the
+ * Feishu chat across a bot restart, and the last turn-id that ended in a failure
+ * so recovery can skip re-sending the same failure card.
+ *
+ * - `approvalNotified`: `true` once the bot has sent the card for the current
+ *   pending approval/user-input; prevents a duplicate card on recovery.
+ * - `lastFailedTurnId`: the `turnId` of the last turn whose failure card was
+ *   sent, or `null` if no failure has been notified yet. Recovery skips
+ *   re-sending a failure card when the current turn matches this value.
+ */
+export interface PersistedNoticeMemory {
+  readonly approvalNotified: boolean;
+  readonly lastFailedTurnId: string | null;
+}
+
+/**
  * Handle to the latest interaction card a chat is showing (M2b-1).
  *
  * - `messageId`: the Feishu message id of the card (target of `updateCard`).
@@ -551,12 +569,42 @@ export class AuditStore extends Context.Service<
  * - `lastSequence`: the thread snapshot sequence the card was rendered from, so
  *   recovery can tell whether a newer snapshot needs a re-render. (M2a wrote and
  *   then removed a `lastSequence` on the binding; M2b re-introduces it here.)
+ * - `operatorOpenId`: the Feishu `open_id` of the user who triggered the
+ *   approval/user-input interaction (M2b-2). Used by M18 restart recovery to
+ *   re-sign approval buttons with the real operator rather than a placeholder.
+ *   Older persisted handles that pre-date this field are migrated to `""` (empty
+ *   string = unknown operator) on load.
  */
 export interface CardHandle {
   readonly messageId: string;
   readonly pendingRequestId: string | null;
   readonly lastSequence: number;
+  readonly operatorOpenId: string;
 }
+
+/**
+ * Persistent map of Feishu `ThreadId` → {@link PersistedNoticeMemory} (M2b-2).
+ *
+ * The shellWatcher reads this on startup to avoid re-sending notification cards
+ * for events already delivered before a restart, and writes it each time the
+ * notification state transitions.
+ */
+export class NoticeMemoryStore extends Context.Service<
+  NoticeMemoryStore,
+  {
+    /** Resolve the notice memory for `threadId`, if any. */
+    readonly get: (
+      threadId: ThreadId,
+    ) => Effect.Effect<Option.Option<PersistedNoticeMemory>, FeishuBotPersistenceError>;
+    /** Record `state` for `threadId` (overwrites any existing state). */
+    readonly put: (
+      threadId: ThreadId,
+      state: PersistedNoticeMemory,
+    ) => Effect.Effect<void, FeishuBotPersistenceError>;
+    /** Drop the state for `threadId` (no-op if absent). */
+    readonly remove: (threadId: ThreadId) => Effect.Effect<void, FeishuBotPersistenceError>;
+  }
+>()("@t3tools/feishu-bot/runtime/persistence/NoticeMemoryStore") {}
 
 /**
  * Persistent map of Feishu `chat_id` → latest {@link CardHandle} (M2b-1).
@@ -667,6 +715,22 @@ export const auditStoreLayer = (options: {
   );
 
 /**
+ * Migrate a raw on-disk card-handle value forward to the current
+ * {@link CardHandle} shape. M2b-1 persisted handles without `operatorOpenId`;
+ * M2b-2 adds the field. Missing values are defaulted to `""` (unknown operator).
+ * Pure; runs once per entry at load time.
+ */
+const migrateCardHandle = (raw: unknown): CardHandle => {
+  const handle = raw as CardHandle;
+  return {
+    messageId: handle.messageId,
+    pendingRequestId: handle.pendingRequestId,
+    lastSequence: handle.lastSequence,
+    operatorOpenId: handle.operatorOpenId ?? "",
+  };
+};
+
+/**
  * {@link CardHandleStore} layer backed by a JSON file at
  * `<stateDir>/card-handles.json` (override the full path via `filePath`).
  */
@@ -681,7 +745,7 @@ export const cardHandleStoreLayer = (options: {
       const path = yield* Path.Path;
       const file = options.filePath ?? path.join(options.stateDir, "card-handles.json");
       const backend = jsonFileBackend<CardHandle>(file, { fs, path });
-      const { map, persist } = yield* loadBackedMap(backend);
+      const { map, persist } = yield* loadBackedMap(backend, migrateCardHandle);
       return CardHandleStore.of({
         get: (chatId) => Effect.sync(() => Option.fromUndefinedOr(map.get(chatId))),
         put: (chatId, handle) =>
@@ -701,13 +765,54 @@ export const cardHandleStoreLayer = (options: {
   );
 
 /**
+ * {@link NoticeMemoryStore} layer backed by a JSON file at
+ * `<stateDir>/notice-memory.json` (override the full path via `filePath`).
+ *
+ * Keyed by `ThreadId`; values are {@link PersistedNoticeMemory} objects.
+ */
+export const noticeMemoryStoreLayer = (options: {
+  readonly stateDir: string;
+  readonly filePath?: string;
+}): Layer.Layer<NoticeMemoryStore, FeishuBotPersistenceError, FileSystem.FileSystem | Path.Path> =>
+  Layer.effect(
+    NoticeMemoryStore,
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const file = options.filePath ?? path.join(options.stateDir, "notice-memory.json");
+      const backend = jsonFileBackend<PersistedNoticeMemory>(file, { fs, path });
+      const { map, persist } = yield* loadBackedMap(backend);
+      return NoticeMemoryStore.of({
+        get: (threadId) => Effect.sync(() => Option.fromUndefinedOr(map.get(threadId))),
+        put: (threadId, state) =>
+          Effect.suspend(() => {
+            map.set(threadId, state);
+            return persist;
+          }),
+        remove: (threadId) =>
+          Effect.suspend(() => {
+            if (!map.delete(threadId)) {
+              return Effect.void;
+            }
+            return persist;
+          }),
+      });
+    }),
+  );
+
+/**
  * Convenience: every durable store wired to JSON files under `stateDir`.
  * `bot.ts` provides this once at startup.
  */
 export const fileStoresLayer = (options: {
   readonly stateDir: string;
 }): Layer.Layer<
-  ChatThreadMapStore | SentCommandStore | CallbackNonceStore | AuditStore | CardHandleStore,
+  | ChatThreadMapStore
+  | SentCommandStore
+  | CallbackNonceStore
+  | AuditStore
+  | CardHandleStore
+  | NoticeMemoryStore,
   FeishuBotPersistenceError,
   FileSystem.FileSystem | Path.Path
 > =>
@@ -717,6 +822,7 @@ export const fileStoresLayer = (options: {
     callbackNonceStoreLayer(options),
     auditStoreLayer(options),
     cardHandleStoreLayer(options),
+    noticeMemoryStoreLayer(options),
   );
 
 /** Default per-user state directory (`~/.t3tools/feishu-bot`). */

@@ -16,7 +16,6 @@ import {
   derivePendingApprovals,
   derivePendingUserInputs,
   isStalePendingRequestFailureDetail,
-  type PendingApproval,
 } from "@t3tools/client-runtime/state/thread-activity";
 import {
   ApprovalRequestId,
@@ -67,6 +66,7 @@ import {
   CallbackNonceStore,
   CardHandleStore,
   fileStoresLayer,
+  NoticeMemoryStore,
   SentCommandStore,
 } from "./runtime/persistence.ts";
 import { LarkGateway } from "./lark/index.ts";
@@ -79,6 +79,7 @@ import {
   type InteractionContext,
   parseCardActionValue,
   renderInteractionSection,
+  type ResolvedNoticeEntry,
 } from "./bridge/interactionCard.ts";
 import { deriveThreadId, ensureThreadForChat } from "./bridge/chatThreadMap.ts";
 import { deriveCommandId } from "./bridge/commandId.ts";
@@ -156,6 +157,22 @@ const discoverProject = (
       return fromSnapshot.value;
     }
 
+    // Escape-hatch guard (M2b-2): `workspaceRoot` is now `string | null`. The
+    // happy path returns from the snapshot branch above and never reaches here.
+    // We only land here on a *bare* server (no project yet). Without an explicit
+    // `T3_WORKSPACE_ROOT` we must NOT invent one (the old `process.cwd()` default
+    // silently created a project at the bot's cwd) and must NOT pass `null` into
+    // `createProject` (whose `workspaceRoot: TrimmedNonEmptyString` schema would
+    // fail to decode at dispatch). Die with an actionable message instead.
+    if (config.workspaceRoot === null) {
+      return yield* Effect.die(
+        new Error(
+          "Server has no project and T3_WORKSPACE_ROOT is not set. " +
+            "Either configure a project on the server first, or set " +
+            "T3_WORKSPACE_ROOT to the path where the bot should create one.",
+        ),
+      );
+    }
     yield* Console.log(`[feishu-bot] no project found; creating one at ${config.workspaceRoot}.`);
     const projectId = yield* makeBrandedId(ProjectId);
     yield* registry.run(
@@ -360,6 +377,8 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     const nonceStore = yield* CallbackNonceStore;
     const audit = yield* AuditStore;
     const cardHandles = yield* CardHandleStore;
+    // M2b-2: persistent notice-dedup store so the shellWatcher survives restarts.
+    const noticeMemoryStore = yield* NoticeMemoryStore;
     // A stable, synchronous view of the live nonce map for `CallbackAuth.verify`
     // (which is sync and IO-free). Yielded once; its reference never changes
     // because the backing `Map` is mutated in place — it always reflects the
@@ -443,16 +462,19 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     // cardAction verify re-checks the actual clicker against the token's `o`.
     const chatOperators = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
 
-    // P2: per-chat resolved overlay — chatId → (requestId → "✅ 已由 @… 允许\n…").
-    // The cardAction handler writes a resolved notice here on a successful
-    // respond; the live `driveTurn` render reads it (via `buildInteraction`) so a
+    // P2: per-chat resolved overlay — chatId → (requestId → {@link ResolvedNoticeEntry}).
+    // The cardAction handler writes a resolved entry here on a successful respond;
+    // the live `driveTurn` render reads it (via `buildInteraction`) so a
     // subsequent streaming tick — which has no operator knowledge of its own —
     // keeps the resolved request greyed out for the whole turn AND after it ends,
     // instead of the echo being overwritten by the next plain re-render. Cleared
     // for a chat on `/release` (the overlay is bound to the chat's session).
-    const chatResolvedNotices = yield* Ref.make<ReadonlyMap<string, ReadonlyMap<string, string>>>(
-      new Map(),
-    );
+    // M2b-2: the value is now a structured {@link ResolvedNoticeEntry} (operator
+    // name + command summary + decision) so the renderer composes the localized
+    // "✅ 已由 @X 授权 · <命令摘要>" line itself (the bare-string echo is gone).
+    const chatResolvedNotices = yield* Ref.make<
+      ReadonlyMap<string, ReadonlyMap<string, ResolvedNoticeEntry>>
+    >(new Map());
     const clearChatResolvedNotices = (chatId: string): Effect.Effect<void> =>
       Ref.update(chatResolvedNotices, (map) => {
         if (!map.has(chatId)) {
@@ -572,7 +594,13 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
       Effect.gen(function* () {
         const done = yield* Deferred.make<void>();
         yield* Deferred.succeed(done, undefined);
-        const card = renderThreadCard(makeNoticeThread(text), { streaming: false }).card;
+        // #3/#4: notice cards carry only a short text body on a synthetic
+        // placeholder thread (no real title/workspace), so `chrome: false`
+        // suppresses the 🧵 header + 📁 subtitle that would otherwise be noise.
+        const card = renderThreadCard(makeNoticeThread(text), {
+          streaming: false,
+          chrome: false,
+        }).card;
         yield* gateway.startStreamingCard(chatId, card, { done: Deferred.await(done) }).pipe(
           Effect.tapError((error) =>
             Console.error(`[feishu-bot] notice card failed for chat ${chatId}: ${error.message}`),
@@ -598,11 +626,51 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
       .pipe(Stream.orDie);
     const shellCache = yield* runShellCacheFiber({ shellStream: shellSubscription });
 
+    // Render the last few messages of a takeover snapshot into a compact
+    // markdown transcript (M2b-2). One line per message: `🧑 …` (user) / `🤖 …`
+    // (assistant), each on its own paragraph. Each message body is trimmed to a
+    // single short excerpt so the takeover card stays light — this is a *simple*
+    // transcript, not the live card (no tools/reasoning). The renderer's global
+    // byte-clamp is the backstop; this keeps the common case readable.
+    const TRANSCRIPT_MESSAGE_COUNT = 5;
+    const TRANSCRIPT_EXCERPT_CHARS = 280;
+    const renderTranscriptMarkdown = (
+      messages: ReadonlyArray<OrchestrationMessage>,
+    ): string | null => {
+      const recent = messages
+        .filter(
+          (message) =>
+            (message.role === "user" || message.role === "assistant") &&
+            message.text.trim().length > 0,
+        )
+        .slice(-TRANSCRIPT_MESSAGE_COUNT);
+      if (recent.length === 0) {
+        return null;
+      }
+      return recent
+        .map((message) => {
+          const icon = message.role === "user" ? "🧑" : "🤖";
+          const text = message.text.trim();
+          const excerpt =
+            text.length > TRANSCRIPT_EXCERPT_CHARS
+              ? `${text.slice(0, TRANSCRIPT_EXCERPT_CHARS)}…`
+              : text;
+          return `${icon} ${excerpt}`;
+        })
+        .join("\n\n");
+    };
+
     // Mirror-light: a `/resume` takeover (or a self-created first contact) does
     // not start a resident per-thread observe fiber. `startMirror` re-binds the
-    // chat as `origin: "resumed"` and pushes a single, one-off "已接管" snapshot
-    // card summarising the thread's current shell state; live streaming only
-    // resumes when the user sends the next message (the normal turn path).
+    // chat as `origin: "resumed"` then pushes a single, one-off "已接管" card.
+    // M2b-2: instead of a shell-status-only notice, it takes a one-shot thread
+    // snapshot (the `subscribeThread` stream replays a full snapshot first;
+    // `Stream.take(1)` + `Effect.scoped` closes the subscription immediately —
+    // the same pattern the cardAction handler uses) and renders a *simple
+    // transcript* card from the last few messages. No resident fiber is started
+    // (still mirror-light); live streaming resumes only when the user sends the
+    // next message (the normal turn path). A null/empty snapshot falls back to
+    // the M2a shell-status text notice.
     const startMirror = (chatId: string, threadId: ThreadId): Effect.Effect<void> =>
       Effect.gen(function* () {
         yield* bindings.bind(chatId, { threadId, origin: "resumed" });
@@ -616,18 +684,83 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
           idle: "状态: 空闲",
           unknown: "(状态未知)",
         }[shellStatus(shell)];
-        yield* sendNotice(
-          chatId,
-          [
-            `已接管会话: ${title}`,
-            statusLine,
-            // The shell view carries no message history; the takeover card is a
-            // status snapshot only. Be honest that full history lives elsewhere
-            // (rich in-card history is M2b's card v2, not this milestone).
-            "(完整历史请见终端/Web)",
-            "发送消息即可继续这个会话;/status 查看状态,/release 退出。",
-          ].join("\n"),
+
+        // One-shot snapshot for the transcript. Any failure here must NOT block
+        // the takeover — fall back to the M2a status-only notice. `Effect.option`
+        // turns a (typed) read failure into `None`; `Option.flatten` collapses the
+        // resulting `Option<Option<item>>` back to `Option<item>`.
+        // #7: `subscribeThread` is `orDie`'d and retries a not-ready subscription
+        // forever, so a deleted/never-delivering thread would hang the user's
+        // `/resume` indefinitely. Bound the read with a `timeout` (→ None) so the
+        // takeover always settles into the status-only fallback within ~10s.
+        const firstFrame = yield* Stream.runHead(
+          subscribeThread(threadId).pipe(Stream.take(1)),
+        ).pipe(
+          Effect.scoped,
+          Effect.timeout(Duration.seconds(10)),
+          Effect.option,
+          Effect.map(Option.flatten),
         );
+        const snapshotThread = Option.match(firstFrame, {
+          onNone: () => null as OrchestrationThread | null,
+          onSome: (item) => (item.kind === "snapshot" ? item.snapshot.thread : null),
+        });
+        const transcript =
+          snapshotThread === null ? null : renderTranscriptMarkdown(snapshotThread.messages);
+
+        if (transcript !== null) {
+          yield* sendNotice(
+            chatId,
+            [
+              `已接管会话: ${title}`,
+              statusLine,
+              "",
+              "最近对话:",
+              transcript,
+              "",
+              "发送消息即可继续这个会话;/status 查看状态,/release 退出。",
+            ].join("\n"),
+          );
+        } else {
+          // Fallback (no snapshot, or no message history): the M2a status-only card.
+          yield* sendNotice(
+            chatId,
+            [
+              `已接管会话: ${title}`,
+              statusLine,
+              // The shell view carries no message history and the snapshot was
+              // unavailable/empty; be honest that full history lives elsewhere.
+              "(完整历史请见终端/Web)",
+              "发送消息即可继续这个会话;/status 查看状态,/release 退出。",
+            ].join("\n"),
+          );
+        }
+
+        // ── M2b-2 (修法 A): surface a pre-existing pending approval on takeover ──
+        //
+        // The §11E "电脑→飞书 approval 接手" promise: a turn started on web that is
+        // *blocked on an approval/user-input* must become actionable from Feishu the
+        // moment the operator `/resume`s. The transcript card above is a *messages*
+        // view only — it never carries the interaction controls. So when a request is
+        // still pending, emit ONE actionable card whose freshly-signed buttons let the
+        // `/resume` operator approve cross-end.
+        //
+        // This now delegates to the shared `surfacePendingApprovalIfNew` helper (the
+        // same one 修法 B's watcher calls) so the takeover-surface and the follow-on
+        // surface stay byte-for-byte consistent (one render/send/persist path, AGENTS
+        // anti-duplication). On takeover there is no prior CardHandle, so the helper's
+        // single-source dedup naturally passes and surfaces approval #1 — persisting
+        // its requestId as the dedup baseline the watcher then composes with (it skips
+        // the same id and surfaces a later #2). The operator captured by
+        // `handleInbound` before routing `/resume` is read from `chatOperators` inside
+        // the helper. Still mirror-light: no resident observe fiber. Robustness
+        // (catchCause) lives inside the helper.
+        //
+        // #7: reuse the `snapshotThread` we already read above for the transcript card
+        // instead of letting the helper take a *second* one-shot snapshot — that
+        // doubled the takeover latency (two reads, each bounded by the 10s subscribe
+        // timeout). Passing it (even `null`) tells the helper "use this; do not read".
+        yield* surfacePendingApprovalIfNew(chatId, threadId, snapshotThread);
       });
 
     // Mirror-light teardown: no resident observe fiber to interrupt, so this is a
@@ -640,36 +773,6 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     // Used by `/resume` to refuse a re-bind while a turn is in flight *or* about
     // to dispatch (the idle merge window). Reads the turn queue's busy view.
     const isChatBusy = (chatId: string): Effect.Effect<boolean> => turnQueue.isBusy(chatId);
-
-    // Reverse-notification + reconciliation watcher. One fiber folding the shared
-    // `shellCache.changes`: it reconciles dangling bindings (thread deleted /
-    // archived elsewhere → unbind + notice) and surfaces key blind-spot events
-    // (new pending approval / failed/interrupted turn) for `origin: "resumed"`
-    // takeovers that are not live-mirroring. Forked on `runBridge`'s scope.
-    // Created before the command table so `/release` can clear a thread's dedup
-    // memory via the returned handle (the discrete unbind lifecycle reset).
-    const shellWatcher = yield* runShellWatcherFiber({
-      shellCache,
-      bindings,
-      stopMirror,
-      sendNotice,
-    });
-
-    // The slash-command table (`/help`, `/status`, `/resume`, `/release`). All
-    // deps are already-total effects (captured service values + the mirror hooks
-    // above), so every handler slots into the table as `Effect.Effect<void>`.
-    const commandTable = buildCommandTable({
-      sendNotice,
-      bindings,
-      shellCache,
-      startMirror,
-      stopMirror,
-      clearNoticeMemory: shellWatcher.clearNoticeMemory,
-      // P2: `/release` drops the chat's resolved overlay so a future session in
-      // the same chat does not inherit stale "✅ 已由 …" greyed-out controls.
-      clearResolvedNotices: clearChatResolvedNotices,
-      isChatBusy,
-    });
 
     // Capture a runtime that forks effects into a scoped FiberSet. This is the
     // edge between the SDK's plain `void` callbacks and the Effect world: the
@@ -765,6 +868,14 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     const buildInteraction = (
       chatId: string,
       thread: OrchestrationThread,
+      // #0/#1(b): optional operator override. The live `driveTurn` path omits it
+      // and resolves the operator from the in-process `chatOperators` Ref. M18
+      // restart recovery passes the operator captured on the persisted card handle
+      // (`handle.operatorOpenId`) because the Ref is empty right after a restart —
+      // re-signing with an empty open id would never match at verify time and would
+      // dead-end the recovered button. A non-empty override wins; otherwise we fall
+      // back to the Ref (preserving the existing live behaviour exactly).
+      operatorOverride?: string,
     ): Effect.Effect<{ readonly elements: ReadonlyArray<object> } | undefined> =>
       Effect.gen(function* () {
         const pendingApprovals = derivePendingApprovals(thread.activities);
@@ -775,7 +886,8 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         // (when pending is empty). The streaming render has no operator knowledge, so
         // the overlay is the only carrier of the echo. Empty overlay → live state.
         const resolvedNotice =
-          (yield* Ref.get(chatResolvedNotices)).get(chatId) ?? new Map<string, string>();
+          (yield* Ref.get(chatResolvedNotices)).get(chatId) ??
+          new Map<string, ResolvedNoticeEntry>();
         if (
           pendingApprovals.length === 0 &&
           pendingUserInputs.length === 0 &&
@@ -784,7 +896,10 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
           return undefined;
         }
         const operators = yield* Ref.get(chatOperators);
-        const operatorOpenId = operators.get(chatId) ?? "";
+        const operatorOpenId =
+          operatorOverride !== undefined && operatorOverride.length > 0
+            ? operatorOverride
+            : (operators.get(chatId) ?? "");
         const staleSet = staleRequestIdsOf(thread.activities);
         const ctx: InteractionContext = {
           chatId,
@@ -803,6 +918,198 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         );
         return { elements };
       });
+
+    // ── M2b-2 (修法 A + 修法 B shared): surface a *new* pending request as a card ──
+    //
+    // Single helper for "a pending approval/user-input exists on `threadId` that
+    // Feishu has not yet rendered an actionable card for → send one fresh card and
+    // remember it". Used by BOTH:
+    //   - 修法 A (`startMirror`): the takeover moment — the approval already pending
+    //     when the operator `/resume`s.
+    //   - 修法 B (`shellWatcher`): the *chained/follow-on* approvals a resumed turn
+    //     raises while the bridge is not live-mirroring (e.g. approve #1 → the turn
+    //     continues → #2 appears). The watcher's single resident fiber calls this
+    //     each frame the resumed thread's shell `hasPendingApprovals` is true.
+    //
+    // ── Single-source dedup (the load-bearing bit) ───────────────────────────────
+    // `CardHandle.pendingRequestId` is the ONE source of truth for "which request is
+    // currently surfaced in Feishu". We read a one-shot thread snapshot, take the
+    // *top* pending requestId (approval first, then user-input — the same priority
+    // `CardHandle` persistence uses elsewhere), and compare it to the stored handle:
+    //   - top requestId === handle.pendingRequestId → already surfaced → return.
+    //   - otherwise (no handle, or a different id) → a genuinely new request →
+    //     send a new card and persist a handle whose `pendingRequestId` is that top
+    //     id, so the next frame/call dedups against it.
+    // This is what keeps the watcher from re-spamming the same approval across the
+    // many frames it stays pending, and what makes 修法 A and 修法 B compose: 修法 A
+    // persists the handle for approval #1 on takeover, so the watcher sees #1 (same
+    // id) and skips; once #1 is approved and #2 appears (new id) the watcher surfaces
+    // #2. No per-frame diffing — dedup is keyed on the stable requestId.
+    //
+    // ROBUSTNESS: the whole effect is `catchCause`-wrapped (warn only). A null/empty
+    // snapshot, a `buildInteraction`/render failure, a failed card send, or a persist
+    // failure must NEVER crash the bot or wedge the watcher's reconciliation loop.
+    const surfacePendingApprovalIfNew = (
+      chatId: string,
+      threadId: ThreadId,
+      // #7: optional already-read first-frame snapshot. `startMirror` reads a first
+      // frame for its transcript card and then calls this helper; passing that same
+      // snapshot here lets the helper reuse it instead of doing a *second*
+      // independent one-shot read (which doubled the `/resume` latency, each read
+      // bounded by the 10s subscribe timeout). The watcher (修法 B) does not pre-read
+      // and passes nothing, so the helper still reads its own first frame. A
+      // `null`/`undefined` value means "read it yourself".
+      preReadSnapshot?: OrchestrationThread | null,
+    ): Effect.Effect<void> =>
+      Effect.gen(function* () {
+        // #3: race guard. When the bridge is actively driving (or about to dispatch)
+        // a turn for THIS chat, `driveTurn` owns the live streaming card and will
+        // render the approval/user-input itself — so a surface here would call
+        // `startStreamingCard` and post a *second*, parallel card before `driveTurn`
+        // has persisted its `pendingRequestId` (the single-source dedup baseline),
+        // i.e. the very window where the requestId dedup cannot yet fire. Skip the
+        // surface entirely while busy and let `driveTurn` render. Read-only probe
+        // (`turnQueue.isBusy`): never mutates the queue's token accounting. (修法 B
+        // / the watcher only reconciles `origin: "resumed"` chats; a resumed user
+        // sending a live message is exactly when this collision happens.)
+        if (yield* isChatBusy(chatId)) {
+          return;
+        }
+
+        // One-shot snapshot read (same bounded pattern as 修法 A / M18 recovery:
+        // `subscribeThread` is `orDie`'d and retries forever, so a deleted /
+        // never-delivering thread would hang without the timeout). A null snapshot
+        // → nothing to surface. #7: reuse a caller-supplied pre-read snapshot when
+        // present so `startMirror` does not read the first frame twice.
+        const snapshotThread =
+          preReadSnapshot !== undefined
+            ? preReadSnapshot
+            : yield* Stream.runHead(subscribeThread(threadId).pipe(Stream.take(1))).pipe(
+                Effect.scoped,
+                Effect.timeout(Duration.seconds(10)),
+                Effect.option,
+                Effect.map(Option.flatten),
+                Effect.map((firstFrame) =>
+                  Option.match(firstFrame, {
+                    onNone: () => null as OrchestrationThread | null,
+                    onSome: (item) => (item.kind === "snapshot" ? item.snapshot.thread : null),
+                  }),
+                ),
+              );
+        if (snapshotThread === null) {
+          return;
+        }
+
+        // Top pending requestId: approval first, then user-input. No pending → done.
+        const pendingApprovals = derivePendingApprovals(snapshotThread.activities);
+        const pendingUserInputs = derivePendingUserInputs(snapshotThread.activities);
+        const topRequestId =
+          pendingApprovals[0]?.requestId ?? pendingUserInputs[0]?.requestId ?? null;
+        if (topRequestId === null) {
+          return;
+        }
+
+        // Single-source dedup: if the currently-surfaced card already solicits this
+        // exact request, it has been surfaced — do not re-send.
+        const handleOpt = yield* cardHandles.get(chatId);
+        if (Option.isSome(handleOpt) && handleOpt.value.pendingRequestId === topRequestId) {
+          return;
+        }
+
+        // Operator: a `resumed` binding was `/resume`d by a user, so `chatOperators`
+        // is normally populated (the inbound `/resume` set it before routing). After
+        // a restart, though, the Ref is empty even though the durable handle still
+        // carries the operator who triggered the prior card — so for a brand-new
+        // approval that surfaces post-restart we fall back to that persisted operator
+        // (in a p2p private chat the takeover operator is the same person, so the
+        // persisted open id is valid for the new request too). Reuse the handle read
+        // above for the dedup so we don't fetch it twice. If BOTH are empty we still
+        // surface the card so the user *sees* a request is pending, but the buttons
+        // would not verify (empty open id) — `buildInteraction` signs with whatever
+        // operator we pass; an empty one yields a card the user can read but whose
+        // click would be rejected at verify time (no wildcard / auth bypass),
+        // prompting a resend. This mirrors M18's graceful fallback.
+        const operators = yield* Ref.get(chatOperators);
+        const operatorOpenId =
+          // #5: the trailing `?? ""` was unreachable — the conditional's else branch
+          // already yields `""`, so the `??` could only ever see a non-nullish string.
+          operators.get(chatId) ?? (Option.isSome(handleOpt) ? handleOpt.value.operatorOpenId : "");
+
+        const interaction = yield* buildInteraction(chatId, snapshotThread, operatorOpenId);
+        const card = renderThreadCard(snapshotThread, {
+          streaming: false,
+          ...(interaction ? { interaction } : {}),
+        }).card;
+
+        // Send a fresh card (one-shot: completion already resolved → render once and
+        // settle) and capture its messageId for the persisted handle.
+        const done = yield* Deferred.make<void>();
+        yield* Deferred.succeed(done, undefined);
+        const sent = yield* gateway.startStreamingCard(chatId, card, {
+          done: Deferred.await(done),
+        });
+
+        // Persist so this call/frame's surfaced request is the dedup baseline for the
+        // next one, and so M18 restart recovery can re-render it.
+        yield* cardHandles.put(chatId, {
+          messageId: sent.messageId,
+          pendingRequestId: topRequestId,
+          lastSequence: 0,
+          operatorOpenId,
+        });
+        yield* Console.log(
+          `[feishu-bot] surfaced pending approval card for chat ${chatId} (request ${topRequestId}).`,
+        );
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning(
+            `[feishu-bot] failed to surface pending approval for chat ${chatId}.`,
+            cause,
+          ),
+        ),
+      );
+
+    // Reverse-notification + reconciliation watcher. One fiber folding the shared
+    // `shellCache.changes`: it reconciles dangling bindings (thread deleted /
+    // archived elsewhere → unbind + notice), surfaces key blind-spot events
+    // (failed/interrupted turn) and — M2b-2 修法 B — the follow-on/chained pending
+    // approvals/user-inputs a resumed turn raises after takeover
+    // (`surfacePendingApproval` delegates to `surfacePendingApprovalIfNew`), all for
+    // `origin: "resumed"` takeovers that are not live-mirroring. Defined here (after
+    // `surfacePendingApprovalIfNew` and `buildInteraction`) so the injected
+    // `surfacePendingApproval` reference is initialised, and before the command table
+    // so `/release` can clear a thread's dedup memory via the returned handle (the
+    // discrete unbind lifecycle reset).
+    //
+    // #4: only the HANDLE is built here; the fold loop is forked later via
+    // `shellWatcher.start` — deliberately AFTER the M18 restart-recovery pass (and
+    // after `gateway.connect`) so recovery has already seeded each chat's
+    // `CardHandle.pendingRequestId` dedup baseline before the watcher's first frame
+    // can race it into a duplicate card.
+    const shellWatcher = yield* runShellWatcherFiber({
+      shellCache,
+      bindings,
+      stopMirror,
+      sendNotice,
+      surfacePendingApproval: surfacePendingApprovalIfNew,
+      noticeMemoryStore,
+    });
+
+    // The slash-command table (`/help`, `/status`, `/resume`, `/release`). All
+    // deps are already-total effects (captured service values + the mirror hooks
+    // above), so every handler slots into the table as `Effect.Effect<void>`.
+    const commandTable = buildCommandTable({
+      sendNotice,
+      bindings,
+      shellCache,
+      startMirror,
+      stopMirror,
+      clearNoticeMemory: shellWatcher.clearNoticeMemory,
+      // P2: `/release` drops the chat's resolved overlay so a future session in
+      // the same chat does not inherit stale "✅ 已由 …" greyed-out controls.
+      clearResolvedNotices: clearChatResolvedNotices,
+      isChatBusy,
+    });
 
     // Drive the live card + observer + completion for an already-dispatched turn.
     // `cardDone` is resolved on EVERY exit (success/failure/interrupt) so the SDK
@@ -854,16 +1161,29 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
                 Effect.flatMap((seen) =>
                   seen === pendingRequestId
                     ? Effect.void
-                    : cardHandles
-                        .put(chatId, {
-                          messageId: handle.messageId,
-                          pendingRequestId,
-                          lastSequence: 0,
-                        })
-                        .pipe(
-                          Effect.ignore,
-                          Effect.andThen(Ref.set(lastPendingId, pendingRequestId)),
+                    : // Capture the chat's *current* real operator open id (#0/#1):
+                      // the verify side reads `evt.operator.openId`, the same source
+                      // `handleInbound` writes into `chatOperators` — so persisting it
+                      // here lets M18 restart recovery re-sign approval buttons for the
+                      // real operator instead of an empty string (which would never
+                      // match at verify time, permanently dead-ending the button).
+                      // Empty string is only written when the operator is genuinely
+                      // unknown (no inbound message captured yet for this chat).
+                      Ref.get(chatOperators).pipe(
+                        Effect.flatMap((operators) =>
+                          cardHandles
+                            .put(chatId, {
+                              messageId: handle.messageId,
+                              pendingRequestId,
+                              lastSequence: 0,
+                              operatorOpenId: operators.get(chatId) ?? "",
+                            })
+                            .pipe(
+                              Effect.ignore,
+                              Effect.andThen(Ref.set(lastPendingId, pendingRequestId)),
+                            ),
                         ),
+                      ),
                 ),
               );
             // Record the card handle once up front (no pending yet) so M2b-2
@@ -886,11 +1206,19 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
                           )
                           .pipe(
                             Effect.ignore,
-                            // Refresh the handle's `pendingRequestId` to the first
-                            // open approval (if any) — only when it changed.
+                            // Refresh the handle's `pendingRequestId` to the top open
+                            // request (approval first, then user-input — the same
+                            // priority `surfacePendingApprovalIfNew` derives its
+                            // `topRequestId` with) — only when it changed. #2: a
+                            // user-input-only turn must NOT persist `null` here, or M18
+                            // restart recovery (which skips a handle whose
+                            // `pendingRequestId === null`) would never recover the
+                            // user-input card.
                             Effect.andThen(
                               persistHandle(
-                                derivePendingApprovals(thread.activities)[0]?.requestId ?? null,
+                                derivePendingApprovals(thread.activities)[0]?.requestId ??
+                                  derivePendingUserInputs(thread.activities)[0]?.requestId ??
+                                  null,
                               ),
                             ),
                           ),
@@ -928,8 +1256,13 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
                   }).card,
                 )
                 .pipe(Effect.ignore);
+              // #2: top open request (approval first, then user-input) so a turn that
+              // ends paused on a user-input prompt persists a non-null requestId and is
+              // recoverable across a restart (M18 skips null-pendingRequestId handles).
               yield* persistHandle(
-                derivePendingApprovals(finalThread.activities)[0]?.requestId ?? null,
+                derivePendingApprovals(finalThread.activities)[0]?.requestId ??
+                  derivePendingUserInputs(finalThread.activities)[0]?.requestId ??
+                  null,
               );
             }
           } else {
@@ -1365,7 +1698,12 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     // degrade the card to a "已失效/已接管" notice rather than crashing the fiber.
     const updateCardNotice = (messageId: string, text: string): Effect.Effect<void> =>
       gateway
-        .updateCard(messageId, renderThreadCard(makeNoticeThread(text), { streaming: false }).card)
+        .updateCard(
+          messageId,
+          // #3/#4: same notice/status card path as `sendNotice` — `chrome: false`
+          // drops the meaningless 🧵/📁 chrome on the synthetic placeholder thread.
+          renderThreadCard(makeNoticeThread(text), { streaming: false, chrome: false }).card,
+        )
         .pipe(
           Effect.tapError((error) =>
             Console.error(`[feishu-bot] card update failed for ${messageId}: ${error.message}`),
@@ -1402,19 +1740,6 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         yield* Ref.update(operatorNames, (map) => new Map(map).set(openId, resolved));
         return resolved;
       });
-
-    // P4: friendly Chinese name for an approval's request kind (the operation type
-    // shown in the resolved echo header, e.g. "命令 ✅ 已由 @… 允许").
-    const approvalKindLabel = (kind: PendingApproval["requestKind"]): string => {
-      switch (kind) {
-        case "command":
-          return "命令";
-        case "file-read":
-          return "读取文件";
-        case "file-change":
-          return "文件改动";
-      }
-    };
 
     /**
      * Handle one cardAction (button click / form submit) end to end (contract B9
@@ -1498,6 +1823,19 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
           yield* updateCardNotice(evt.messageId, "⚠️ 此操作已失效(请求已被处理或过期)。");
           return;
         }
+        // #6/#8: past this guard a request matched, which is only possible when the
+        // snapshot delivered a non-empty `activities` — i.e. `snapshotThread` is
+        // non-null. The old `echoResolved` carried a `snapshotThread === null`
+        // fallback branch (a plain `updateCardNotice` with an *un-truncated*
+        // commandSummary), but that branch was unreachable for exactly this reason
+        // (dead code, and #6/#12's missing-truncation only lived there). We narrow
+        // the type here so the echo always re-renders the full card, and surface the
+        // impossible-null case as a defect rather than silently dead-pathing.
+        if (snapshotThread === null) {
+          return yield* Effect.die(
+            new Error("cardAction: matched a pending request but snapshot thread was null."),
+          );
+        }
 
         // 8. Durably consume the single-use nonce BEFORE routing (adjustment 1:
         //    no crash-replay window). A `false` means another delivery already
@@ -1549,34 +1887,39 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         // 12. Echo the outcome onto the clicked card by RE-RENDERING the same
         //     thread snapshot with this request's interaction controls greyed out,
         //     preserving the thread body — never replacing the whole card with a
-        //     bare notice (which would drop the conversation). The resolved-notice
-        //     text (P4) leads with the operation type + decision verb and lists the
-        //     operation detail, attributed to the operator's resolved name (P3).
-        //     We persist that text into the chat's resolved overlay (P2) so every
-        //     subsequent `driveTurn` render tick keeps this request greyed out for
-        //     the whole turn and after it ends, then echo it onto this card now.
+        //     bare notice (which would drop the conversation). M2b-2: we build a
+        //     structured {@link ResolvedNoticeEntry} (operator name + command
+        //     summary + decision) and hand it to `interactionCard`, which composes
+        //     the localized "✅ 已由 @X 授权 · <命令摘要>" / "🚫 … 拒绝 …" / "✅ … 提交"
+        //     line itself (truncating the summary). We persist the entry into the
+        //     chat's resolved overlay (P2) so every subsequent `driveTurn` render
+        //     tick keeps this request greyed out for the whole turn and after it
+        //     ends, then echo it onto this card now.
         const who = yield* resolveOperatorName(evt.operator);
-        const verb = isApproval ? (res.payload.a === "approval:accept" ? "允许" : "拒绝") : "提交";
-        // P4: "<操作类型> ✅ 已由 @<name> <verb>\n<detail>". For an approval the type
-        // is the request kind (命令/读取文件/文件改动) and the detail is the approval's
-        // detail; a user-input submit has no kind/detail, so it is just the header.
-        const kindLabel = matchedApproval ? approvalKindLabel(matchedApproval.requestKind) : "回答";
-        const detailLine = matchedApproval?.detail?.trim();
-        const resolvedText =
-          `${kindLabel} ✅ 已由 @${who} ${verb}` + (detailLine ? `\n${detailLine}` : "");
+        const decision: ResolvedNoticeEntry["decision"] = isApproval
+          ? res.payload.a === "approval:accept"
+            ? "accept"
+            : "decline"
+          : "submit";
+        // commandSummary: for an approval, the request's detail (the command/file
+        // summary) — trimmed, `null` when empty; the renderer truncates it. A
+        // user-input submit has no single-line detail, so it is `null`.
+        const commandSummary = matchedApproval?.detail?.trim() || null;
+        const entry: ResolvedNoticeEntry = {
+          operatorName: who,
+          commandSummary,
+          decision,
+        };
 
         // P2: record the overlay BEFORE echoing so any render tick racing this
         // handler already sees the request as resolved.
         yield* Ref.update(chatResolvedNotices, (map) => {
-          const forChat = new Map(map.get(evt.chatId) ?? new Map<string, string>());
-          forChat.set(parsed.requestId, resolvedText);
+          const forChat = new Map(map.get(evt.chatId) ?? new Map<string, ResolvedNoticeEntry>());
+          forChat.set(parsed.requestId, entry);
           return new Map(map).set(evt.chatId, forChat);
         });
 
         const echoResolved = (): Effect.Effect<void> => {
-          if (snapshotThread === null) {
-            return updateCardNotice(evt.messageId, resolvedText);
-          }
           const operatorOpenId = evt.operator.openId;
           const ctx: InteractionContext = {
             chatId: evt.chatId,
@@ -1586,7 +1929,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
             auth,
             ttlMs: CALLBACK_TOKEN_TTL_MS,
           };
-          const resolvedNotice = new Map<string, string>([[parsed.requestId, resolvedText]]);
+          const resolvedNotice = new Map<string, ResolvedNoticeEntry>([[parsed.requestId, entry]]);
           const elements = renderInteractionSection(
             pendingApprovals,
             pendingUserInputs,
@@ -1724,6 +2067,184 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     // Warm-up log of restored bindings (read from the in-memory authority).
     const restored = yield* bindings.entries;
     yield* Console.log(`[feishu-bot] restored ${restored.length} chat binding(s).`);
+
+    // ── M2b-2: restart recovery of outstanding approval cards ────────────────
+    //
+    // After a bot restart the durable `CardHandleStore` may still hold a card
+    // whose `pendingRequestId` was awaiting an operator decision. Feishu has no
+    // inbound replay, so unless we re-render that card its buttons carry tokens
+    // signed with the OLD app-secret-derived key context and the operator has no
+    // fresh card to act on. For each restored binding we read its card handle and,
+    // when it has a `pendingRequestId`, take a one-shot thread snapshot (the same
+    // `Stream.take(1)` + `Effect.scoped` pattern the cardAction handler uses),
+    // re-derive the pending approvals, and:
+    //   - still pending  → re-render the approval card (`renderThreadCard` +
+    //     `buildInteraction`, freshly-signed buttons) onto the same `messageId`;
+    //   - no longer pending → drop the stale handle so we don't try again.
+    //
+    // ROBUSTNESS: the WHOLE block is wrapped in `Effect.catchCause` (warning only).
+    // Recovery is strictly best-effort — a snapshot/render/update failure for one
+    // chat must NEVER interrupt startup (the bot must come up and serve live
+    // traffic regardless). Per-chat work is additionally isolated so one bad chat
+    // doesn't abort the others.
+    yield* Effect.forEach(
+      restored,
+      ([chatId, binding]) =>
+        Effect.gen(function* () {
+          const handleOpt = yield* cardHandles.get(chatId);
+          if (Option.isNone(handleOpt)) {
+            return;
+          }
+          const handle = handleOpt.value;
+          if (handle.pendingRequestId === null) {
+            return;
+          }
+          const threadId = binding.threadId;
+
+          // #0/#1(c): graceful fallback when the persisted handle has no captured
+          // operator (pre-M2b-2 data, or the card was rendered before any inbound
+          // message identified the chat's operator). Re-signing buttons with an
+          // empty open id would dead-end them at verify time, so instead of
+          // rendering dead buttons we drop the stale handle and nudge the user to
+          // send a message — which re-drives the turn and produces a fresh card
+          // with usable, correctly-signed buttons. No wildcard / auth bypass.
+          if (handle.operatorOpenId.length === 0) {
+            yield* cardHandles.remove(chatId).pipe(Effect.ignore);
+            yield* sendNotice(
+              chatId,
+              "⚠️ 有待批准的操作,请发送一条消息以继续(将刷新可操作的卡片)。",
+            );
+            yield* Console.log(
+              `[feishu-bot] skipping approval-card recovery for chat ${chatId} (no captured operator); nudged user to resend.`,
+            );
+            return;
+          }
+
+          // #7: bound the one-shot snapshot read. `subscribeThread` is `orDie`'d and
+          // retries the subscription forever on an expected failure, so a thread
+          // that was deleted/archived while the bot was down (or a server that never
+          // delivers its first frame) would otherwise hang this read — and, since it
+          // runs synchronously on the main `runBridge` fiber before `Effect.never`,
+          // wedge startup. A `timeout` turns that into a `None` we skip past.
+          const firstFrame = yield* Stream.runHead(
+            subscribeThread(threadId).pipe(Stream.take(1)),
+          ).pipe(
+            Effect.scoped,
+            Effect.timeout(Duration.seconds(10)),
+            Effect.option,
+            Effect.map(Option.flatten),
+          );
+          const snapshotThread = Option.match(firstFrame, {
+            onNone: () => null as OrchestrationThread | null,
+            onSome: (item) => (item.kind === "snapshot" ? item.snapshot.thread : null),
+          });
+          if (snapshotThread === null) {
+            yield* Console.log(
+              `[feishu-bot] approval-card recovery skipped for chat ${chatId} (no snapshot within timeout).`,
+            );
+            return;
+          }
+
+          const pendingApprovals = derivePendingApprovals(snapshotThread.activities);
+          const pendingUserInputs = derivePendingUserInputs(snapshotThread.activities);
+          const stillPending = pendingApprovals.some(
+            (approval) => approval.requestId === handle.pendingRequestId,
+          );
+          // #2: the original request may have been resolved while the bot was down,
+          // but a *new* approval (B) can have appeared on the same thread in the
+          // meantime. Only drop the handle when nothing at all is pending; if any
+          // approval/user-input is pending we fall through to the render path, which
+          // lets `buildInteraction` (via `derivePendingApprovals` /
+          // `derivePendingUserInputs`) surface B on the same card/messageId rather
+          // than leaving the user with no actionable card.
+          if (!stillPending && pendingApprovals.length === 0 && pendingUserInputs.length === 0) {
+            // Nothing pending at all (resolved elsewhere, no replacement): drop the
+            // stale handle so we don't keep trying to recover a dead request.
+            yield* cardHandles.remove(chatId).pipe(Effect.ignore);
+            return;
+          }
+
+          // Still pending (the original request, or a newer approval B): re-render
+          // the approval card with freshly-signed buttons and push it onto the same
+          // message id. #0/#1(b): re-sign for the operator captured on the handle
+          // (the `chatOperators` Ref is empty right after a restart) so the buttons
+          // verify correctly when clicked; the operator is re-checked at verify time.
+          const interaction = yield* buildInteraction(
+            chatId,
+            snapshotThread,
+            handle.operatorOpenId,
+          );
+          const card = renderThreadCard(snapshotThread, {
+            streaming: false,
+            ...(interaction ? { interaction } : {}),
+          }).card;
+          // #10: reflect the ACTUAL outcome of the card push. `updateCard` failures
+          // are still swallowed (recovery must never crash the bot), but we no
+          // longer log a "recovered" success unconditionally — a failed push logs a
+          // warning instead, so the log doesn't claim success that didn't happen.
+          const pushExit = yield* gateway.updateCard(handle.messageId, card).pipe(Effect.exit);
+          if (pushExit._tag === "Failure") {
+            yield* Effect.logWarning(
+              `[feishu-bot] approval-card recovery render failed for chat ${chatId} (request ${handle.pendingRequestId}).`,
+              pushExit.cause,
+            );
+          } else {
+            // #2: the card we just rendered may solicit a *newer* request (B) than the
+            // one stored on the handle (the original was resolved while the bot was
+            // down). Refresh the durable `pendingRequestId` to the request actually
+            // rendered — the SAME priority `buildInteraction`/`renderInteractionSection`
+            // used (approval first, then user-input) — so the resident shellWatcher's
+            // single-source dedup (`CardHandle.pendingRequestId`) matches the surfaced
+            // card and does NOT re-send a duplicate (which would also be signed with the
+            // post-restart-empty `chatOperators`, i.e. dead buttons). Reuse the recovered
+            // `messageId` and the persisted `operatorOpenId` (the Ref is still empty).
+            const renderedRequestId =
+              pendingApprovals[0]?.requestId ?? pendingUserInputs[0]?.requestId ?? null;
+            yield* cardHandles
+              .put(chatId, {
+                messageId: handle.messageId,
+                pendingRequestId: renderedRequestId,
+                lastSequence: handle.lastSequence,
+                operatorOpenId: handle.operatorOpenId,
+              })
+              .pipe(Effect.ignore);
+            yield* Console.log(
+              `[feishu-bot] recovered outstanding approval card for chat ${chatId} (request ${renderedRequestId}).`,
+            );
+          }
+        }).pipe(
+          // Per-chat isolation: a failure recovering one chat must not abort the
+          // others. Logged at warning level, then swallowed.
+          Effect.catchCause((cause) =>
+            Effect.logWarning(
+              `[feishu-bot] approval-card recovery failed for chat ${chatId}.`,
+              cause,
+            ),
+          ),
+        ),
+      // #6: recover chats with bounded concurrency. Each per-chat snapshot read is
+      // bounded by a 10s `timeout`; with the old fully-serial `forEach` a handful of
+      // chats whose threads were deleted/never-deliver-a-frame while the bot was down
+      // would each burn their full 10s back-to-back (N × 10s) and stall startup right
+      // up to `Effect.never`. A small bound runs them in parallel so the worst case is
+      // ~10s total, not 10s per chat, while the per-chat `catchCause` isolation above
+      // (one bad chat never aborts the pass) is preserved unchanged.
+      { concurrency: 8, discard: true },
+    ).pipe(
+      // Outer guard: ANY failure of the recovery pass as a whole is non-fatal —
+      // startup must proceed to `Effect.never` regardless.
+      Effect.catchCause((cause) =>
+        Effect.logWarning("[feishu-bot] approval-card recovery pass failed.", cause),
+      ),
+    );
+
+    // #4: NOW fork the shell-watcher fold loop — after `gateway.connect` and after
+    // the M18 recovery pass above. By this point recovery has updated each restored
+    // chat's `CardHandle.pendingRequestId` (the single-source dedup baseline), so the
+    // watcher's very first frame dedups against it instead of racing recovery to post
+    // a second card. (The handle / `clearNoticeMemory` was already available to the
+    // command table from `runShellWatcherFiber` above; only the loop was deferred.)
+    yield* shellWatcher.start;
 
     // Resident: keep the scope (connection, subscriptions, fibers) open forever.
     return yield* Effect.never;
