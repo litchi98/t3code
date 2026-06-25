@@ -234,20 +234,15 @@ export const runShellWatcherFiber = (
         const prior = (yield* Ref.get(memory)).get(binding.threadId) ?? EMPTY_MEMORY;
         const title = shell.title;
 
-        // ① Pending-approval rising edge: notify once per episode.
-        let approvalNotified = prior.approvalNotified;
-        if (shell.hasPendingApprovals) {
-          if (!prior.approvalNotified) {
-            yield* deps.sendNotice(
-              chatId,
-              `⚠️ 你接管的会话 ${title} 有一个待批准操作,请在终端/Web 处理(飞书内审批将于后续版本支持)`,
-            );
-            approvalNotified = true;
-          }
-        } else {
-          // Falling edge: reset so the next genuine approval re-notifies.
-          approvalNotified = false;
-        }
+        // ① Pending-approval episode tracking (M2b-1: notice SUPPRESSED).
+        // The interaction card is now the in-Feishu approval entry point (live
+        // [允许]/[拒绝] buttons rendered by the turn pipeline), so the old M2a
+        // "请在终端/Web 处理" standalone notice is obsolete and redundant — we no
+        // longer push it. We STILL track the rising/falling edge in `NoticeMemory`
+        // (set on rising edge, reset on falling edge) purely to keep the dedup
+        // state consistent for the cold-start baseline seed and `/release` reset;
+        // only the user-facing `sendNotice` call is removed.
+        const approvalNotified = shell.hasPendingApprovals;
 
         // ② Latest turn in a notable terminal (error / interrupted), deduped by
         // turnId. Distinct text per state so an interrupt from another end is not

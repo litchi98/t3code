@@ -78,6 +78,25 @@ const sdkCall = <A>(describe: string, run: () => Promise<A>): Effect.Effect<A, L
   });
 
 /**
+ * Minimal structural view of the slice of `channel.rawClient` we use to resolve
+ * a user's display name (`contact.user.get`). We deliberately do NOT lean on the
+ * node-sdk's auto-generated overload types here (300k+ lines, brittle to infer):
+ * this narrow interface names only the request/response shape the call relies on
+ * — `{ path: { user_id }, params: { user_id_type } }` → `{ data?: { user?: {
+ * name? } } }` — keeping the call site type-checked and resilient to SDK churn.
+ */
+interface RawContactClient {
+  readonly contact: {
+    readonly user: {
+      readonly get: (payload: {
+        readonly path: { readonly user_id: string };
+        readonly params: { readonly user_id_type: "open_id" };
+      }) => Promise<{ readonly data?: { readonly user?: { readonly name?: string } } }>;
+    };
+  };
+}
+
+/**
  * Project a raw {@link NormalizedMessage} into the bridge-facing
  * {@link InboundMessage}. Only image resources survive (M1 surfaces images;
  * other resource kinds are dropped — the bridge replies with a "text/image
@@ -165,6 +184,13 @@ export const larkGatewayLayer = (config: FeishuAppConfig): Layer.Layer<LarkGatew
                 }
                 handlers.onInboundMessage(normalizeInbound(message));
               },
+              // Card interactions are NOT gated by `acceptChatType`: interaction
+              // cards exist only in the private chats the bridge already drives,
+              // so every `cardAction` is routed straight to the bridge, which
+              // verifies the signed token and resolves the binding (M2b-1).
+              cardAction: (evt) => {
+                handlers.onCardAction(evt);
+              },
               reconnecting: () => {
                 handlers.onReconnecting();
               },
@@ -227,6 +253,30 @@ export const larkGatewayLayer = (config: FeishuAppConfig): Layer.Layer<LarkGatew
           return card;
         });
 
+      const updateCard = (messageId: string, card: object) =>
+        sdkCall("card update", () => channel.updateCard(messageId, card));
+
+      // Resolve a user's display name via the raw node-sdk contact client the
+      // channel exposes (`rawClient`). Cast through the narrow `RawContactClient`
+      // view (see its note) so the call is type-checked without depending on the
+      // SDK's generated overloads. A failure (missing scope → 403, network) is
+      // tagged as a LarkGatewayError for the caller to catch and fall back from.
+      const rawContact = channel.rawClient as unknown as RawContactClient;
+      const getUser = (
+        openId: string,
+      ): Effect.Effect<{ readonly name?: string }, LarkGatewayError> =>
+        sdkCall("contact user get", () =>
+          rawContact.contact.user.get({
+            path: { user_id: openId },
+            params: { user_id_type: "open_id" },
+          }),
+        ).pipe(
+          Effect.map((response) => {
+            const name = response.data?.user?.name;
+            return name === undefined ? {} : { name };
+          }),
+        );
+
       const addReaction = (messageId: string, emojiType: string) =>
         sdkCall("add reaction", () => channel.addReaction(messageId, emojiType));
 
@@ -243,6 +293,8 @@ export const larkGatewayLayer = (config: FeishuAppConfig): Layer.Layer<LarkGatew
         addReaction,
         removeReactionByEmoji,
         downloadImage,
+        updateCard,
+        getUser,
       });
     }),
   );

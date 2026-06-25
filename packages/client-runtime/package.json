@@ -127,6 +127,10 @@
       "types": "./src/state/threadSort.ts",
       "default": "./src/state/threadSort.ts"
     },
+    "./state/thread-activity": {
+      "types": "./src/state/threadActivity.ts",
+      "default": "./src/state/threadActivity.ts"
+    },
     "./state/vcs": {
       "types": "./src/state/vcs.ts",
       "default": "./src/state/vcs.ts"

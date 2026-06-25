@@ -17,6 +17,7 @@ import type { BridgeHandlers } from "./types.ts";
 // Re-export the cross-layer types so callers can `import { ... } from "../lark"`.
 export type {
   BridgeHandlers,
+  CardActionEvent,
   InboundAttachment,
   InboundMessage,
   LarkChannelError,
@@ -111,5 +112,29 @@ export class LarkGateway extends Context.Service<
       messageId: string,
       fileKey: string,
     ) => Effect.Effect<Buffer, LarkGatewayError>;
+    /**
+     * Replace the full card content of an already-sent card message by its
+     * Feishu `messageId` (the SDK's `channel.updateCard` — a whole-card update
+     * targeting a message_id, distinct from the sequenced `updateCardById`
+     * managed-card path). Used by the cardAction handler to echo an
+     * interaction's outcome (✅ allowed / button expired / request stale) onto
+     * the very card that was clicked (M2b-1).
+     */
+    readonly updateCard: (messageId: string, card: object) => Effect.Effect<void, LarkGatewayError>;
+    /**
+     * Resolve a Feishu user's display `name` from their `openId` via the SDK's
+     * raw contact client (`rawClient.contact.user.get`, `user_id_type=open_id`).
+     * Used by the cardAction echo to attribute an action to the operator's real
+     * name when the cardAction event itself did not carry one (M2b-1, P3).
+     *
+     * Returns `{ name?: string }` — `name` is `undefined` when the API responds
+     * without one. A *failure* (missing `contact:user.base:readonly` scope → 403,
+     * network, etc.) surfaces as a {@link LarkGatewayError}; the caller is
+     * expected to catch it and fall back to the raw openId, never blocking the
+     * echo.
+     */
+    readonly getUser: (
+      openId: string,
+    ) => Effect.Effect<{ readonly name?: string }, LarkGatewayError>;
   }
 >()("@t3tools/feishu-bot/lark/LarkGateway") {}

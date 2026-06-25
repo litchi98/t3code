@@ -9,7 +9,7 @@ import { CheckIcon } from "lucide-react";
 import { cn } from "~/lib/utils";
 
 interface PendingUserInputPanelProps {
-  pendingUserInputs: PendingUserInput[];
+  pendingUserInputs: readonly PendingUserInput[];
   respondingRequestIds: ApprovalRequestId[];
   answers: Record<string, PendingUserInputDraftAnswer>;
   questionIndex: number;

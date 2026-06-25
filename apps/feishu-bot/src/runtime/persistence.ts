@@ -6,6 +6,7 @@ import {
 import { TokenStore } from "@t3tools/client-runtime/authorization";
 import { CredentialStore, ProfileStore } from "@t3tools/client-runtime/connection";
 import type { ConnectionCredential, ConnectionProfile } from "@t3tools/client-runtime/connection";
+import type { NonceProbe } from "../bridge/callbackAuth.js";
 import type {
   CommandId,
   EnvironmentId,
@@ -347,7 +348,7 @@ export class SentCommandStore extends Context.Service<
  * discriminate legacy vs. current encodings. Omit it for stores whose on-disk
  * shape has never changed (identity).
  */
-const loadBackedMap = <V>(
+export const loadBackedMap = <V>(
   backend: PersistenceBackend<V>,
   normalize: (raw: unknown) => V = (raw) => raw as V,
 ) =>
@@ -451,17 +452,272 @@ export const sentCommandStoreLayer = (options: {
     }),
   );
 
+// ───────────────────────────────────────────────────────────────────────────
+// Interaction-kernel stores (M2b-1)
+//
+// Three more durable stores back the cardAction → respond loop:
+//   - CallbackNonceStore: single-use guard for signed callback tokens.
+//   - AuditStore: append-only, immutable record of every routed command.
+//   - CardHandleStore: chat → latest interaction-card handle, for re-render.
+// All three reuse the same `loadBackedMap` + `jsonFileBackend` machinery as the
+// M1 stores above; M4 can swap the backend for SQLite without touching callers.
+// ───────────────────────────────────────────────────────────────────────────
+
 /**
- * Convenience: both durable stores wired to JSON files under `stateDir`.
+ * Persisted state of a single callback nonce.
+ *
+ * - `state`: `"used"` once a token bearing this nonce has been consumed (so a
+ *   replayed click is rejected), or `"revoked"` to pre-emptively kill a token.
+ * - `exp`: the token's expiry (epoch millis). Records whose `exp` is already in
+ *   the past are dropped on load — they can never authenticate a live token
+ *   again, so the file does not grow without bound.
+ */
+export interface NonceRecord {
+  readonly state: "used" | "revoked";
+  readonly exp: number;
+}
+
+/**
+ * Persistent single-use guard for signed callback tokens (M2b-1).
+ *
+ * `CallbackAuth.verify` needs a *synchronous* view of nonce state (it returns a
+ * plain result, no Effect), so the store exposes {@link probe}: a one-shot
+ * effect yielding a stable {@link NonceProbe} that reads the live in-memory map.
+ * `runBridge` yields it once at start-up and hands it to `CallbackAuth`; because
+ * the underlying `Map` is mutated in place, the probe always reflects the latest
+ * state without re-fetching.
+ *
+ * Durable consumption is driven by the cardAction handler, not by `verify`:
+ * `verify` only *reads* nonce state via the probe (no write). After a token
+ * verifies, the handler awaits {@link consume} — the single authoritative writer
+ * — which marks the nonce in memory *and* persists before the command is routed,
+ * closing the crash-replay window (orchestrator adjustment 1).
+ */
+export class CallbackNonceStore extends Context.Service<
+  CallbackNonceStore,
+  {
+    /** Mark `nonce` used and persist; `false` if it was already used/revoked. */
+    readonly consume: (
+      nonce: string,
+      exp: number,
+    ) => Effect.Effect<boolean, FeishuBotPersistenceError>;
+    /** Pre-emptively revoke `nonce` (persisted); idempotent. */
+    readonly revoke: (nonce: string, exp: number) => Effect.Effect<void, FeishuBotPersistenceError>;
+    /** One-shot effect yielding a stable, synchronous view of the live map. */
+    readonly probe: Effect.Effect<NonceProbe, FeishuBotPersistenceError>;
+  }
+>()("@t3tools/feishu-bot/runtime/persistence/CallbackNonceStore") {}
+
+/**
+ * Immutable audit entry for one routed interaction command (M2b-1).
+ *
+ * `command` is the token action that was routed (`approval:accept` /
+ * `approval:decline` / `user-input:submit`, or `turn.start` for the turn path);
+ * `operatorOpenId` is the Feishu open_id that actually clicked.
+ */
+export interface AuditEntry {
+  readonly operatorOpenId: string;
+  readonly chatId: string;
+  readonly threadId: string;
+  readonly command: string;
+  readonly ts: number;
+}
+
+/**
+ * Append-only audit log keyed by `commandId` (M2b-1).
+ *
+ * Because the server sees the bot as a single principal and cannot attribute
+ * individual operators, the bridge is the system of record for *who did what*.
+ * {@link append} is write-once per `commandId`: a repeated id (e.g. a retried
+ * dispatch) is ignored so the log stays an immutable, idempotent ledger.
+ */
+export class AuditStore extends Context.Service<
+  AuditStore,
+  {
+    /** Record `entry` under `commandId`; ignored if `commandId` already exists. */
+    readonly append: (
+      commandId: string,
+      entry: AuditEntry,
+    ) => Effect.Effect<void, FeishuBotPersistenceError>;
+  }
+>()("@t3tools/feishu-bot/runtime/persistence/AuditStore") {}
+
+/**
+ * Handle to the latest interaction card a chat is showing (M2b-1).
+ *
+ * - `messageId`: the Feishu message id of the card (target of `updateCard`).
+ * - `pendingRequestId`: the approval/user-input request the card is soliciting,
+ *   or `null` when the card has none outstanding.
+ * - `lastSequence`: the thread snapshot sequence the card was rendered from, so
+ *   recovery can tell whether a newer snapshot needs a re-render. (M2a wrote and
+ *   then removed a `lastSequence` on the binding; M2b re-introduces it here.)
+ */
+export interface CardHandle {
+  readonly messageId: string;
+  readonly pendingRequestId: string | null;
+  readonly lastSequence: number;
+}
+
+/**
+ * Persistent map of Feishu `chat_id` → latest {@link CardHandle} (M2b-1).
+ *
+ * The turn path records a handle after rendering an interaction card; M2b-2
+ * recovery reads it back to re-render an outstanding approval card across a
+ * restart. M2b-1 only defines the store and writes handles.
+ */
+export class CardHandleStore extends Context.Service<
+  CardHandleStore,
+  {
+    /** Resolve the handle for `chatId`, if any. */
+    readonly get: (
+      chatId: string,
+    ) => Effect.Effect<Option.Option<CardHandle>, FeishuBotPersistenceError>;
+    /** Record `handle` for `chatId` (overwrites any existing handle). */
+    readonly put: (
+      chatId: string,
+      handle: CardHandle,
+    ) => Effect.Effect<void, FeishuBotPersistenceError>;
+    /** Drop the handle for `chatId` (no-op if absent). */
+    readonly remove: (chatId: string) => Effect.Effect<void, FeishuBotPersistenceError>;
+  }
+>()("@t3tools/feishu-bot/runtime/persistence/CardHandleStore") {}
+
+/**
+ * {@link CallbackNonceStore} layer backed by a JSON file at
+ * `<stateDir>/callback-nonces.json` (override the full path via `filePath`).
+ *
+ * Records whose `exp` is already past are pruned on load. The {@link NonceProbe}
+ * returned by `probe` is built once and closes over the live `Map`, so its
+ * reference is stable while always reflecting the current state.
+ */
+export const callbackNonceStoreLayer = (options: {
+  readonly stateDir: string;
+  readonly filePath?: string;
+}): Layer.Layer<CallbackNonceStore, FeishuBotPersistenceError, FileSystem.FileSystem | Path.Path> =>
+  Layer.effect(
+    CallbackNonceStore,
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const file = options.filePath ?? path.join(options.stateDir, "callback-nonces.json");
+      const backend = jsonFileBackend<NonceRecord>(file, { fs, path });
+      const { map, persist } = yield* loadBackedMap(backend);
+      // Drop already-expired records once at start-up: they can never
+      // authenticate a live token again, so they only bloat the file.
+      const now = yield* Clock.currentTimeMillis;
+      for (const [nonce, record] of map) {
+        if (record.exp < now) {
+          map.delete(nonce);
+        }
+      }
+      // Stable, synchronous read view of the live map for CallbackAuth.verify.
+      // Built once; its reference never changes because the backing `Map` is
+      // mutated in place. The probe is read-only (`state`) — durable
+      // consumption is the store's `consume` effect, the single authoritative
+      // writer, awaited by the handler after verify succeeds and before routing.
+      const probe: NonceProbe = {
+        state: (nonce: string) => map.get(nonce)?.state,
+      };
+      return CallbackNonceStore.of({
+        consume: (nonce, exp) =>
+          Effect.suspend(() => {
+            if (map.has(nonce)) {
+              return Effect.succeed(false);
+            }
+            map.set(nonce, { state: "used", exp });
+            return persist.pipe(Effect.as(true));
+          }),
+        revoke: (nonce, exp) =>
+          Effect.suspend(() => {
+            map.set(nonce, { state: "revoked", exp });
+            return persist;
+          }),
+        probe: Effect.succeed(probe),
+      });
+    }),
+  );
+
+/**
+ * {@link AuditStore} layer backed by a JSON file at `<stateDir>/audit-log.json`
+ * (override the full path via `filePath`). Keyed by `commandId`; append-only.
+ */
+export const auditStoreLayer = (options: {
+  readonly stateDir: string;
+  readonly filePath?: string;
+}): Layer.Layer<AuditStore, FeishuBotPersistenceError, FileSystem.FileSystem | Path.Path> =>
+  Layer.effect(
+    AuditStore,
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const file = options.filePath ?? path.join(options.stateDir, "audit-log.json");
+      const backend = jsonFileBackend<AuditEntry>(file, { fs, path });
+      const { map, persist } = yield* loadBackedMap(backend);
+      return AuditStore.of({
+        append: (commandId, entry) =>
+          Effect.suspend(() => {
+            if (map.has(commandId)) {
+              return Effect.void;
+            }
+            map.set(commandId, entry);
+            return persist;
+          }),
+      });
+    }),
+  );
+
+/**
+ * {@link CardHandleStore} layer backed by a JSON file at
+ * `<stateDir>/card-handles.json` (override the full path via `filePath`).
+ */
+export const cardHandleStoreLayer = (options: {
+  readonly stateDir: string;
+  readonly filePath?: string;
+}): Layer.Layer<CardHandleStore, FeishuBotPersistenceError, FileSystem.FileSystem | Path.Path> =>
+  Layer.effect(
+    CardHandleStore,
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const file = options.filePath ?? path.join(options.stateDir, "card-handles.json");
+      const backend = jsonFileBackend<CardHandle>(file, { fs, path });
+      const { map, persist } = yield* loadBackedMap(backend);
+      return CardHandleStore.of({
+        get: (chatId) => Effect.sync(() => Option.fromUndefinedOr(map.get(chatId))),
+        put: (chatId, handle) =>
+          Effect.suspend(() => {
+            map.set(chatId, handle);
+            return persist;
+          }),
+        remove: (chatId) =>
+          Effect.suspend(() => {
+            if (!map.delete(chatId)) {
+              return Effect.void;
+            }
+            return persist;
+          }),
+      });
+    }),
+  );
+
+/**
+ * Convenience: every durable store wired to JSON files under `stateDir`.
  * `bot.ts` provides this once at startup.
  */
 export const fileStoresLayer = (options: {
   readonly stateDir: string;
 }): Layer.Layer<
-  ChatThreadMapStore | SentCommandStore,
+  ChatThreadMapStore | SentCommandStore | CallbackNonceStore | AuditStore | CardHandleStore,
   FeishuBotPersistenceError,
   FileSystem.FileSystem | Path.Path
-> => Layer.merge(chatThreadMapStoreLayer(options), sentCommandStoreLayer(options));
+> =>
+  Layer.mergeAll(
+    chatThreadMapStoreLayer(options),
+    sentCommandStoreLayer(options),
+    callbackNonceStoreLayer(options),
+    auditStoreLayer(options),
+    cardHandleStoreLayer(options),
+  );
 
 /** Default per-user state directory (`~/.t3tools/feishu-bot`). */
 export const defaultStateDir = (): string => `${NodeOS.homedir()}/.t3tools/feishu-bot`;
