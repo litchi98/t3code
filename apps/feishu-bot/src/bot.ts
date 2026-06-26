@@ -87,6 +87,7 @@ import {
 import {
   anchorOf,
   compositeChatKey,
+  densityForRuntime,
   deriveThreadId,
   ensureThreadForChat,
   resolveApprover,
@@ -366,6 +367,15 @@ const CALLBACK_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
  */
 const FORM_SETTLE_DELAY = Duration.seconds(1);
 
+/**
+ * M3b: upper bound on the per-bystander "unauthorised click" dedup set. Realistic
+ * bystander volume is tiny, but the set is keyed by `(chatKey, messageId, openId)`
+ * and lives for the whole bridge scope, so a long-running, high-traffic group
+ * could grow it without limit. On overflow we keep the most recent ~80% (Set
+ * iteration order ≈ insertion order) and drop the oldest entries.
+ */
+const MAX_BYSTANDER_KEYS = 10_000;
+
 // ── M3a (group + topic) routing helpers ──────────────────────────────────────
 
 /**
@@ -502,6 +512,13 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     // (bot-side, like appId) so `buildInteraction` closures share a stable reference.
     const ownerOpenIds = config.feishu.ownerOpenIds;
 
+    // M3b: render density for group / topic chats, captured once from config
+    // (bot-side, like `ownerOpenIds`) so every `renderThreadCard` call site below
+    // derives its layout from one place via `densityForRuntime(runtimeMode, …)`.
+    // p2p (`full-access`) is always `card`; only an explicit
+    // `FEISHU_GROUP_CHAT_DENSITY` lowers a group/topic below `card`.
+    const groupChatDensity = config.feishu.groupChatDensity;
+
     // E④: composite chatKey → operator open id, captured from each inbound message.
     // `chatOperators` records the most recent sender per composite key (chatId or
     // chatId:larkThreadId). During a running turn the turn initiator is pinned via
@@ -511,10 +528,10 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     const chatOperators = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
 
     // Fix B: per-bystander dedup so the "unauthorised click" notice fires at most
-    // once per (chatKey, card messageId, clicker openId) triple. The set is
-    // intentionally unbounded — realistic bystander volume is tiny (short strings,
-    // at most a handful per session). No cleanup is necessary; the set is discarded
-    // when the bridge scope closes.
+    // once per (chatKey, card messageId, clicker openId) triple. Realistic bystander
+    // volume is tiny, but the set lives for the whole bridge scope, so the write
+    // site (M3b) clamps it to `MAX_BYSTANDER_KEYS`, dropping the oldest keys on
+    // overflow — bounded memory without breaking the at-most-once dedup.
     const bystanderNoticed = yield* Ref.make<ReadonlySet<string>>(new Set<string>());
 
     // P2: per-chat resolved overlay — chatId → (requestId → {@link ResolvedNoticeEntry}).
@@ -751,7 +768,15 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     // (still mirror-light); live streaming resumes only when the user sends the
     // next message (the normal turn path). A null/empty snapshot falls back to
     // the M2a shell-status text notice.
-    const startMirror = (chatId: string, threadId: ThreadId): Effect.Effect<void> =>
+    const startMirror = (
+      chatId: string,
+      threadId: ThreadId,
+      // M3b path A: the `/resume` command message id (belongs to the resumed topic).
+      // Used as the in-thread reply anchor for the takeover approval card and stored
+      // on the binding as `topicAnchorMessageId` so later topic-anchored cards land
+      // inside the topic. Absent (non-`/resume` callers) → cards post at the root.
+      replyToMessageId?: string,
+    ): Effect.Effect<void> =>
       Effect.gen(function* () {
         // M2b-3: a `/resume` may re-point a chat that is already mirroring a previous
         // thread. Tear down any existing observe fiber first so the new takeover's
@@ -766,7 +791,19 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         // stays absent → any click on the old card correctly falls through to the
         // "degrade stale card" path.
         yield* cardHandles.remove(chatId).pipe(Effect.ignore);
-        yield* bindings.bind(chatId, { threadId, origin: "resumed" });
+        // M3b: anchor later topic-anchored cards (path A surfaces below, path B's
+        // watcher) to the `/resume` command message — it belongs to the resumed
+        // topic, whereas `anchorOf` may yield an `omt_…` Feishu rejects as a reply
+        // target. exactOptionalPropertyTypes: omit the key when absent rather than
+        // assigning `undefined` (see persistence.ts `migrateChatBinding`). Density is
+        // deliberately NOT stored here — a clean per-thread `runtimeMode` is not yet
+        // available (the snapshot is read below), and the placeholder's
+        // `densityForRuntime(placeholderThread.runtimeMode, …)` fallback is safe.
+        yield* bindings.bind(chatId, {
+          threadId,
+          origin: "resumed",
+          ...(replyToMessageId !== undefined ? { topicAnchorMessageId: replyToMessageId } : {}),
+        });
         const shell = yield* shellCache.threadById(threadId);
         const title = shell?.title ?? threadId;
         // Map the shared `shellStatus` classifier to this card's Chinese line, so
@@ -883,7 +920,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         // instead of letting the helper take a *second* one-shot snapshot — that
         // doubled the takeover latency (two reads, each bounded by the 10s subscribe
         // timeout). Passing it (even `null`) tells the helper "use this; do not read".
-        yield* surfacePendingApprovalIfNew(chatId, threadId, snapshotThread);
+        yield* surfacePendingApprovalIfNew(chatId, threadId, snapshotThread, replyToMessageId);
       });
 
     // Read-only probe: is the chat busy (a turn running OR coalescing pending)?
@@ -1315,6 +1352,10 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
       // and passes nothing, so the helper still reads its own first frame. A
       // `null`/`undefined` value means "read it yourself".
       preReadSnapshot?: OrchestrationThread | null,
+      // M3b path A: the `/resume` command message id, used as the in-thread reply
+      // anchor so the surfaced card posts inside the topic. Path B (the watcher)
+      // passes nothing → falls back to the binding's stored `topicAnchorMessageId`.
+      replyToMessageId?: string,
     ): Effect.Effect<void> =>
       Effect.gen(function* () {
         // #3: race guard. When the bridge is actively driving (or about to dispatch)
@@ -1399,6 +1440,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         const interaction = yield* buildInteraction(chatId, snapshotThread, operatorOpenId);
         const card = renderThreadCard(snapshotThread, {
           streaming: false,
+          density: densityForRuntime(snapshotThread.runtimeMode, groupChatDensity),
           ...(interaction ? { interaction } : {}),
         }).card;
 
@@ -1406,12 +1448,22 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         // settle) and capture its messageId for the persisted handle.
         const done = yield* Deferred.make<void>();
         yield* Deferred.succeed(done, undefined);
-        // M3a: send to the real Feishu chatId. No triggering message here, so no
-        // topic `sendOpts` — a surfaced approval card posts at the chat/group root
-        // (accepted degradation for a topic group).
-        const sent = yield* gateway.startStreamingCard(splitChatKey(chatId).chatId, card, {
-          done: Deferred.await(done),
-        });
+        // M3b: anchor the surfaced approval card inside the topic when possible.
+        // Path A (`/resume`) supplies the command message id; path B (the watcher)
+        // passes nothing and falls back to the binding's stored
+        // `topicAnchorMessageId`. `topicSendOpts` only emits in-thread opts when the
+        // key is a topic (`larkThreadId` present) AND a reply anchor is known;
+        // otherwise `undefined` → posts at the chat/group root (p2p / no anchor).
+        const { chatId: realChatId, larkThreadId } = splitChatKey(chatId);
+        const binding = yield* bindings.get(chatId);
+        const effectiveReplyTo = replyToMessageId ?? binding?.topicAnchorMessageId;
+        const sendOpts = topicSendOpts(larkThreadId, effectiveReplyTo);
+        const sent = yield* gateway.startStreamingCard(
+          realChatId,
+          card,
+          { done: Deferred.await(done) },
+          sendOpts,
+        );
 
         // Persist so this call/frame's surfaced request is the dedup baseline for the
         // next one, and so M18 restart recovery can re-render it.
@@ -1598,6 +1650,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
                         renderThreadCard(thread, {
                           streaming: true,
                           currentTurnId,
+                          density: densityForRuntime(thread.runtimeMode, groupChatDensity),
                           ...(interaction ? { interaction } : {}),
                         }).card,
                       )
@@ -1649,6 +1702,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
               renderThreadCard(finalThread, {
                 streaming: false,
                 currentTurnId,
+                density: densityForRuntime(finalThread.runtimeMode, groupChatDensity),
                 ...(interaction ? { interaction } : {}),
               }).card,
             )
@@ -1823,15 +1877,26 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
             // the turn reaches a terminal state (the `cardDone` released below). A
             // failed start must NOT crash the fiber — skip the render and exit; the
             // watcher re-triggers on the next frame if the turn is still running.
-            const initial = renderThreadCard(placeholderThread, { streaming: true }).card;
-            // M3a: send to the real Feishu chatId. An observe fiber mirrors a turn
-            // another end started (no triggering message for this end), so it posts
-            // at the chat/group root (no topic `sendOpts`) — the accepted degradation
-            // for a taken-over topic turn.
+            // M3b: prefer the binding's bind-time density so the placeholder first
+            // frame matches the real frame (no card→low-noise jump); fall back to the
+            // runtimeMode-derived density for legacy bindings without stored density.
+            // The same binding read supplies the topic reply anchor below.
+            const binding = yield* bindings.get(chatId);
+            const placeholderDensity =
+              binding?.density ??
+              densityForRuntime(placeholderThread.runtimeMode, groupChatDensity);
+            const initial = renderThreadCard(placeholderThread, {
+              streaming: true,
+              density: placeholderDensity,
+            }).card;
+            // M3b: an observe fiber mirrors a turn another end started (no triggering
+            // message for this end), so anchor its fresh card inside the topic via the
+            // binding's stored `topicAnchorMessageId` when present; `topicSendOpts`
+            // degrades to a root post for p2p / plain group / no stored anchor.
+            const { chatId: realChatId, larkThreadId } = splitChatKey(chatId);
+            const sendOpts = topicSendOpts(larkThreadId, binding?.topicAnchorMessageId);
             const card = yield* gateway
-              .startStreamingCard(splitChatKey(chatId).chatId, initial, {
-                done: Deferred.await(cardDone),
-              })
+              .startStreamingCard(realChatId, initial, { done: Deferred.await(cardDone) }, sendOpts)
               .pipe(
                 Effect.tapError((error) =>
                   Console.error(
@@ -1904,9 +1969,20 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
       Effect.gen(function* () {
         const cardDone = yield* Deferred.make<void>();
         yield* Effect.gen(function* () {
-          const initial = renderThreadCard(placeholderThread, { streaming: true }).card;
+          // M3b: prefer the binding's bind-time density so the placeholder first
+          // frame matches the real frame (no density jump); fall back to the
+          // runtimeMode-derived density for legacy bindings without stored density.
+          const binding = yield* bindings.get(chatId);
+          const placeholderDensity =
+            binding?.density ?? densityForRuntime(placeholderThread.runtimeMode, groupChatDensity);
+          const initial = renderThreadCard(placeholderThread, {
+            streaming: true,
+            density: placeholderDensity,
+          }).card;
 
-          // M3a: real Feishu chatId + (topic-only) in-thread reply opts.
+          // M3a: real Feishu chatId + (topic-only) in-thread reply opts. driveTurn
+          // anchors to THIS turn's triggering message (`replyToMessageId`) — its
+          // freshest in-topic message — not the binding anchor (red line: unchanged).
           const { chatId: realChatId, larkThreadId } = splitChatKey(chatId);
           const sendOpts = topicSendOpts(larkThreadId, replyToMessageId);
           const card = yield* gateway
@@ -2289,6 +2365,15 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
                 bindings.bind(chatKey, {
                   threadId,
                   origin: "self-created",
+                  // M3b: store the trigger message id as the topic reply anchor (it
+                  // belongs to the target topic; `anchorOf` may return an `omt_…`
+                  // which Feishu rejects as a reply target) and the bind-time density
+                  // so later topic-anchored cards / placeholder frames are correct.
+                  // Both are always defined here, so no conditional spread is needed.
+                  // p2p stores them harmlessly (no `larkThreadId` → `topicSendOpts`
+                  // yields `undefined`, and density is `card` either way).
+                  topicAnchorMessageId: message.messageId,
+                  density: densityForRuntime(runtimeMode, groupChatDensity),
                 }),
               ),
             ),
@@ -2318,6 +2403,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
           // M3a: per-chat-type runtimeMode + topic id (forms the composite binding
           // key + the topic-aware thread id derivation inside the helper).
           runtimeMode,
+          groupChatDensity,
           larkThreadId,
         ).pipe(Effect.provideService(BindingState, bindings), Effect.exit);
 
@@ -2569,6 +2655,12 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
                 if (set.has(dedupKey)) return [true, set] as const;
                 const next = new Set(set);
                 next.add(dedupKey);
+                // M3b: bound the set. On overflow keep the most recent ~80% (Set
+                // iteration order ≈ insertion order) and drop the oldest keys.
+                if (next.size > MAX_BYSTANDER_KEYS) {
+                  const keep = Math.floor(MAX_BYSTANDER_KEYS * 0.8);
+                  return [false, new Set(Array.from(next).slice(-keep))] as const;
+                }
                 return [false, next] as const;
               });
               if (!alreadyNotified) {
@@ -2668,6 +2760,11 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
 
         // 11. Append the immutable audit row under the SAME commandId.
         const ts = yield* Clock.currentTimeMillis;
+        // M3b: record the topic the command was routed within. `evt.chatId` is the
+        // bare Feishu id; the composite `chatKey` carries the topic, so recover it
+        // via `splitChatKey` (normalises empty → undefined). exactOptionalPropertyTypes:
+        // omit the key for p2p / plain group rather than assigning `undefined`.
+        const auditLarkThreadId = splitChatKey(chatKey).larkThreadId;
         yield* audit
           .append(commandId, {
             operatorOpenId: evt.operator.openId,
@@ -2675,6 +2772,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
             threadId,
             command: res.payload.a,
             ts,
+            ...(auditLarkThreadId !== undefined ? { larkThreadId: auditLarkThreadId } : {}),
           })
           .pipe(Effect.ignore);
 
@@ -2756,6 +2854,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
           );
           const card = renderThreadCard(snapshotThread, {
             streaming: false,
+            density: densityForRuntime(snapshotThread.runtimeMode, groupChatDensity),
             interaction: { elements },
           }).card;
           return gateway.updateCard(evt.messageId, card).pipe(
@@ -3016,6 +3115,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
           );
           const card = renderThreadCard(snapshotThread, {
             streaming: false,
+            density: densityForRuntime(snapshotThread.runtimeMode, groupChatDensity),
             ...(interaction ? { interaction } : {}),
           }).card;
           // #10: reflect the ACTUAL outcome of the card push. `updateCard` failures

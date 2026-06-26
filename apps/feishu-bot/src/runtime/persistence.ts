@@ -7,6 +7,8 @@ import { TokenStore } from "@t3tools/client-runtime/authorization";
 import { CredentialStore, ProfileStore } from "@t3tools/client-runtime/connection";
 import type { ConnectionCredential, ConnectionProfile } from "@t3tools/client-runtime/connection";
 import type { NonceProbe } from "../bridge/callbackAuth.js";
+// Type-only: erased at compile time, so no runtime import cycle with the renderer.
+import type { RenderDensity } from "../bridge/eventRenderer.js";
 import type {
   CommandId,
   EnvironmentId,
@@ -284,6 +286,22 @@ export interface ChatBinding {
   readonly threadId: ThreadId;
   /** How the binding was established (drives recovery; see {@link ChatBindingOrigin}). */
   readonly origin: ChatBindingOrigin;
+  /**
+   * A message id belonging to this topic thread (the trigger/command message),
+   * for paths that have no inbound trigger message of their own (shellWatcher
+   * chained approval / observe fresh) to reuse as the `replyTo` anchor of
+   * `reply_in_thread`. Feishu `reply_in_thread` accepts only a *message id*, not
+   * an `omt_` thread id, so a message id must be stored. Optional: absent on p2p
+   * / plain-group bindings and on legacy on-disk entries (→ `undefined`).
+   */
+  readonly topicAnchorMessageId?: string;
+  /**
+   * The render density fixed at bind time from the `chatType`, read by the
+   * `driveTurn`/`observe` placeholder first frame so the placeholder does not
+   * jump density when the real frame arrives. Optional: absent on legacy on-disk
+   * entries (→ `undefined`, callers fall back to their computed default).
+   */
+  readonly density?: RenderDensity;
 }
 
 /**
@@ -373,17 +391,31 @@ export const loadBackedMap = <V>(
  * Migrate a raw on-disk binding value forward to the current {@link ChatBinding}
  * shape. M1 persisted a bare `ThreadId` string per chat; M2a persists the full
  * object. A legacy string is read as a `self-created` binding (the only origin
- * M1 ever produced); a current object is narrowed to the two live fields
- * (`threadId`, `origin`), dropping any extraneous keys an older M2a build may
- * have written (e.g. the now-removed `lastSequence`). Pure; runs once per entry
- * at load time.
+ * M1 ever produced); a current object is narrowed to the live fields (`threadId`,
+ * `origin`, plus the M3b-optional `topicAnchorMessageId` / `density`), dropping
+ * any extraneous keys an older build may have written (e.g. the now-removed
+ * `lastSequence`). The two M3b fields are optional: legacy entries that pre-date
+ * them simply carry `undefined`, preserving the M3a "zero re-bind" invariant
+ * (`threadId`/`origin` are never lost). Pure; runs once per entry at load time.
  */
 const migrateChatBinding = (raw: unknown): ChatBinding => {
   if (typeof raw === "string") {
+    // Legacy M1 bare-string: the M3b optional fields are simply absent.
     return { threadId: raw as ThreadId, origin: "self-created" };
   }
   const binding = raw as ChatBinding;
-  return { threadId: binding.threadId, origin: binding.origin };
+  // Narrow to the live fields, dropping any extraneous on-disk keys. The two
+  // M3b optionals are carried through only when present: under
+  // `exactOptionalPropertyTypes` an optional field is "absent or string", so an
+  // entry that pre-dates them must omit the key rather than set it `undefined`.
+  return {
+    threadId: binding.threadId,
+    origin: binding.origin,
+    ...(binding.topicAnchorMessageId !== undefined
+      ? { topicAnchorMessageId: binding.topicAnchorMessageId }
+      : {}),
+    ...(binding.density !== undefined ? { density: binding.density } : {}),
+  };
 };
 
 /**
@@ -529,6 +561,15 @@ export interface AuditEntry {
   readonly threadId: string;
   readonly command: string;
   readonly ts: number;
+  /**
+   * The Feishu topic (`omt_…`) the command was routed within, for audit
+   * completeness in group topics. Optional: non-empty in a group topic, absent
+   * (→ `undefined`) for p2p / plain-group commands and for legacy on-disk
+   * entries written before this field existed. The {@link AuditStore} loads
+   * entries with identity normalisation, so old entries lacking it decode
+   * unchanged.
+   */
+  readonly larkThreadId?: string;
 }
 
 /**

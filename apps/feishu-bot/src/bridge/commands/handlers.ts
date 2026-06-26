@@ -66,7 +66,11 @@ export interface CommandDeps {
    * "resumed"` and push a one-off takeover snapshot card. Validation that the
    * thread is live happens in the handler *before* this is called.
    */
-  readonly startMirror: (chatId: string, threadId: ThreadId) => Effect.Effect<void>;
+  readonly startMirror: (
+    chatId: string,
+    threadId: ThreadId,
+    replyToMessageId?: string,
+  ) => Effect.Effect<void>;
   /** Tear down any mirror state for `chatId` (mirror-light: candidate-cache clear). */
   readonly stopMirror: (chatId: string) => Effect.Effect<void>;
   /**
@@ -287,7 +291,9 @@ export const buildCommandTable = (deps: CommandDeps): ReadonlyMap<string, Comman
       }
 
       // Hand off to mirror-light: it does the re-bind + takeover snapshot card.
-      yield* deps.startMirror(chatKey, target);
+      // M3b path A: pass the `/resume` command message id (belongs to this topic) so
+      // the takeover/approval cards anchor inside the topic and the binding records it.
+      yield* deps.startMirror(chatKey, target, ctx.message.messageId);
     });
 
   const resume: CommandHandler = (ctx) => {

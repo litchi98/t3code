@@ -1,6 +1,8 @@
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 
+import type { RenderDensity } from "./bridge/eventRenderer.ts";
+
 /**
  * Runtime configuration for the headless feishu-bot client.
  *
@@ -71,8 +73,24 @@ export interface FeishuAppConfig {
    * initiator (pre-M3a behavior, no regression). When set, only
    * `ownerOpenIds[0]` is used as the approval operator (single-owner binding);
    * multi-approver allowlist is a future milestone.
+   *
+   * KNOWN LIMITATION (single-owner binding): `ownerOpenIds[0]` MUST be a member
+   * of every target group. If it is set to someone NOT in the group, that group's
+   * approval cards are signed to a non-member: group members fail verify, and the
+   * owner never sees the card — so the turn's approval can never be granted and the
+   * turn blocks permanently. The empty-array default (initiator approval) is not
+   * affected. Root fix = multi-approver allowlist (future milestone).
    */
   readonly ownerOpenIds: ReadonlyArray<string>;
+  /**
+   * Render density for group / topic chats (M3b). From `FEISHU_GROUP_CHAT_DENSITY`
+   * (`card` | `markdown` | `text`). Like `ownerOpenIds`, this is bot-own config —
+   * not shared with the server. p2p 1:1 chats are always `card` regardless of this
+   * value (see `densityForRuntime`); this seam only lowers group/topic noise when
+   * set explicitly. Defaults to `card` (no auto-downgrade); an unrecognised value
+   * falls back to `card` (non-fatal).
+   */
+  readonly groupChatDensity: RenderDensity;
 }
 
 /** Map a {@link FeishuTenant} to its open-platform domain origin. */
@@ -95,6 +113,7 @@ const FLAG_BY_ENV: Readonly<Record<string, string>> = {
   FEISHU_APP_SECRET: "--feishu-app-secret",
   FEISHU_TENANT: "--feishu-tenant",
   FEISHU_OWNER_OPEN_IDS: "--feishu-owner-open-ids",
+  FEISHU_GROUP_CHAT_DENSITY: "--feishu-group-chat-density",
   T3_STATE_DIR: "--state-dir",
 };
 
@@ -227,12 +246,28 @@ const resolveFeishuAppConfig = (
       .map((s) => s.trim())
       .filter((s) => s.length > 0);
 
+    // M3b: group/topic render density. Validated against the three known modes;
+    // an unset value defaults to `card`, an unrecognised one falls back to `card`
+    // (non-fatal — mirrors the forgiving ownerOpenIds default) with a warning.
+    const rawDensity = resolveValue("FEISHU_GROUP_CHAT_DENSITY", env, args);
+    const groupChatDensity: RenderDensity =
+      rawDensity === "card" || rawDensity === "markdown" || rawDensity === "text"
+        ? rawDensity
+        : "card";
+    if (rawDensity !== undefined && rawDensity !== groupChatDensity) {
+      yield* Effect.logWarning(
+        `[feishu-bot] Ignoring invalid FEISHU_GROUP_CHAT_DENSITY "${rawDensity}" ` +
+          '(expected "card" | "markdown" | "text"); falling back to "card".',
+      );
+    }
+
     return {
       appId,
       appSecret,
       tenant,
       domain: DOMAIN_BY_TENANT[tenant],
       ownerOpenIds,
+      groupChatDensity,
     } satisfies FeishuAppConfig;
   });
 

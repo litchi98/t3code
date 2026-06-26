@@ -72,6 +72,17 @@ T3_WORKSPACE_ROOT=/path/to/workspace \
 pnpm --filter @t3tools/feishu-bot dev
 ```
 
+## Troubleshooting / Known limitations
+
+- **Group approval card can't be approved by anyone / the turn hangs.** Check
+  whether the open id configured in `FEISHU_OWNER_OPEN_IDS` is actually a member
+  of that group. Group/topic approvals (M3a) are signed to `ownerOpenIds[0]`
+  (single-owner binding): if that owner is not in the group, members' clicks fail
+  verification and the owner never sees the card, so the turn's approval can never
+  be granted and the turn blocks permanently. Leaving `FEISHU_OWNER_OPEN_IDS`
+  unset (the default) falls back to initiator approval and avoids this entirely.
+  The multi-approver allowlist that removes this constraint is a later milestone.
+
 ## Checks
 
 ```sh
