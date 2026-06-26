@@ -510,6 +510,13 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     // clicker against the token's `o` field at click time.
     const chatOperators = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
 
+    // Fix B: per-bystander dedup so the "unauthorised click" notice fires at most
+    // once per (chatKey, card messageId, clicker openId) triple. The set is
+    // intentionally unbounded — realistic bystander volume is tiny (short strings,
+    // at most a handful per session). No cleanup is necessary; the set is discarded
+    // when the bridge scope closes.
+    const bystanderNoticed = yield* Ref.make<ReadonlySet<string>>(new Set<string>());
+
     // P2: per-chat resolved overlay — chatId → (requestId → {@link ResolvedNoticeEntry}).
     // The cardAction handler writes a resolved entry here on a successful respond;
     // the live `driveTurn` render reads it (via `buildInteraction`) so a
@@ -752,6 +759,13 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         // chatId (which would leave the chat observing the OLD thread). Idempotent
         // no-op when nothing is observing.
         yield* stopObserve(chatId);
+        // Fix A: clear stale cardHandle so a click on the old card cannot be
+        // misidentified as "current card, unauthorised clicker" (bystander no-op).
+        // `surfacePendingApprovalIfNew` at the end of startMirror will re-populate
+        // the handle if the new thread has a pending approval; otherwise the handle
+        // stays absent → any click on the old card correctly falls through to the
+        // "degrade stale card" path.
+        yield* cardHandles.remove(chatId).pipe(Effect.ignore);
         yield* bindings.bind(chatId, { threadId, origin: "resumed" });
         const shell = yield* shellCache.threadById(threadId);
         const title = shell?.title ?? threadId;
@@ -2529,8 +2543,48 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
           policyFingerprint: fp,
         });
 
-        // 6. Verification failure → degrade the card; never route.
+        // 6. Verification failure → bystander no-op, or degrade a stale card.
+        // In a group the approval buttons are bound to a single operator (owner /
+        // initiator). A non-authorised member clicking yields `context-mismatch`
+        // — but so does a genuinely stale card (e.g. threadId/fp changed after a
+        // `/resume`). Degrading on every failure lets ANY bystander destroy the
+        // approval card and lock out the real approver. Distinguish by whether the
+        // click targets the bridge's CURRENT card for this chat: same messageId →
+        // live card, wrong clicker → no-op (preserve buttons for the real
+        // approver); different/absent → old session's card → degrade as before.
         if (!res.ok) {
+          if (res.reason === "context-mismatch") {
+            const handleOpt = yield* cardHandles
+              .get(chatKey)
+              .pipe(Effect.orElseSucceed(() => Option.none<CardHandle>()));
+            if (Option.isSome(handleOpt) && handleOpt.value.messageId === evt.messageId) {
+              yield* Console.log(
+                `[feishu-bot] cardAction ignored for chat ${evt.chatId} — unauthorised click on the current card; card preserved.`,
+              );
+              // Fix B: dedup the "unauthorised" notice to at most once per
+              // (chatKey, card messageId, clicker). Repeated clicks still
+              // no-op (card stays intact) but don't spam the thread.
+              const dedupKey = `${chatKey}:${evt.messageId}:${evt.operator.openId}`;
+              const alreadyNotified = yield* Ref.modify(bystanderNoticed, (set) => {
+                if (set.has(dedupKey)) return [true, set] as const;
+                const next = new Set(set);
+                next.add(dedupKey);
+                return [false, next] as const;
+              });
+              if (!alreadyNotified) {
+                // Fix C: generic wording — the same branch covers both approval
+                // and user-input interactions, so "审批" is misleading.
+                // The WS card path has no native per-clicker toast, so post a
+                // short topic-anchored notice; card stays intact for real approver.
+                yield* sendNotice(
+                  chatKey,
+                  `<at id=${evt.operator.openId}></at> 你暂时没有此操作的权限,需由授权人处理。`,
+                  evt.messageId,
+                );
+              }
+              return;
+            }
+          }
           yield* Console.log(
             `[feishu-bot] cardAction rejected for chat ${evt.chatId} (${res.reason}).`,
           );

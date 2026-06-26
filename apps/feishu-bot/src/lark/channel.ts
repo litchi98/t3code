@@ -115,12 +115,41 @@ const normalizeInbound = (message: NormalizedMessage): InboundMessage => {
       ...(resource.fileName !== undefined ? { fileName: resource.fileName } : {}),
     }));
 
+  // Strip a leading @BotName mention from the message text.
+  //
+  // SDK behaviour differs by message type:
+  //   • `text` messages   — the SDK's resolveMentions pass already strips bot
+  //     mentions by replacing the `@_user_xxx` placeholder with an empty string,
+  //     so the regex below is a no-op.
+  //   • `post` (rich-text) messages — renderElement calls the per-element mention
+  //     renderer, which looks the mention up by user_id type; because the bot's
+  //     open_id does not match a user_id the lookup fails and the literal text
+  //     `@ClientBot` (or the actual bot name) leaks into the rendered string. The
+  //     SDK's resolveMentions pass then has no placeholder key to strip, so the
+  //     literal survives into `message.content` and reaches the prompt unchanged.
+  //
+  // We detect the bot-mention case via `message.mentionedBot` (SDK-set), find the
+  // bot's `MentionInfo` by `isBot`, and strip the leading "@Name " prefix.
+  let text = message.content;
+  if (message.mentionedBot) {
+    const botName = message.mentions.find((m) => m.isBot)?.name;
+    if (botName) {
+      const escaped = botName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      // Fix D: negative lookahead `(?!\w)` prevents stripping when the bot
+      // name is a strict prefix of another display name (e.g. bot="Bot",
+      // sender="@BotMaster …" → "M" is \w → not stripped). Space, slash,
+      // CJK, and end-of-string all satisfy (?!\w) so normal mentions still
+      // work: "@Bot 消息"  "@Bot/resume"  "@Bot创建"  "@Bot" (alone).
+      text = text.replace(new RegExp(`^@${escaped}(?!\\w)\\s*`), "").trim();
+    }
+  }
+
   return {
     chatId: message.chatId,
     chatType: message.chatType,
     messageId: message.messageId,
     senderId: message.senderId,
-    text: message.content,
+    text,
     attachments,
     createTime: message.createTime,
     // M3a routing projections. `mentionedBot` is always present on the SDK
