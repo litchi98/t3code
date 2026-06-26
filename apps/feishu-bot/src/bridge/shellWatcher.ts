@@ -241,6 +241,14 @@ export const runShellWatcherFiber = (deps: ShellWatcherDeps): Effect.Effect<Shel
         return;
       }
       const isFirstFrame = yield* Ref.getAndSet(firstFrame, false);
+      // M3a: each entry's key is the bridge's composite `chatId[:larkThreadId]`
+      // (a topic backs its own binding). This watcher treats it as an OPAQUE
+      // conversation id and never splits it: every dep it forwards the key to
+      // (`bindings.unbind` / `stopMirror` / `surfacePendingApproval` /
+      // `ensureObserving` are all keyed by the same composite id; `sendNotice`
+      // splits it back to the real Feishu chatId internally), so per-topic
+      // reconciliation/notification falls out for free. For p2p / plain group the
+      // key is the bare chatId (no `:`), so behaviour is byte-identical to pre-M3a.
       const entries = yield* deps.bindings.entries;
       yield* Effect.forEach(
         entries,

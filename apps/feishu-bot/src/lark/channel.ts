@@ -28,6 +28,7 @@ import type {
   InboundAttachment,
   InboundMessage,
   NormalizedMessage,
+  SendOptions,
 } from "./types.ts";
 
 /**
@@ -58,13 +59,15 @@ const SOURCE_TAG = "t3tools-feishu-bot";
 const HANDSHAKE_TIMEOUT_MS = 30_000;
 
 /**
- * Single admission point for inbound chat types (M3 group-chat seam).
+ * Single admission point for inbound chat types.
  *
- * M2a only drives 1:1 private chats, so this admits `"p2p"` and nothing else.
- * The M3 group-chat work flips the gate here (e.g. also admit `"group"`) without
- * touching the handler wiring — the `message` callback routes solely on this.
+ * M3a opens group chats alongside 1:1 private chats, so this admits `"p2p"` and
+ * `"group"` (topic groups also report `chatType === "group"`; the topic split
+ * lives in {@link NormalizedMessage.chatMode}, surfaced as `InboundMessage.chatMode`).
+ * The `message` callback routes solely on this gate, plus an @-mention guard for
+ * group messages (see the `message` handler).
  */
-const acceptChatType = (chatType: string): boolean => chatType === "p2p";
+const acceptChatType = (chatType: string): boolean => chatType === "p2p" || chatType === "group";
 
 /**
  * Wrap an SDK Promise call, tagging any rejection as a {@link LarkGatewayError}.
@@ -120,7 +123,14 @@ const normalizeInbound = (message: NormalizedMessage): InboundMessage => {
     text: message.content,
     attachments,
     createTime: message.createTime,
+    // M3a routing projections. `mentionedBot` is always present on the SDK
+    // shape; `threadId`/`chatMode`/`rootId` are spread conditionally to satisfy
+    // `exactOptionalPropertyTypes` (omitted, not set to `undefined`).
+    mentionedBot: message.mentionedBot,
     ...(message.senderName !== undefined ? { senderName: message.senderName } : {}),
+    ...(message.threadId !== undefined ? { larkThreadId: message.threadId } : {}),
+    ...(message.chatMode !== undefined ? { chatMode: message.chatMode } : {}),
+    ...(message.rootId !== undefined ? { rootId: message.rootId } : {}),
   };
 };
 
@@ -173,21 +183,30 @@ export const larkGatewayLayer = (config: FeishuAppConfig): Layer.Layer<LarkGatew
           // Register handlers before opening the socket so no event is missed.
           // The SDK callbacks fire on its own async loop; `BridgeHandlers` are
           // plain `void` functions adapted onto the bridge runtime, so we invoke
-          // them directly. Only `p2p` messages reach the bridge in M1; group /
-          // topic messages are ignored.
+          // them directly. M3a admits p2p and group (@-mention-gated) messages.
           yield* Effect.sync(() =>
             channel.on({
               message: (message) => {
-                // Single admission point (M3 seam): M2a still admits only p2p.
+                // Single admission point: M3a admits p2p and group.
                 if (!acceptChatType(message.chatType)) {
+                  return;
+                }
+                // Group @-mention guard (redundant defence). Feishu only pushes
+                // group messages that @-mention the bot, so `mentionedBot` should
+                // already be true here; we still drop an un-mentioned group
+                // message rather than spawn a turn for chatter the bot wasn't
+                // addressed in. `undefined` (mention info absent) is tolerated as
+                // "allow" so a normalisation gap never silences the bot. The p2p
+                // path is unaffected — it never consults `mentionedBot`.
+                if (message.chatType === "group" && message.mentionedBot === false) {
                   return;
                 }
                 handlers.onInboundMessage(normalizeInbound(message));
               },
               // Card interactions are NOT gated by `acceptChatType`: interaction
-              // cards exist only in the private chats the bridge already drives,
-              // so every `cardAction` is routed straight to the bridge, which
-              // verifies the signed token and resolves the binding (M2b-1).
+              // cards are sent by the bridge to any chat it drives (p2p, group, or
+              // topic), so every `cardAction` is routed straight to the bridge,
+              // which verifies the signed token and resolves the binding (M2b-1).
               cardAction: (evt) => {
                 handlers.onCardAction(evt);
               },
@@ -212,6 +231,7 @@ export const larkGatewayLayer = (config: FeishuAppConfig): Layer.Layer<LarkGatew
         chatId: string,
         initial: object,
         completion: StreamingCardCompletion,
+        sendOpts?: SendOptions,
       ): Effect.Effect<StreamingCard, LarkGatewayError> =>
         Effect.gen(function* () {
           // Native-Promise handoff: the SDK producer runs the card's whole
@@ -237,8 +257,12 @@ export const larkGatewayLayer = (config: FeishuAppConfig): Layer.Layer<LarkGatew
           // Fire-and-forget: `stream(...)` resolves only after the producer
           // returns (turn end). If it rejects before the controller is handed
           // back, surface that to the waiter; later rejections have nowhere to
-          // go (the turn is over) and are swallowed.
-          void channel.stream(chatId, input).catch((cause: unknown) => rejectController(cause));
+          // go (the turn is over) and are swallowed. `sendOpts` (M3a) carries the
+          // optional topic reply (`replyInThread` / `replyTo`); `undefined` keeps
+          // the legacy p2p/group send behaviour byte-for-byte unchanged.
+          void channel
+            .stream(chatId, input, sendOpts)
+            .catch((cause: unknown) => rejectController(cause));
 
           const controller = yield* Effect.tryPromise({
             try: () => controllerReady,

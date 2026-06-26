@@ -287,13 +287,21 @@ export interface ChatBinding {
 }
 
 /**
- * Persistent map of Feishu `chat_id` → current {@link ChatBinding}.
+ * Persistent map of a Feishu conversation key → current {@link ChatBinding}.
  *
- * The first message from a chat creates a thread and records the binding here;
- * every later message re-uses it, which is what makes the conversation a true
- * shared session across restarts. Keyed by `chat_id` (Feishu private chats are
- * 1:1, so one chat ↔ one binding). M2a stores the full {@link ChatBinding}
+ * The first message from a conversation creates a thread and records the binding
+ * here; every later message re-uses it, which is what makes the conversation a
+ * true shared session across restarts. M2a stored the full {@link ChatBinding}
  * (threadId + origin), migrating M1's bare-`ThreadId` JSON on load.
+ *
+ * M3a: the key is the composite `chatId[:larkThreadId]` produced by the bridge's
+ * `compositeChatKey` — a group *topic* (`omt_…`) backs its own thread, so the
+ * key distinguishes topics within one `chat_id`. p2p / plain-group keys have no
+ * `larkThreadId` and so are a bare `chat_id` with no `:`, byte-identical to the
+ * pre-M3a key. This store is key-agnostic (the value is opaque `string`), so old
+ * on-disk entries (key = `chat_id`) are the natural degenerate form and load
+ * with no migration. The `get`/`put`/`remove`/`entries` signatures are unchanged
+ * (still `string`); only the key *content* may now contain a single `:`.
  */
 export class ChatThreadMapStore extends Context.Service<
   ChatThreadMapStore,
@@ -607,11 +615,18 @@ export class NoticeMemoryStore extends Context.Service<
 >()("@t3tools/feishu-bot/runtime/persistence/NoticeMemoryStore") {}
 
 /**
- * Persistent map of Feishu `chat_id` → latest {@link CardHandle} (M2b-1).
+ * Persistent map of a Feishu conversation key → latest {@link CardHandle} (M2b-1).
  *
  * The turn path records a handle after rendering an interaction card; M2b-2
  * recovery reads it back to re-render an outstanding approval card across a
  * restart. M2b-1 only defines the store and writes handles.
+ *
+ * M3a: like {@link ChatThreadMapStore}, the key is the bridge's composite
+ * `chatId[:larkThreadId]` so a group topic keeps its own card handle. The key is
+ * opaque `string` here; p2p / plain-group keys carry no `:` and so are
+ * byte-identical to the pre-M3a `chat_id` key (old entries load unchanged). The
+ * `get`/`put`/`remove` signatures are unchanged — only the key content may now
+ * contain a single `:`.
  */
 export class CardHandleStore extends Context.Service<
   CardHandleStore,

@@ -12,7 +12,7 @@ import * as Context from "effect/Context";
 import * as Data from "effect/Data";
 import type * as Effect from "effect/Effect";
 
-import type { BridgeHandlers } from "./types.ts";
+import type { BridgeHandlers, SendOptions } from "./types.ts";
 
 // Re-export the cross-layer types so callers can `import { ... } from "../lark"`.
 export type {
@@ -21,8 +21,10 @@ export type {
   InboundAttachment,
   InboundMessage,
   LarkChannelError,
+  MentionInfo,
   NormalizedMessage,
   ResourceDescriptor,
+  SendOptions,
 } from "./types.ts";
 
 /** Any error escaping the gateway boundary. M1 wraps SDK failures verbatim. */
@@ -82,11 +84,18 @@ export class LarkGateway extends Context.Service<
      * (resolved once the card message exists) for in-place updates; the gateway
      * keeps the underlying SDK `stream` producer alive until `completion.done`
      * fires. `initial` is the first card JSON to render.
+     *
+     * `sendOpts` (M3a) is forwarded to the SDK `stream(...)` call as its
+     * {@link SendOptions}: a topic-group turn passes `{ replyInThread: true }`
+     * (optionally with `replyTo` set to the triggering message id) so the card
+     * posts inside the originating Feishu topic rather than the chat root.
+     * Omitting it preserves the legacy p2p/group send behaviour unchanged.
      */
     readonly startStreamingCard: (
       chatId: string,
       initial: object,
       completion: StreamingCardCompletion,
+      sendOpts?: SendOptions,
     ) => Effect.Effect<StreamingCard, LarkGatewayError>;
     /**
      * Add an emoji reaction to a message, returning the Feishu `reaction_id` (for
