@@ -56,6 +56,7 @@ import { type CallbackAuth, computePolicyFingerprint } from "./callbackAuth.ts";
 // ── Action constants ────────────────────────────────────────────────────────
 
 const ACTION_APPROVAL_ACCEPT = "approval:accept";
+const ACTION_APPROVAL_ACCEPT_FOR_SESSION = "approval:acceptForSession";
 const ACTION_APPROVAL_DECLINE = "approval:decline";
 const ACTION_USER_INPUT_SUBMIT = "user-input:submit";
 
@@ -99,7 +100,7 @@ export interface InteractionContext {
 export interface ResolvedNoticeEntry {
   readonly operatorName: string;
   readonly commandSummary: string | null;
-  readonly decision: "accept" | "decline" | "submit";
+  readonly decision: "accept" | "acceptForSession" | "decline" | "submit";
 }
 
 /**
@@ -159,8 +160,14 @@ export const renderInteractionSection = (
 ): ReadonlyArray<CardElement> => {
   const elements: CardElement[] = [];
 
-  for (const approval of pendingApprovals) {
-    pushBlock(elements, renderApprovalBlock(approval, staleRequestIds, resolvedNotice, ctx));
+  const totalApprovals = pendingApprovals.length;
+  for (let i = 0; i < pendingApprovals.length; i++) {
+    const approval = pendingApprovals[i];
+    if (!approval) continue;
+    pushBlock(
+      elements,
+      renderApprovalBlock(approval, staleRequestIds, resolvedNotice, ctx, i + 1, totalApprovals),
+    );
   }
 
   for (const userInput of pendingUserInputs) {
@@ -180,35 +187,66 @@ const pushBlock = (target: CardElement[], block: ReadonlyArray<CardElement>): vo
   }
 };
 
+/**
+ * Map a {@link PendingApproval.requestKind} to a human-readable Chinese title
+ * (aligning with web's "Command/File-read/File-change approval requested").
+ */
+const approvalKindTitle = (requestKind: PendingApproval["requestKind"]): string => {
+  switch (requestKind) {
+    case "command":
+      return "命令审批";
+    case "file-read":
+      return "文件读取审批";
+    case "file-change":
+      return "文件修改审批";
+  }
+};
+
 const renderApprovalBlock = (
   approval: PendingApproval,
   staleRequestIds: ReadonlySet<string>,
   resolvedNotice: ReadonlyMap<string, ResolvedNoticeEntry>,
   ctx: InteractionContext,
+  /** 1-based index of this approval among all pending approvals (for progress display). */
+  index: number,
+  /** Total number of pending approvals (for progress display). */
+  total: number,
 ): ReadonlyArray<CardElement> => {
   const requestId = approval.requestId;
   const detail = approval.detail?.trim() || PLACEHOLDER_DETAIL;
+  const kindTitle = approvalKindTitle(approval.requestKind);
+  const progressSuffix = total > 1 ? ` (${index}/${total})` : "";
 
   const entry = resolvedNotice.get(requestId);
   if (entry) {
     return [resolvedMarkdown(formatResolvedEntry(entry))];
   }
   if (staleRequestIds.has(requestId)) {
-    return [staleMarkdown(`⚠️ 需批准:${detail}`)];
+    return [staleMarkdown(`⚠️ ${kindTitle}${progressSuffix}:${detail}`)];
   }
 
+  // Active approval: three buttons on a single row (拒绝 / 始终允许 / 允许),
+  // mirroring web order Decline / Always allow this session / Approve once. The
+  // row is one `flex_mode: "flow"` column_set with auto-width columns, so the
+  // three short labels sit on one line (and degrade gracefully if ever too wide).
+  // "始终允许" is the short button label for acceptForSession; the resolved echo
+  // still spells out "设为本会话始终允许".
   return [
-    markdown(`⚠️ **需批准**:${detail}`),
+    markdown(`⚠️ **${kindTitle}${progressSuffix}**:${detail}`),
     buttonRow([
-      callbackButton({
-        text: "允许",
-        type: "primary",
-        value: actionValue(ctx, requestId, ACTION_APPROVAL_ACCEPT),
-      }),
       callbackButton({
         text: "拒绝",
         type: "danger",
         value: actionValue(ctx, requestId, ACTION_APPROVAL_DECLINE),
+      }),
+      callbackButton({
+        text: "始终允许",
+        value: actionValue(ctx, requestId, ACTION_APPROVAL_ACCEPT_FOR_SESSION),
+      }),
+      callbackButton({
+        text: "允许",
+        type: "primary",
+        value: actionValue(ctx, requestId, ACTION_APPROVAL_ACCEPT),
       }),
     ]),
   ];
@@ -378,9 +416,10 @@ const staleMarkdown = (title: string): CardElement => ({
 
 /**
  * Format a {@link ResolvedNoticeEntry} into a single markdown line:
- *   - accepted approval → `✅ 已由 @<operatorName> 授权 · <commandSummary>`
- *   - declined approval → `🚫 已由 @<operatorName> 拒绝 · <commandSummary>`
- *   - user-input submit → `✅ 已由 @<operatorName> 提交`
+ *   - accepted approval           → `✅ 已由 @<operatorName> 授权 · <commandSummary>`
+ *   - acceptForSession approval   → `✅ 已由 @<operatorName> 设为本会话始终允许 · <commandSummary>`
+ *   - declined approval           → `🚫 已由 @<operatorName> 拒绝 · <commandSummary>`
+ *   - user-input submit           → `✅ 已由 @<operatorName> 提交`
  *
  * `commandSummary` is truncated to {@link RESOLVED_SUMMARY_MAX_CHARS} chars.
  * When absent (user-input), the `· <summary>` suffix is omitted.
@@ -388,7 +427,14 @@ const staleMarkdown = (title: string): CardElement => ({
 const formatResolvedEntry = (entry: ResolvedNoticeEntry): string => {
   const { operatorName, commandSummary, decision } = entry;
   const icon = decision === "decline" ? "🚫" : "✅";
-  const verb = decision === "accept" ? "授权" : decision === "decline" ? "拒绝" : "提交";
+  const verb =
+    decision === "accept"
+      ? "授权"
+      : decision === "acceptForSession"
+        ? "设为本会话始终允许"
+        : decision === "decline"
+          ? "拒绝"
+          : "提交";
   const base = `${icon} 已由 @${operatorName} ${verb}`;
   if (commandSummary === null || commandSummary.trim().length === 0) {
     return base;
@@ -575,6 +621,8 @@ export const actionToApprovalDecision = (action: string): ProviderApprovalDecisi
   switch (action) {
     case ACTION_APPROVAL_ACCEPT:
       return "accept";
+    case ACTION_APPROVAL_ACCEPT_FOR_SESSION:
+      return "acceptForSession";
     case ACTION_APPROVAL_DECLINE:
       return "decline";
     default:

@@ -565,7 +565,13 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
       projectId: project.projectId,
       title: placeholderTitle,
       modelSelection,
-      runtimeMode: "full-access",
+      // Safe default for the first streaming frame: driveTurn / runObserveFiber
+      // render this placeholder before the real snapshot arrives, and
+      // approval-required carries no header badge — so the card never flashes a
+      // misleading red `bypass` for what is actually an approval-required session.
+      // The real runtimeMode overwrites it on the first folded frame. (sendNotice
+      // renders this thread with chrome:false, so the value is moot there.)
+      runtimeMode: "approval-required",
       interactionMode: "default",
       branch: null,
       worktreePath: null,
@@ -2416,10 +2422,26 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         //     tick keeps this request greyed out for the whole turn and after it
         //     ends, then echo it onto this card now.
         const who = yield* resolveOperatorName(evt.operator);
+        // Echo-display decision: derive it from the SAME action the respond RPC
+        // routed (line ~2380) so the greyed-out echo matches what was actually
+        // dispatched. A binary "accept vs else→decline" ternary would misclassify
+        // an `acceptForSession` click as a 拒绝 echo, so map the action explicitly.
+        // Only accept/acceptForSession/decline buttons exist (no `cancel` button),
+        // and an unrecognized action can't reach here — routing already rejected a
+        // null decision above — so decline is just a defensive default. User-input
+        // submits stay "submit".
+        const echoDecision = (action: string): ResolvedNoticeEntry["decision"] => {
+          switch (action) {
+            case "approval:accept":
+              return "accept";
+            case "approval:acceptForSession":
+              return "acceptForSession";
+            default:
+              return "decline";
+          }
+        };
         const decision: ResolvedNoticeEntry["decision"] = isApproval
-          ? res.payload.a === "approval:accept"
-            ? "accept"
-            : "decline"
+          ? echoDecision(res.payload.a)
           : "submit";
         // commandSummary: for an approval, the request's detail (the command/file
         // summary) — trimmed, `null` when empty; the renderer truncates it. A

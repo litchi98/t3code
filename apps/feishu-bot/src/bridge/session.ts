@@ -23,6 +23,7 @@ import type {
   OrchestrationThread,
   OrchestrationThreadStreamItem,
   ThreadId,
+  TurnId,
 } from "@t3tools/contracts";
 import { applyThreadDetailEvent } from "@t3tools/client-runtime/state/threads";
 import * as Deferred from "effect/Deferred";
@@ -30,6 +31,7 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Schedule from "effect/Schedule";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
@@ -42,6 +44,18 @@ import type { TurnOutcome } from "./types.ts";
  * bridge can flush the queue and recover. Mirrors M0's `TURN_TIMEOUT`.
  */
 const TURN_TIMEOUT = Duration.minutes(10);
+
+/**
+ * Upper bound on the post-turn grace wait for the `thread.turn-diff-completed`
+ * event (the one that fills `thread.checkpoints` with the changed-file line
+ * counts). The server emits it *after* the `thread.session-set` that flips the
+ * session idle, so a turn that genuinely changed files can succeed-complete a
+ * beat before its checkpoint lands. We only ever wait when this turn touched
+ * files and the checkpoint is still absent, and we fall through (rendering
+ * without Changed files this once) on timeout — far smaller than
+ * {@link TURN_TIMEOUT} so the grace's own timeout always fires first.
+ */
+const TURN_DIFF_GRACE = Duration.seconds(5);
 
 /**
  * Live observation of a single thread's turn.
@@ -94,6 +108,21 @@ const isFailureStatus = (status: OrchestrationSession["status"]): boolean =>
   status === "error" || status === "interrupted" || status === "stopped";
 
 /**
+ * Read the `itemType` string off an activity payload (which is `unknown`)
+ * without trusting its shape; returns "" when absent. A deliberately tiny,
+ * local mirror of `eventRenderer`'s `payloadString` — kept inline so this
+ * module stays free of an `eventRenderer` import (the changed-files grace only
+ * needs the one key to recognise `file_change` / diff activities).
+ */
+const payloadItemType = (payload: unknown): string => {
+  if (typeof payload !== "object" || payload === null) {
+    return "";
+  }
+  const value = (payload as Record<string, unknown>).itemType;
+  return typeof value === "string" ? value : "";
+};
+
+/**
  * Begin observing `threadId`. Folds the subscription into a `Ref` and pushes
  * each folded state to a render-tick queue; resolves `completion` via the
  * session latch (saw active turn → `activeTurnId` cleared = success; failure
@@ -120,6 +149,10 @@ export const observeThread = (
     // Latch: only treat `activeTurnId === null` as completion once we've seen
     // the turn actually running (the initial snapshot is already terminal-ish).
     const turnObserved = yield* Ref.make(false);
+    // The id of the turn we last saw running. Recorded (never awaited) inside
+    // the fold so the post-completion grace can scope its "did this turn touch
+    // files? / has its checkpoint arrived?" checks to the turn that just ran.
+    const activeTurnIdSeen = yield* Ref.make<TurnId | null>(null);
 
     // sliding(1): the renderer only cares about the newest state; coalesce.
     const ticks = yield* Queue.sliding<OrchestrationThread>(1);
@@ -129,6 +162,10 @@ export const observeThread = (
       Effect.gen(function* () {
         if (session.activeTurnId !== null) {
           yield* Ref.set(turnObserved, true);
+          // Remember which turn ran so the completion-chain grace can scope its
+          // file-change / checkpoint checks. Record-only: never await here, or
+          // we'd block the fold fiber.
+          yield* Ref.set(activeTurnIdSeen, session.activeTurnId);
           return;
         }
         // activeTurnId === null: a terminal-ish state. Only treat it as *this
@@ -224,6 +261,69 @@ export const observeThread = (
     // no turn event is missed (the spec's ordering rule).
     yield* deps.subscribe(threadId).pipe(Stream.runForEach(applyItem), Effect.forkScoped);
 
+    // Post-completion grace for the changed-files terminal render.
+    //
+    // On a successful turn the server emits `thread.session-set` (status idle /
+    // `activeTurnId → null`, which resolves `done`) *before* the
+    // `thread.turn-diff-completed` event that fills `thread.checkpoints` with the
+    // changed-file line counts. The terminal card render (`bot.ts`, after this
+    // `completion` resolves) reads `observation.current` and would miss the
+    // Changed-files section if the checkpoint hasn't landed yet.
+    //
+    // So, *after* `done` resolves and *only* when this turn actually touched
+    // files and its checkpoint is still absent, briefly poll `threadRef` until
+    // the checkpoint arrives. This runs on the await/main fiber — never inside
+    // the fold (`applyItem`) — so the `forkScoped` fold fiber keeps consuming the
+    // subscription and folding the incoming `turn-diff-completed` into
+    // `threadRef` while we poll; that is exactly what flips `checkpointArrived`.
+    // On timeout we fall through and return the unchanged outcome (Changed files
+    // simply won't show this once), so a missing diff event can never wedge us.
+    const graceForChangedFiles = (outcome: TurnOutcome) =>
+      Effect.gen(function* () {
+        if (outcome.kind !== "succeeded") {
+          return outcome;
+        }
+        const seenTurnId = yield* Ref.get(activeTurnIdSeen);
+        if (seenTurnId === null) {
+          return outcome;
+        }
+        const thread = yield* Ref.get(threadRef);
+        if (thread === null) {
+          return outcome;
+        }
+        const hasFileChange = thread.activities.some((activity) => {
+          if (activity.turnId !== seenTurnId) {
+            return false;
+          }
+          const itemType = payloadItemType(activity.payload);
+          return itemType === "file_change" || itemType.includes("diff");
+        });
+        const checkpointArrived = thread.checkpoints.some(
+          (cp) => cp.turnId === seenTurnId && cp.files.length > 0,
+        );
+        if (!hasFileChange || checkpointArrived) {
+          // Nothing to wait for — zero added latency on the common path.
+          return outcome;
+        }
+        // Poll the fold's ref until the checkpoint lands; bounded so a never-
+        // delivered diff event can't pin us. Interruptible (Effect primitives
+        // only — no blocking sleep), so a turn-scope interrupt propagates.
+        yield* Ref.get(threadRef).pipe(
+          Effect.repeat({
+            until: (current: OrchestrationThread | null) =>
+              current !== null &&
+              current.checkpoints.some((cp) => cp.turnId === seenTurnId && cp.files.length > 0),
+            schedule: Schedule.spaced(Duration.millis(100)),
+          }),
+          Effect.timeoutOrElse({
+            duration: TURN_DIFF_GRACE,
+            orElse: () => Effect.succeed(null as OrchestrationThread | null),
+          }),
+          Effect.asVoid,
+        );
+        return outcome;
+      });
+
     // Bound the wait so a wedged provider can't pin the chat queue forever.
     const completion = Deferred.await(done).pipe(
       Effect.timeoutOrElse({
@@ -235,6 +335,11 @@ export const observeThread = (
             lastError: `Turn did not complete within ${Duration.format(TURN_TIMEOUT)}.`,
           }),
       }),
+      // Once terminal, grace-wait for this turn's changed-files checkpoint before
+      // the final render (success + file-change + checkpoint-not-yet-arrived only;
+      // otherwise zero-latency). Sits between the await and the tick shutdown so
+      // the fold fiber is still alive to fold the awaited diff event.
+      Effect.flatMap(graceForChangedFiles),
       // Stop pushing render ticks once the turn is terminal.
       Effect.ensuring(Queue.shutdown(ticks)),
     );
