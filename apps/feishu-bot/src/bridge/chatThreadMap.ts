@@ -39,6 +39,7 @@ import * as Effect from "effect/Effect";
 
 import { BindingState } from "./bindingState.ts";
 import { deriveCommandId } from "./commandId.ts";
+import type { RenderDensity } from "./eventRenderer.ts";
 import type { EnsuredThread } from "./types.ts";
 import type { InboundMessage } from "../lark/types.ts";
 
@@ -98,6 +99,20 @@ export const resolveApprover = (
   runtimeMode === "approval-required" && ownerOpenIds.length > 0
     ? (ownerOpenIds[0] ?? initiatorOpenId)
     : initiatorOpenId;
+
+/**
+ * M3b: render density per runtime mode. A p2p 1:1 chat (`full-access`) is always
+ * the full `card` layout; a group / topic chat (`approval-required`) honours the
+ * configured `groupChatDensity` (default `card`; opt-in `markdown` / `text`).
+ * Pure function of `(runtimeMode, groupChatDensity)` — lives here next to
+ * `runtimeModeForChatType` / `resolveApprover` so the turn pipeline and renderer
+ * derive density from one place. Default-no-auto-downgrade: only an explicit
+ * config lowers a group below `card`, so p2p noise control is never affected.
+ */
+export const densityForRuntime = (
+  runtimeMode: RuntimeMode,
+  groupChatDensity: RenderDensity,
+): RenderDensity => (runtimeMode === "full-access" ? "card" : groupChatDensity);
 
 /**
  * M3a: the chat-key anchor for a Feishu inbound message.

@@ -87,6 +87,7 @@ import {
 import {
   anchorOf,
   compositeChatKey,
+  densityForRuntime,
   deriveThreadId,
   ensureThreadForChat,
   resolveApprover,
@@ -501,6 +502,13 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     // M3a: primary owner open IDs for approval gating. Captured once from config
     // (bot-side, like appId) so `buildInteraction` closures share a stable reference.
     const ownerOpenIds = config.feishu.ownerOpenIds;
+
+    // M3b: render density for group / topic chats, captured once from config
+    // (bot-side, like `ownerOpenIds`) so every `renderThreadCard` call site below
+    // derives its layout from one place via `densityForRuntime(runtimeMode, …)`.
+    // p2p (`full-access`) is always `card`; only an explicit
+    // `FEISHU_GROUP_CHAT_DENSITY` lowers a group/topic below `card`.
+    const groupChatDensity = config.feishu.groupChatDensity;
 
     // E④: composite chatKey → operator open id, captured from each inbound message.
     // `chatOperators` records the most recent sender per composite key (chatId or
@@ -1399,6 +1407,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         const interaction = yield* buildInteraction(chatId, snapshotThread, operatorOpenId);
         const card = renderThreadCard(snapshotThread, {
           streaming: false,
+          density: densityForRuntime(snapshotThread.runtimeMode, groupChatDensity),
           ...(interaction ? { interaction } : {}),
         }).card;
 
@@ -1598,6 +1607,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
                         renderThreadCard(thread, {
                           streaming: true,
                           currentTurnId,
+                          density: densityForRuntime(thread.runtimeMode, groupChatDensity),
                           ...(interaction ? { interaction } : {}),
                         }).card,
                       )
@@ -1649,6 +1659,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
               renderThreadCard(finalThread, {
                 streaming: false,
                 currentTurnId,
+                density: densityForRuntime(finalThread.runtimeMode, groupChatDensity),
                 ...(interaction ? { interaction } : {}),
               }).card,
             )
@@ -1823,7 +1834,10 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
             // the turn reaches a terminal state (the `cardDone` released below). A
             // failed start must NOT crash the fiber — skip the render and exit; the
             // watcher re-triggers on the next frame if the turn is still running.
-            const initial = renderThreadCard(placeholderThread, { streaming: true }).card;
+            const initial = renderThreadCard(placeholderThread, {
+              streaming: true,
+              density: densityForRuntime(placeholderThread.runtimeMode, groupChatDensity),
+            }).card;
             // M3a: send to the real Feishu chatId. An observe fiber mirrors a turn
             // another end started (no triggering message for this end), so it posts
             // at the chat/group root (no topic `sendOpts`) — the accepted degradation
@@ -1904,7 +1918,10 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
       Effect.gen(function* () {
         const cardDone = yield* Deferred.make<void>();
         yield* Effect.gen(function* () {
-          const initial = renderThreadCard(placeholderThread, { streaming: true }).card;
+          const initial = renderThreadCard(placeholderThread, {
+            streaming: true,
+            density: densityForRuntime(placeholderThread.runtimeMode, groupChatDensity),
+          }).card;
 
           // M3a: real Feishu chatId + (topic-only) in-thread reply opts.
           const { chatId: realChatId, larkThreadId } = splitChatKey(chatId);
@@ -2756,6 +2773,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
           );
           const card = renderThreadCard(snapshotThread, {
             streaming: false,
+            density: densityForRuntime(snapshotThread.runtimeMode, groupChatDensity),
             interaction: { elements },
           }).card;
           return gateway.updateCard(evt.messageId, card).pipe(
@@ -3016,6 +3034,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
           );
           const card = renderThreadCard(snapshotThread, {
             streaming: false,
+            density: densityForRuntime(snapshotThread.runtimeMode, groupChatDensity),
             ...(interaction ? { interaction } : {}),
           }).card;
           // #10: reflect the ACTUAL outcome of the card push. `updateCard` failures

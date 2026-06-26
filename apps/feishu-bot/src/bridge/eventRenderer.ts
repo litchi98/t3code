@@ -54,8 +54,11 @@ import type { CardElement, CardJson } from "../lark/card.ts";
 import type { RenderOptions as BaseRenderOptions, RenderResult } from "./types.ts";
 
 /**
- * Forward seam for M3 group-chat noise control. `card` is the full v3 layout;
- * the other modes are reserved (today they fall back to `card`).
+ * Output density for group-chat noise control (M3b). `card` is the full v3
+ * layout; `markdown` and `text` are low-noise variants that swap the collapsible
+ * plan / activity / changed-files panels for single-line markdown summaries
+ * (`text` further drops the header, plan and changed-files sections). All three
+ * keep the assistant body and the interaction section.
  */
 export type RenderDensity = "card" | "markdown" | "text";
 
@@ -67,9 +70,13 @@ export type RenderDensity = "card" | "markdown" | "text";
  */
 export interface RenderOptions extends BaseRenderOptions {
   /**
-   * Output density. Defaults to `card`. Only `card` is implemented; `markdown`
-   * and `text` currently fall back to the `card` layout (see the density switch
-   * in {@link renderThreadCard}). TODO(M3): 群聊降噪密度.
+   * Output density. Defaults to `card` (full v3 layout). `markdown` drops the
+   * header, swaps the plan / activity / changed-files collapsibles for single-line
+   * markdown summaries, and strips the status-line workspace/branch meta. `text`
+   * is the most compact: it additionally drops the plan and changed-files
+   * sections and the activity current-step line, keeping only a one-line error
+   * banner, the status line, an activity tally, the full body, and the
+   * interaction. See the density branches in {@link renderThreadCard}.
    */
   readonly density?: RenderDensity;
   /**
@@ -436,6 +443,29 @@ const renderErrorBanner = (
     return null;
   }
   return markdown(trimToBytes(`⚠️ **错误**\n${lastError}`, maxBytes).text);
+};
+
+/** Max chars of the session error's first line kept in the `text`-density banner. */
+const ERROR_FIRST_LINE_MAX_CHARS = 120;
+
+/**
+ * Compact error banner for the `text` density: the first line of the session
+ * `lastError`, truncated to {@link ERROR_FIRST_LINE_MAX_CHARS} chars and prefixed
+ * with ⚠️. Drops the bold "错误" label and any multi-line stack trace — `text`
+ * density keeps only a one-line error signal above the body. Returns null when
+ * there is no session error (same source/gate as {@link renderErrorBanner}).
+ */
+const renderErrorBannerFirstLine = (thread: OrchestrationThread): MarkdownElement | null => {
+  const lastError = thread.session?.lastError ?? null;
+  if (lastError === null || lastError.length === 0) {
+    return null;
+  }
+  const firstLine = lastError.split("\n", 1)[0] ?? "";
+  const clipped =
+    firstLine.length > ERROR_FIRST_LINE_MAX_CHARS
+      ? `${firstLine.slice(0, ERROR_FIRST_LINE_MAX_CHARS)}…`
+      : firstLine;
+  return markdown(`⚠️ ${clipped}`);
 };
 
 // ── Unified activity stream (tool.* + task.*) ────────────────────────────────
@@ -945,6 +975,23 @@ const PLAN_STATUS_ICON: Readonly<Record<PlanStep["status"], string>> = {
 };
 
 /**
+ * Plan progress counts (completed / total). Shared by the full collapsible panel
+ * ({@link renderPlanPanel}) and the low-noise single-line summary
+ * ({@link renderPlanSummary}) so both agree on `X/N`.
+ */
+const planProgress = (
+  steps: ReadonlyArray<PlanStep>,
+): { readonly completed: number; readonly total: number } => {
+  let completed = 0;
+  for (const step of steps) {
+    if (step.status === "completed") {
+      completed += 1;
+    }
+  }
+  return { completed, total: steps.length };
+};
+
+/**
  * Render the plan panel (§5), mirroring the activity stream's "current visible,
  * rest folded" shape (per user): the **in-progress** steps (`🔄`) render inline
  * with no separate title row (TodoWrite normally has one active step — this is
@@ -962,17 +1009,15 @@ const renderPlanPanel = (
   steps: ReadonlyArray<PlanStep>,
   maxBytes: number,
 ): { readonly elements: ReadonlyArray<CardElement>; readonly degraded: boolean } => {
-  let completedCount = 0;
   const inProgressLines: Array<string> = [];
   const allLines: Array<string> = [];
   for (const step of steps) {
-    if (step.status === "completed") {
-      completedCount += 1;
-    } else if (step.status === "inProgress") {
+    if (step.status === "inProgress") {
       inProgressLines.push(`${PLAN_STATUS_ICON.inProgress} ${step.step}`);
     }
     allLines.push(`${PLAN_STATUS_ICON[step.status]} ${step.step}`);
   }
+  const { completed } = planProgress(steps);
   const elements: Array<CardElement> = [];
   let degraded = false;
   if (inProgressLines.length > 0) {
@@ -981,9 +1026,20 @@ const renderPlanPanel = (
     degraded = outer.cut;
   }
   const full = trimToBytes(allLines.join("\n\n"), maxBytes);
-  elements.push(collapsible(`📋 完整计划 (${completedCount}/${steps.length})`, full.text, false));
+  elements.push(collapsible(`📋 完整计划 (${completed}/${steps.length})`, full.text, false));
   degraded = degraded || full.cut;
   return { elements, degraded };
+};
+
+/**
+ * Low-noise plan summary (`markdown` density): a single-line `📋 计划 {X}/{N}`
+ * replacing the {@link renderPlanPanel} collapsible — same progress counts (via
+ * {@link planProgress}), no per-step list, no collapsible. Only invoked when
+ * {@link derivePlanSteps} returned steps.
+ */
+const renderPlanSummary = (steps: ReadonlyArray<PlanStep>): MarkdownElement => {
+  const { completed, total } = planProgress(steps);
+  return markdown(`📋 计划 ${completed}/${total}`);
 };
 
 // ── Changed files summary (checkpoint files) ─────────────────────────────────
@@ -1136,6 +1192,50 @@ const changedPathsFromActivities = (
 };
 
 /**
+ * Aggregate changed-file data for the rendered turn: the checkpoint files (with
+ * summed +/- line counts) when a checkpoint is associated with the turn, else the
+ * degraded file-name fallback from `file_change` activities. Shared by the full
+ * collapsible ({@link renderChangedFiles}) and the low-noise single-line summary
+ * ({@link renderChangedFilesSummary}) so both agree on count/totals/title. Returns
+ * null when there are no changed files at all.
+ */
+type ChangedFilesData =
+  | {
+      readonly kind: "checkpoint";
+      readonly files: ReadonlyArray<OrchestrationCheckpointFile>;
+      readonly additions: number;
+      readonly deletions: number;
+    }
+  | { readonly kind: "fallback"; readonly paths: ReadonlyArray<string> };
+
+const aggregateChangedFiles = (
+  thread: OrchestrationThread,
+  activeTurnId: TurnId | null,
+): ChangedFilesData | null => {
+  const checkpointFiles = checkpointFilesForTurn(thread, activeTurnId);
+  if (checkpointFiles !== null) {
+    let additions = 0;
+    let deletions = 0;
+    for (const file of checkpointFiles) {
+      additions += file.additions;
+      deletions += file.deletions;
+    }
+    return { kind: "checkpoint", files: checkpointFiles, additions, deletions };
+  }
+  const paths = changedPathsFromActivities(thread.activities, activeTurnId);
+  if (paths.length === 0) {
+    return null;
+  }
+  return { kind: "fallback", paths };
+};
+
+/** Title line shared by the collapsible panel and the low-noise summary. */
+const changedFilesTitle = (data: ChangedFilesData): string =>
+  data.kind === "checkpoint"
+    ? `📝 改动 ${data.files.length} 文件 (+${data.additions} -${data.deletions})`
+    : `📝 改动 ${data.paths.length} 文件`;
+
+/**
  * Render the changed-files summary (§6). Prefers the **checkpoint path**
  * (`📝 改动 N 文件 (+X -Y)`, one row `{path} (+a -b)` per file). When no checkpoint
  * is associated with the turn, falls back to file names extracted from
@@ -1148,30 +1248,36 @@ const renderChangedFiles = (
   maxBytes: number,
   activeTurnId: TurnId | null,
 ): { readonly element: CardElement; readonly degraded: boolean } | null => {
-  const checkpointFiles = checkpointFilesForTurn(thread, activeTurnId);
-  if (checkpointFiles !== null) {
-    let additions = 0;
-    let deletions = 0;
-    const lines: Array<string> = [];
-    for (const file of checkpointFiles) {
-      additions += file.additions;
-      deletions += file.deletions;
-      lines.push(`\`${file.path}\`  (+${file.additions} -${file.deletions})`);
-    }
-    const title = `📝 改动 ${checkpointFiles.length} 文件 (+${additions} -${deletions})`;
+  const data = aggregateChangedFiles(thread, activeTurnId);
+  if (data === null) {
+    return null;
+  }
+  const title = changedFilesTitle(data);
+  if (data.kind === "checkpoint") {
+    const lines = data.files.map(
+      (file) => `\`${file.path}\`  (+${file.additions} -${file.deletions})`,
+    );
     const byBytes = trimToBytes(lines.join("\n\n"), maxBytes);
     return { element: collapsible(title, byBytes.text, false), degraded: byBytes.cut };
   }
-
   // Degraded fallback: file names only (no line counts) + a pointer footer.
-  const paths = changedPathsFromActivities(thread.activities, activeTurnId);
-  if (paths.length === 0) {
-    return null;
-  }
-  const title = `📝 改动 ${paths.length} 文件`;
-  const body = `${paths.map((path) => `\`${path}\``).join("\n\n")}\n\n详见终端 / Web 查看 diff`;
+  const body = `${data.paths.map((path) => `\`${path}\``).join("\n\n")}\n\n详见终端 / Web 查看 diff`;
   const byBytes = trimToBytes(body, maxBytes);
   return { element: collapsible(title, byBytes.text, false), degraded: byBytes.cut };
+};
+
+/**
+ * Low-noise changed-files summary (`markdown` density): the same
+ * `📝 改动 N 文件 (+X -Y)` title as {@link renderChangedFiles} (via
+ * {@link changedFilesTitle}) as one markdown line, dropping the collapsible
+ * per-file list. Returns null when there are no changed files.
+ */
+const renderChangedFilesSummary = (
+  thread: OrchestrationThread,
+  activeTurnId: TurnId | null,
+): MarkdownElement | null => {
+  const data = aggregateChangedFiles(thread, activeTurnId);
+  return data === null ? null : markdown(changedFilesTitle(data));
 };
 
 // ── Header + subtitle ─────────────────────────────────────────────────────────
@@ -1295,9 +1401,10 @@ const clampElement = (
  * byte-estimated and degraded to stay under `opts.maxElementBytes ??
  * MAX_ELEMENT_BYTES`. `streaming_mode` is set from `opts.streaming`.
  *
- * `opts.density` is a forward seam for M3 group-chat noise control. Only `card`
- * (the full layout) is implemented today; `markdown`/`text` fall back to the
- * `card` behaviour (see the density switch below).
+ * `opts.density` selects the layout (M3b group-chat noise control): `card` is
+ * the full v3 layout; `markdown`/`text` are low-noise variants (single-line
+ * summaries instead of collapsible panels — see the density branches below). All
+ * three densities keep the assistant body and the interaction section.
  *
  * Turn scope: every dynamic section (body / status line / activity stream / plan
  * / changed files) filters by `opts.currentTurnId ?? thread.session.activeTurnId`
@@ -1321,17 +1428,11 @@ export const renderThreadCard = (
   // JSON envelope can't push us over the actual wire limit.
   const contentBytes = Math.min(SAFE_ELEMENT_BYTES, Math.max(0, ceiling - 2_000));
 
-  // Density seam (M2b-2). Resolve to a layout mode; only `card` is implemented.
-  // TODO(M3): 群聊降噪密度 — `markdown` (drop chrome, body-only) / `text` (plain
-  // line) for noisy group chats. Until then both fall back to the `card` layout.
+  // Density (M3b group-chat noise control). `card` = full v3 layout; `markdown` /
+  // `text` are low-noise variants assembled section-by-section below (collapsible
+  // panels become single-line markdown summaries; `text` drops more sections).
+  // All three keep the assistant body and the interaction section.
   const density = opts.density ?? "card";
-  switch (density) {
-    case "markdown":
-    case "text":
-    // TODO(M3): 群聊降噪密度 — distinct low-noise layouts. Fall through to `card`.
-    case "card":
-      break;
-  }
 
   const elements: Array<CardElement> = [];
   let degraded = false;
@@ -1369,14 +1470,19 @@ export const renderThreadCard = (
   // `opts.chrome === false` (notice/status cards that carry only a short text
   // body and have no meaningful title to surface).
   const withChrome = opts.chrome !== false;
-  if (withChrome) {
+  if (density === "card" && withChrome) {
     elements.push(renderHeader(thread));
   }
 
   // 2. Top error banner (session.lastError). Above the body; kept even when
   // chrome=false (a hard session error still surfaces on a notice card). Turn
   // error-tone activities are NOT here — they fold into the activity stream.
-  const banner = renderErrorBanner(thread, contentBytes);
+  // card/markdown: the full (multi-line) banner; text: a single ≤120-char first
+  // line. `banner === null` below still drives the status-line error fallback.
+  const banner =
+    density === "text"
+      ? renderErrorBannerFirstLine(thread)
+      : renderErrorBanner(thread, contentBytes);
   if (banner) {
     elements.push(banner);
   }
@@ -1398,9 +1504,12 @@ export const renderThreadCard = (
     // latestTurn, and a streaming-but-snapshot-lagging turn is "running" (not
     // "done"), so this filters only the genuine never-run case. (#11 follow-up)
     const suppressIdleDone = thread.latestTurn === null && turnStatus === "done";
+    // Low-noise densities drop the ` · 📁 ws · 🌿 branch` meta suffix; only `card`
+    // carries it (workspace/branch are low value in a noisy group thread).
+    const statusMeta = density === "card" ? statusMetaSuffix(thread) : "";
     const statusLine = suppressIdleDone
       ? null
-      : renderStatusLine(turnStatus, turnDuration(thread), statusMetaSuffix(thread));
+      : renderStatusLine(turnStatus, turnDuration(thread), statusMeta);
     if (statusLine) {
       elements.push(statusLine);
     } else if (turnStatus === "error" && banner === null) {
@@ -1424,28 +1533,53 @@ export const renderThreadCard = (
   // Only when the turn carried a `turn.plan.updated`.
   const planSteps = derivePlanSteps(thread.activities, turnIdForFilter);
   if (planSteps) {
-    startProcessGroup();
-    const plan = renderPlanPanel(planSteps, contentBytes);
-    for (const planElement of plan.elements) {
-      elements.push(planElement);
+    if (density === "card") {
+      startProcessGroup();
+      const plan = renderPlanPanel(planSteps, contentBytes);
+      for (const planElement of plan.elements) {
+        elements.push(planElement);
+      }
+      degraded = degraded || plan.degraded;
+    } else if (density === "markdown") {
+      // Low-noise: a single-line `📋 计划 X/N` summary instead of the collapsible.
+      startProcessGroup();
+      elements.push(renderPlanSummary(planSteps));
     }
-    degraded = degraded || plan.degraded;
+    // density === "text": the plan section is dropped entirely.
   }
 
   // 5. Unified activity stream (tool.* + task.* merged): current step always
   // visible + single-level history fold (RUNNING), or one folded summary (DONE).
-  const activity = renderActivityStream(
-    thread.activities,
-    contentBytes,
-    turnIdForFilter,
-    isRunning,
-  );
-  if (activity.elements.length > 0) {
-    startProcessGroup();
-    for (const activityElement of activity.elements) {
-      elements.push(activityElement);
+  if (density === "card") {
+    const activity = renderActivityStream(
+      thread.activities,
+      contentBytes,
+      turnIdForFilter,
+      isRunning,
+    );
+    if (activity.elements.length > 0) {
+      startProcessGroup();
+      for (const activityElement of activity.elements) {
+        elements.push(activityElement);
+      }
+      degraded = degraded || activity.degraded;
     }
-    degraded = degraded || activity.degraded;
+  } else {
+    // Low-noise: replace the collapsible work log with a single-line tally
+    // `🛠️ X✓ Y✗ [Z⏳]` (same aggregation/counts as the card panel). `markdown`
+    // keeps the always-visible current step while running; `text` shows only the
+    // tally. No activity ⇒ nothing rendered (mirrors the card empty case).
+    const entries = aggregateWorkLog(thread.activities, turnIdForFilter);
+    if (entries.length > 0) {
+      startProcessGroup();
+      if (density === "markdown" && isRunning) {
+        const current = entries[entries.length - 1];
+        if (current !== undefined) {
+          elements.push(renderCurrentStep(current));
+        }
+      }
+      elements.push(markdown(`🛠️ ${formatWorkCounts(tallyWorkCounts(entries))}`));
+    }
   }
 
   // 6. Changed files summary (📝 改动 N 文件 …). Checkpoint path (with line counts)
@@ -1454,12 +1588,22 @@ export const renderThreadCard = (
   // checkpoints can carry the running turn's files, and the same edits already
   // show as 🔧 rows in the activity stream — rendering both would double-display.
   if (!isRunning) {
-    const changed = renderChangedFiles(thread, contentBytes, turnIdForFilter);
-    if (changed) {
-      startProcessGroup();
-      elements.push(changed.element);
-      degraded = degraded || changed.degraded;
+    if (density === "card") {
+      const changed = renderChangedFiles(thread, contentBytes, turnIdForFilter);
+      if (changed) {
+        startProcessGroup();
+        elements.push(changed.element);
+        degraded = degraded || changed.degraded;
+      }
+    } else if (density === "markdown") {
+      // Low-noise: a single-line `📝 改动 N 文件 (+X -Y)` summary, no collapsible.
+      const summary = renderChangedFilesSummary(thread, turnIdForFilter);
+      if (summary) {
+        startProcessGroup();
+        elements.push(summary);
+      }
     }
+    // density === "text": the changed-files section is dropped entirely.
   }
 
   // 7. Assistant body (primary). Only rendered when the assistant has emitted
@@ -1471,9 +1615,15 @@ export const renderThreadCard = (
     if (elements.length > 0) {
       elements.push(divider());
     }
-    const trimmed = trimToBytes(assistant, contentBytes);
-    degraded = degraded || trimmed.cut;
-    elements.push(markdown(trimmed.text));
+    if (density === "card") {
+      const trimmed = trimToBytes(assistant, contentBytes);
+      degraded = degraded || trimmed.cut;
+      elements.push(markdown(trimmed.text));
+    } else {
+      // markdown/text: the body is the core value — no section-level pre-trim
+      // (the final clampElement still enforces the 30KB per-element wire ceiling).
+      elements.push(markdown(assistant));
+    }
   }
 
   // 8. Interaction section (pre-rendered by interactionCard, injected via opts).
