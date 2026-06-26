@@ -90,6 +90,12 @@ export const runtimeModeForChatType = (chatType: string): RuntimeMode =>
  * back to the turn initiator = pre-M3a "initiator-only" behavior (no regression).
  * Multi-approver allowlist is a future web-config milestone (decouples authz
  * from callbackAuth.verify); M3a only consumes ownerOpenIds[0].
+ *
+ * KNOWN LIMITATION: when owner-default selects `ownerOpenIds[0]`, that owner MUST
+ * be a member of the group. If the configured owner is not in the group, members'
+ * clicks fail verify and the owner never sees the card → the group approval
+ * deadlocks and the turn blocks permanently. The unconfigured/empty fallback
+ * (initiator approval) is safe. Root fix = multi-approver allowlist (M4).
  */
 export const resolveApprover = (
   runtimeMode: RuntimeMode,
@@ -242,6 +248,7 @@ export const ensureThreadForChat = (
   message: InboundMessage,
   deps: EnsureThreadDeps,
   runtimeMode: RuntimeMode,
+  groupChatDensity: RenderDensity,
   larkThreadId?: string,
 ): Effect.Effect<EnsuredThread, never, BindingState> =>
   Effect.gen(function* () {
@@ -296,7 +303,21 @@ export const ensureThreadForChat = (
     // `bind` absorbs a persist failure (logged, not propagated): the deterministic
     // threadId + stable create commandId make a re-create idempotent, so a lost
     // persist self-heals on the next message rather than orphaning a thread.
-    yield* bindings.bind(chatKey, { threadId, origin: "self-created" });
+    // M3b: stamp the binding with a topic reply anchor (the trigger message id —
+    // it belongs to this topic thread and is a valid `reply_in_thread` replyTo,
+    // unlike `anchorOf`'s `omt_` for a topic group) and the bind-time render
+    // density, so trigger-less paths (shellWatcher chained approvals, observe
+    // fresh card) post inside the topic and the placeholder first frame renders
+    // at the right density (no placeholder→real density jump). p2p stamps a
+    // harmless anchor (topicSendOpts no-ops when larkThreadId is undefined) and
+    // density `card`.
+    const density = densityForRuntime(runtimeMode, groupChatDensity);
+    yield* bindings.bind(chatKey, {
+      threadId,
+      origin: "self-created",
+      topicAnchorMessageId: message.messageId,
+      density,
+    });
     return { threadId, created: true } satisfies EnsuredThread;
   });
 

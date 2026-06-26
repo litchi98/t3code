@@ -73,6 +73,13 @@ export interface FeishuAppConfig {
    * initiator (pre-M3a behavior, no regression). When set, only
    * `ownerOpenIds[0]` is used as the approval operator (single-owner binding);
    * multi-approver allowlist is a future milestone.
+   *
+   * KNOWN LIMITATION (single-owner binding): `ownerOpenIds[0]` MUST be a member
+   * of every target group. If it is set to someone NOT in the group, that group's
+   * approval cards are signed to a non-member: group members fail verify, and the
+   * owner never sees the card — so the turn's approval can never be granted and the
+   * turn blocks permanently. The empty-array default (initiator approval) is not
+   * affected. Root fix = multi-approver allowlist (future milestone).
    */
   readonly ownerOpenIds: ReadonlyArray<string>;
   /**
