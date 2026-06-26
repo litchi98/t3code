@@ -81,6 +81,14 @@ export interface InteractionContext {
   readonly runtimeMode: string;
   readonly auth: CallbackAuth;
   readonly ttlMs: number;
+  /**
+   * Optional Feishu topic id (`omt_…`) for M3a group/topic chats. Threaded into
+   * every button's signed token (`payload.lt`) AND echoed in the plain button
+   * value (`lt`) so the cardAction handler can recover the topic to locate its
+   * binding — `CardActionEvent` carries no thread field. `undefined` for p2p /
+   * non-topic chats (token + value then identical to the pre-M3a shape).
+   */
+  readonly larkThreadId?: string;
 }
 
 /**
@@ -113,6 +121,16 @@ export interface CardActionValue {
   readonly t: string;
   readonly rid: string;
   readonly q?: string;
+  /**
+   * Optional Feishu topic id (`omt_…`, M3a). A pre-verify bootstrap hint echoed
+   * back on click so the handler can locate the topic binding *before* it can
+   * recompute the policy fingerprint to verify the token. Untrusted on its own
+   * but tamper-evident: the signed fingerprint derives from the topic's thread
+   * id, so a forged `lt` fails verification with `context-mismatch`. The
+   * authoritative copy is the signed `payload.lt` returned by `verify`. Omitted
+   * for p2p / non-topic buttons (value identical to the pre-M3a shape).
+   */
+  readonly lt?: string;
 }
 
 /** Parsed pieces of a `CardActionEvent` the handler needs to route a response. */
@@ -120,6 +138,13 @@ export interface ParsedCardAction {
   readonly token: string;
   readonly requestId: string;
   readonly formValue?: Record<string, unknown>;
+  /**
+   * The Feishu topic id (`omt_…`) the button was rendered for (M3a), echoed in
+   * the value's `lt`. A pre-verify bootstrap the handler uses to locate the topic
+   * binding; cross-validated by the signed fingerprint at `verify` (whose
+   * `payload.lt` is the authoritative copy). Absent for p2p / non-topic.
+   */
+  readonly larkThreadId?: string;
 }
 
 // ── Rendering ────────────────────────────────────────────────────────────────
@@ -489,8 +514,18 @@ const actionValue = (
     action,
     policyFingerprint: computePolicyFingerprint(ctx.chatId, ctx.threadId, ctx.runtimeMode),
     ttlMs: ctx.ttlMs,
+    // M3a: bind the topic id into the signed payload (`lt`) so the handler can
+    // recover it after verify; conditionally spread (exactOptionalPropertyTypes)
+    // so a p2p ctx omits the key entirely — `sign` then keeps the token
+    // byte-identical to the pre-M3a shape.
+    ...(ctx.larkThreadId !== undefined ? { larkThreadId: ctx.larkThreadId } : {}),
   }),
   rid: requestId,
+  // Echo the topic id in the plain value too — a pre-verify bootstrap so the
+  // handler can locate the topic binding before it can recompute the fingerprint
+  // to verify (cross-checked by that signed fingerprint). Omitted for p2p so the
+  // value object is unchanged from the pre-M3a shape.
+  ...(ctx.larkThreadId !== undefined ? { lt: ctx.larkThreadId } : {}),
 });
 
 // ── Parsing ──────────────────────────────────────────────────────────────────
@@ -522,10 +557,16 @@ export const parseCardActionValue = (value: unknown): ParsedCardAction | null =>
       ? (fv as Record<string, unknown>)
       : undefined;
 
+  // M3a: surface the topic id echoed in `lt` (a pre-verify bootstrap), only when
+  // it is a non-empty string. Absent for p2p / non-topic values.
+  const lt = record.lt;
+  const larkThreadId = typeof lt === "string" && lt.length > 0 ? lt : undefined;
+
   return {
     token,
     requestId,
     ...(formValue ? { formValue } : {}),
+    ...(larkThreadId !== undefined ? { larkThreadId } : {}),
   };
 };
 

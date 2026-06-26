@@ -241,6 +241,14 @@ export const runShellWatcherFiber = (deps: ShellWatcherDeps): Effect.Effect<Shel
         return;
       }
       const isFirstFrame = yield* Ref.getAndSet(firstFrame, false);
+      // M3a: each entry's key is the bridge's composite `chatId[:larkThreadId]`
+      // (a topic backs its own binding). This watcher treats it as an OPAQUE
+      // conversation id and never splits it: every dep it forwards the key to
+      // (`bindings.unbind` / `stopMirror` / `surfacePendingApproval` /
+      // `ensureObserving` are all keyed by the same composite id; `sendNotice`
+      // splits it back to the real Feishu chatId internally), so per-topic
+      // reconciliation/notification falls out for free. For p2p / plain group the
+      // key is the bare chatId (no `:`), so behaviour is byte-identical to pre-M3a.
       const entries = yield* deps.bindings.entries;
       yield* Effect.forEach(
         entries,
@@ -251,24 +259,45 @@ export const runShellWatcherFiber = (deps: ShellWatcherDeps): Effect.Effect<Shel
 
     const reconcileBinding = (chatId: string, binding: ChatBinding, isFirstFrame: boolean) =>
       Effect.gen(function* () {
-        // ── Scope gate: takeovers only ────────────────────────────────────
-        // The watcher exists for `origin: "resumed"` takeovers — chats loosely
-        // bound to a thread another end drives. A `self-created` binding is the
-        // bridge's *own* live-driven thread: the turn pipeline already owns its
-        // lifecycle, so the watcher must NOT touch it. Reconciling a self-created
-        // binding here (unbind on a deleted/archived snapshot) sends the chat back
-        // through `ensureThread`'s self-create path, which deterministically
-        // re-derives the *same* threadId and slams into the server's soft-delete
-        // tombstone (`requireThreadAbsent`) → endless outbound retry that wedges
-        // the chat. Gate the *entire* pass (reconciliation + key notifications)
-        // on `resumed` so self-created bindings are left untouched (= the M1,
-        // watcher-less behaviour). Also keeps the "你接管的会话…" notice text
-        // truthful — it only fires for genuinely taken-over chats.
+        // Read the shell once — shared between the self-created fast path and the
+        // full resumed path below.
+        const shell = yield* deps.shellCache.threadById(binding.threadId);
+
+        // ── Scope gate: takeovers only (with M3a self-created observe exception) ──
+        // The watcher exists primarily for `origin: "resumed"` takeovers — chats
+        // loosely bound to a thread another end drives. A `self-created` binding
+        // is the bridge's *own* live-driven thread: the turn pipeline owns its
+        // lifecycle, so the watcher must NOT touch reconciliation or notifications
+        // for it. Reconciling a self-created binding (unbind on deleted/archived)
+        // would send the chat back through `ensureThread`'s self-create path,
+        // which deterministically re-derives the same threadId and slams into the
+        // server's soft-delete tombstone (`requireThreadAbsent`) → endless outbound
+        // retry that wedges the chat.
+        //
+        // M3a exception: a bot-driven group turn can spawn a server-side subagent
+        // (e.g. planner → executor). The executor turn surfaces in
+        // `shell.session.activeTurnId` but is NOT driven by this bot's driveTurn
+        // pipeline — it is a server-spawned subagent whose pending approvals must
+        // still reach Feishu. We call `ensureObserving` here so the subagent turn
+        // is mirrored and its approval cards surface. Safety is preserved:
+        //   • `isChatBusy` inside ensureObserving → no-op while driveTurn is active
+        //   • atomic per-chat dedup → at most one observe fiber/card per chat
+        // Reconciliation and key notifications remain resumed-only (no change there).
         if (binding.origin !== "resumed") {
+          if (shell?.session?.activeTurnId != null) {
+            yield* deps
+              .ensureObserving(chatId, binding.threadId, shell.session.activeTurnId)
+              .pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning(
+                    "[feishu-bot] shellWatcher ensureObserving (self-created) failed",
+                    cause,
+                  ),
+                ),
+              );
+          }
           return;
         }
-
-        const shell = yield* deps.shellCache.threadById(binding.threadId);
 
         // ── Reconciliation (M10) ──────────────────────────────────────────
         // Thread gone from the snapshot (deleted) or archived → the binding is

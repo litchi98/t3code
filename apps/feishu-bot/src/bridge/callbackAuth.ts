@@ -38,6 +38,16 @@ export interface CallbackSignInput {
   readonly action: string;
   readonly policyFingerprint: string;
   readonly ttlMs: number;
+  /**
+   * Optional Feishu topic id (`omt_…`) the rendered button belongs to (M3a
+   * group/topic chats). Carried into the signed payload as `lt` so the cardAction
+   * handler can recover the topic — `CardActionEvent` has no thread field. It is
+   * integrity-protected by the whole-payload HMAC but, like `action`, is **not**
+   * part of {@link CallbackVerifyExpected}/`matchesExpected` (carried data, not a
+   * matched context key). `undefined` for p2p / non-topic chats (the field is
+   * then omitted, keeping the token byte-identical to the pre-M3a shape).
+   */
+  readonly larkThreadId?: string;
 }
 
 /**
@@ -63,6 +73,14 @@ export interface CallbackPayload {
   fp: string;
   n: string;
   kv: number;
+  /**
+   * Optional Feishu topic id (`omt_…`), present only for M3a group/topic buttons.
+   * Signed (it rides in the encoded payload the HMAC covers) but, like `a`, NOT
+   * compared in {@link matchesExpected}; `verify` returns it on success so the
+   * handler can locate the topic binding. Absent (key omitted) for p2p /
+   * non-topic tokens, which therefore decode/serialize identically to pre-M3a.
+   */
+  lt?: string;
 }
 
 export type CallbackVerifyResult =
@@ -133,6 +151,10 @@ export class CallbackAuth {
       fp: input.policyFingerprint,
       n: this.createNonce(),
       kv: key.version,
+      // M3a: carry the topic id (signed, but NOT a matched context key) only when
+      // present, so a p2p / non-topic token serializes byte-identically to the
+      // pre-M3a shape (an omitted key is absent from the JSON).
+      ...(input.larkThreadId !== undefined ? { lt: input.larkThreadId } : {}),
     };
     const encoded = encodeJson(payload);
     return `${PREFIX}.${encoded}.${sign(encoded, key.secret)}`;
@@ -221,7 +243,10 @@ function decodePayload(encoded: string): CallbackPayload | undefined {
       typeof raw.exp !== "number" ||
       typeof raw.fp !== "string" ||
       typeof raw.n !== "string" ||
-      typeof raw.kv !== "number"
+      typeof raw.kv !== "number" ||
+      // Optional M3a topic id: absent is fine; present must be a string (a
+      // non-string `lt` is a malformed/tampered token, rejected like any other).
+      (raw.lt !== undefined && typeof raw.lt !== "string")
     ) {
       return undefined;
     }
@@ -235,6 +260,9 @@ function decodePayload(encoded: string): CallbackPayload | undefined {
       fp: raw.fp,
       n: raw.n,
       kv: raw.kv,
+      // Carry the topic id through only when the token actually had one, so an
+      // old / p2p token decodes to the identical (no-`lt`) object.
+      ...(raw.lt !== undefined ? { lt: raw.lt } : {}),
     };
   } catch {
     return undefined;

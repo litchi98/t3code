@@ -64,6 +64,15 @@ export interface FeishuAppConfig {
    * straight to `createLarkChannel({ domain })`.
    */
   readonly domain: string;
+  /**
+   * Bot-side owner open IDs for group/topic approval gating (M3a). From
+   * `FEISHU_OWNER_OPEN_IDS` (comma-separated). Like `appId`, this is bot-own
+   * config — not shared with the server. Empty array = fall back to turn
+   * initiator (pre-M3a behavior, no regression). When set, only
+   * `ownerOpenIds[0]` is used as the approval operator (single-owner binding);
+   * multi-approver allowlist is a future milestone.
+   */
+  readonly ownerOpenIds: ReadonlyArray<string>;
 }
 
 /** Map a {@link FeishuTenant} to its open-platform domain origin. */
@@ -85,6 +94,7 @@ const FLAG_BY_ENV: Readonly<Record<string, string>> = {
   FEISHU_APP_ID: "--feishu-app-id",
   FEISHU_APP_SECRET: "--feishu-app-secret",
   FEISHU_TENANT: "--feishu-tenant",
+  FEISHU_OWNER_OPEN_IDS: "--feishu-owner-open-ids",
   T3_STATE_DIR: "--state-dir",
 };
 
@@ -212,11 +222,17 @@ const resolveFeishuAppConfig = (
     }
     const tenant: FeishuTenant = rawTenant;
 
+    const ownerOpenIds = (resolveValue("FEISHU_OWNER_OPEN_IDS", env, args) ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+
     return {
       appId,
       appSecret,
       tenant,
       domain: DOMAIN_BY_TENANT[tenant],
+      ownerOpenIds,
     } satisfies FeishuAppConfig;
   });
 

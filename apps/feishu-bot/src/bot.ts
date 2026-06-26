@@ -74,7 +74,7 @@ import {
 } from "./runtime/persistence.ts";
 import { LarkGateway, type StreamingCard } from "./lark/index.ts";
 import { larkGatewayLayer } from "./lark/channel.ts";
-import type { BridgeHandlers, CardActionEvent, InboundMessage } from "./lark/types.ts";
+import type { BridgeHandlers, CardActionEvent, InboundMessage, SendOptions } from "./lark/types.ts";
 import { CallbackAuth, computePolicyFingerprint } from "./bridge/callbackAuth.ts";
 import {
   actionToApprovalDecision,
@@ -84,7 +84,15 @@ import {
   renderInteractionSection,
   type ResolvedNoticeEntry,
 } from "./bridge/interactionCard.ts";
-import { deriveThreadId, ensureThreadForChat } from "./bridge/chatThreadMap.ts";
+import {
+  anchorOf,
+  compositeChatKey,
+  deriveThreadId,
+  ensureThreadForChat,
+  resolveApprover,
+  runtimeModeForChatType,
+  splitChatKey,
+} from "./bridge/chatThreadMap.ts";
 import { deriveCommandId } from "./bridge/commandId.ts";
 import { renderThreadCard } from "./bridge/eventRenderer.ts";
 import { observeThread, type ThreadObservation } from "./bridge/session.ts";
@@ -358,6 +366,29 @@ const CALLBACK_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
  */
 const FORM_SETTLE_DELAY = Duration.seconds(1);
 
+// ── M3a (group + topic) routing helpers ──────────────────────────────────────
+
+/**
+ * Build the SDK {@link SendOptions} that post a streaming card *inside* a Feishu
+ * topic or plain-group thread (M3a). Only produced when BOTH an anchor
+ * (`larkThreadId`, non-undefined for topic / in-thread plain-group turns) and a
+ * reply target (`replyTo`, the triggering message) are known — Feishu requires
+ * `replyTo` to anchor the card inside the thread. Otherwise `undefined`, which
+ * posts at the chat root (pre-M3a behaviour, and the acceptable degradation for
+ * the observe path which has no triggering message). p2p always yields `undefined`
+ * (`anchorOf` returns `undefined` for p2p, so no `larkThreadId` is ever set).
+ * Plain-group and topic turns carry the composite anchor (rootId / messageId) and
+ * post with `replyInThread: true`, which is also why plain-group turns require
+ * topic mode (Feishu error 230071 otherwise).
+ */
+const topicSendOpts = (
+  larkThreadId: string | undefined,
+  replyTo: string | undefined,
+): SendOptions | undefined =>
+  larkThreadId !== undefined && replyTo !== undefined
+    ? { replyTo, replyInThread: true }
+    : undefined;
+
 // ── Resident bridge core ─────────────────────────────────────────────────────
 
 /**
@@ -467,11 +498,24 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
       nonces: nonceProbe,
     });
 
-    // E④: chatId → operator open id, captured from each inbound message. The
-    // interaction card binds its buttons to the operator known at render time
-    // (private chats are 1:1, so the last sender is the chat's operator); the
-    // cardAction verify re-checks the actual clicker against the token's `o`.
+    // M3a: primary owner open IDs for approval gating. Captured once from config
+    // (bot-side, like appId) so `buildInteraction` closures share a stable reference.
+    const ownerOpenIds = config.feishu.ownerOpenIds;
+
+    // E④: composite chatKey → operator open id, captured from each inbound message.
+    // `chatOperators` records the most recent sender per composite key (chatId or
+    // chatId:larkThreadId). During a running turn the turn initiator is pinned via
+    // `operatorOverride`; after the turn ends `chatOperators` carries the last
+    // known sender as a fallback. The cardAction verify re-checks the actual
+    // clicker against the token's `o` field at click time.
     const chatOperators = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
+
+    // Fix B: per-bystander dedup so the "unauthorised click" notice fires at most
+    // once per (chatKey, card messageId, clicker openId) triple. The set is
+    // intentionally unbounded — realistic bystander volume is tiny (short strings,
+    // at most a handful per session). No cleanup is necessary; the set is discarded
+    // when the bridge scope closes.
+    const bystanderNoticed = yield* Ref.make<ReadonlySet<string>>(new Set<string>());
 
     // P2: per-chat resolved overlay — chatId → (requestId → {@link ResolvedNoticeEntry}).
     // The cardAction handler writes a resolved entry here on a successful respond;
@@ -607,8 +651,20 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     // "server not connected"). Opens a streaming card whose completion is already
     // resolved, so the SDK producer renders once and settles immediately. Failures
     // are logged and swallowed — a notice must never crash the handler.
-    const sendNotice = (chatId: string, text: string): Effect.Effect<void> =>
+    // M3a: `chatKey` is the composite `chatId[:larkThreadId]` (the bridge's
+    // internal conversation identity). Fix 5: when the notice answers a *triggering*
+    // message (`replyToMessageId` supplied) AND the key is a topic, `topicSendOpts`
+    // anchors the card inside that topic; for p2p / plain group / no anchor it
+    // returns `undefined` so the card posts at the chat/group root (byte-identical
+    // to pre-Fix-5). A bare `chatId` (p2p / plain group) has no `larkThreadId`, so
+    // the topic opts never fire there.
+    const sendNotice = (
+      chatKey: string,
+      text: string,
+      replyToMessageId?: string,
+    ): Effect.Effect<void> =>
       Effect.gen(function* () {
+        const { chatId, larkThreadId } = splitChatKey(chatKey);
         const done = yield* Deferred.make<void>();
         yield* Deferred.succeed(done, undefined);
         // #3/#4: notice cards carry only a short text body on a synthetic
@@ -618,12 +674,19 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
           streaming: false,
           chrome: false,
         }).card;
-        yield* gateway.startStreamingCard(chatId, card, { done: Deferred.await(done) }).pipe(
-          Effect.tapError((error) =>
-            Console.error(`[feishu-bot] notice card failed for chat ${chatId}: ${error.message}`),
-          ),
-          Effect.ignore,
-        );
+        yield* gateway
+          .startStreamingCard(
+            chatId,
+            card,
+            { done: Deferred.await(done) },
+            topicSendOpts(larkThreadId, replyToMessageId),
+          )
+          .pipe(
+            Effect.tapError((error) =>
+              Console.error(`[feishu-bot] notice card failed for chat ${chatId}: ${error.message}`),
+            ),
+            Effect.ignore,
+          );
       });
 
     // ── M2a: resident shell cache + reverse-notification watcher ─────────────
@@ -696,6 +759,13 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         // chatId (which would leave the chat observing the OLD thread). Idempotent
         // no-op when nothing is observing.
         yield* stopObserve(chatId);
+        // Fix A: clear stale cardHandle so a click on the old card cannot be
+        // misidentified as "current card, unauthorised clicker" (bystander no-op).
+        // `surfacePendingApprovalIfNew` at the end of startMirror will re-populate
+        // the handle if the new thread has a pending approval; otherwise the handle
+        // stays absent → any click on the old card correctly falls through to the
+        // "degrade stale card" path.
+        yield* cardHandles.remove(chatId).pipe(Effect.ignore);
         yield* bindings.bind(chatId, { threadId, origin: "resumed" });
         const shell = yield* shellCache.threadById(threadId);
         const title = shell?.title ?? threadId;
@@ -1096,7 +1166,20 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
             threadId,
             message: { messageId, role: "user", text: dispatch.prompt, attachments: [] },
             ...(perTurnModelSelection === null ? {} : { modelSelection: perTurnModelSelection }),
-            runtimeMode: "full-access",
+            // M3a: per-turn runtimeMode tracks the chat type of the message(s) that
+            // drove this turn — p2p stays `full-access`, group/topic is
+            // `approval-required`. A dispatched batch always carries ≥1 source
+            // message; the `?? "p2p"` keeps the legacy `full-access` default in the
+            // (unreachable) empty case so existing p2p behaviour is byte-identical.
+            //
+            // NOTE: for an *already-existing* thread this field is INERT — the
+            // server pins `runtimeMode` at thread-creation time and `turn.start`
+            // resolves the active mode from `targetThread.runtimeMode`
+            // (decider.ts), IGNORING this command value. It is carried only because
+            // `ThreadTurnStart` requires it; it does NOT re-assert per-turn policy.
+            // (The group/topic safety gate that matters lives at thread creation +
+            // the `/resume` full-access gate, not here.)
+            runtimeMode: runtimeModeForChatType(dispatch.sources[0]?.message.chatType ?? "p2p"),
             interactionMode: "default",
           }),
         ),
@@ -1118,7 +1201,12 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
      * nothing pending — so the renderer adds no empty section).
      */
     const buildInteraction = (
-      chatId: string,
+      // M3a: the composite `chatId[:larkThreadId]` conversation key. State lookups
+      // (resolved overlay / operator) read it verbatim; the *token* it signs must
+      // carry the REAL Feishu `chatId` (the verify side reads `evt.chatId`) plus
+      // the topic id (`InteractionContext.larkThreadId`) so the cardAction handler
+      // can recover the topic — both are recovered via `splitChatKey` below.
+      chatKey: string,
       thread: OrchestrationThread,
       // #0/#1(b): optional operator override. The live `driveTurn` path omits it
       // and resolves the operator from the in-process `chatOperators` Ref. M18
@@ -1138,7 +1226,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         // (when pending is empty). The streaming render has no operator knowledge, so
         // the overlay is the only carrier of the echo. Empty overlay → live state.
         const resolvedNotice =
-          (yield* Ref.get(chatResolvedNotices)).get(chatId) ??
+          (yield* Ref.get(chatResolvedNotices)).get(chatKey) ??
           new Map<string, ResolvedNoticeEntry>();
         if (
           pendingApprovals.length === 0 &&
@@ -1148,18 +1236,29 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
           return undefined;
         }
         const operators = yield* Ref.get(chatOperators);
-        const operatorOpenId =
+        const rawInitiator =
           operatorOverride !== undefined && operatorOverride.length > 0
             ? operatorOverride
-            : (operators.get(chatId) ?? "");
+            : (operators.get(chatKey) ?? "");
+        // M3a: for approval-required chats, bind the primary owner (if configured)
+        // as the approval operator so only the owner can click approve. p2p /
+        // unconfigured owner falls back to the turn initiator (no regression).
+        const operatorOpenId = resolveApprover(thread.runtimeMode, ownerOpenIds, rawInitiator);
         const staleSet = staleRequestIdsOf(thread.activities);
+        // M3a: recover the real Feishu chatId (for the token's `c`/`scope`, matched
+        // at verify against `evt.chatId`) and the topic id (signed into the token's
+        // `lt` + echoed in the button value) from the composite key. For p2p / plain
+        // group the key has no `:`, so `chatId === chatKey` and `larkThreadId` is
+        // `undefined` — the token is byte-identical to the pre-M3a shape.
+        const { chatId: realChatId, larkThreadId } = splitChatKey(chatKey);
         const ctx: InteractionContext = {
-          chatId,
+          chatId: realChatId,
           threadId: thread.id,
           operatorOpenId,
           runtimeMode: thread.runtimeMode,
           auth,
           ttlMs: CALLBACK_TOKEN_TTL_MS,
+          ...(larkThreadId !== undefined ? { larkThreadId } : {}),
         };
         const elements = renderInteractionSection(
           pendingApprovals,
@@ -1202,6 +1301,10 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     // snapshot, a `buildInteraction`/render failure, a failed card send, or a persist
     // failure must NEVER crash the bot or wedge the watcher's reconciliation loop.
     const surfacePendingApprovalIfNew = (
+      // M3a: composite `chatId[:larkThreadId]` conversation key. Used verbatim for
+      // every state lookup (busy/observe gates, cardHandles, chatOperators,
+      // buildInteraction); the actual card is sent to the real Feishu chatId
+      // (`splitChatKey`) at the `startStreamingCard` call below.
       chatId: string,
       threadId: ThreadId,
       // #7: optional already-read first-frame snapshot. `startMirror` reads a first
@@ -1303,7 +1406,10 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         // settle) and capture its messageId for the persisted handle.
         const done = yield* Deferred.make<void>();
         yield* Deferred.succeed(done, undefined);
-        const sent = yield* gateway.startStreamingCard(chatId, card, {
+        // M3a: send to the real Feishu chatId. No triggering message here, so no
+        // topic `sendOpts` — a surfaced approval card posts at the chat/group root
+        // (accepted degradation for a topic group).
+        const sent = yield* gateway.startStreamingCard(splitChatKey(chatId).chatId, card, {
           done: Deferred.await(done),
         });
 
@@ -1441,6 +1547,16 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
                   // (downgrading to a "send a message" nudge). Fall back to the existing
                   // handle's `operatorOpenId` when the Ref has none. Empty string is
                   // only written when BOTH are genuinely unknown.
+                  //
+                  // Fix 1(b) (M3a): a non-empty `operatorOverride` (the live
+                  // `driveTurn` now pins this turn's *initiator*; the observe/adopt
+                  // path passes the recovered handle's operator) wins — the SAME
+                  // precedence `buildInteraction` uses. This persists the pinned
+                  // initiator into the durable handle so M18 restart recovery re-signs
+                  // the recovered approval for the initiator, NOT for whoever last
+                  // @-mentioned the bot (which a later inbound could have flipped in
+                  // the Ref). For p2p the initiator equals the chat owner equals the
+                  // Ref value, so this is byte-identical.
                   Effect.all([
                     Ref.get(chatOperators),
                     cardHandles
@@ -1454,8 +1570,10 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
                           pendingRequestId,
                           lastSequence: 0,
                           operatorOpenId:
-                            operators.get(chatId) ??
-                            (Option.isSome(existing) ? existing.value.operatorOpenId : ""),
+                            operatorOverride !== undefined && operatorOverride.length > 0
+                              ? operatorOverride
+                              : (operators.get(chatId) ??
+                                (Option.isSome(existing) ? existing.value.operatorOpenId : "")),
                         })
                         .pipe(
                           Effect.ignore,
@@ -1706,8 +1824,14 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
             // failed start must NOT crash the fiber — skip the render and exit; the
             // watcher re-triggers on the next frame if the turn is still running.
             const initial = renderThreadCard(placeholderThread, { streaming: true }).card;
+            // M3a: send to the real Feishu chatId. An observe fiber mirrors a turn
+            // another end started (no triggering message for this end), so it posts
+            // at the chat/group root (no topic `sendOpts`) — the accepted degradation
+            // for a taken-over topic turn.
             const card = yield* gateway
-              .startStreamingCard(chatId, initial, { done: Deferred.await(cardDone) })
+              .startStreamingCard(splitChatKey(chatId).chatId, initial, {
+                done: Deferred.await(cardDone),
+              })
               .pipe(
                 Effect.tapError((error) =>
                   Console.error(
@@ -1756,17 +1880,37 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     // updater is `forkScoped` onto the caller's turn scope (`runTurn`'s
     // `Effect.scoped`), so it is interrupted when the turn ends.
     const driveTurn = (
+      // M3a: composite `chatId[:larkThreadId]` key. The render loop keys state by
+      // it (via `renderObservationToCard`); the card is opened on the real Feishu
+      // chatId, and — for a topic, with the triggering message as the in-thread
+      // reply anchor — posted *inside* that topic.
       chatId: string,
       threadId: ThreadId,
       observation: ThreadObservation,
+      // The Feishu message id that triggered this turn (the topic reply anchor),
+      // or `undefined` (flush/replay with no live trigger) → post at the root.
+      replyToMessageId?: string,
+      // Fix 1(a) (M3a): the open id of *this turn's initiator* (the sender of the
+      // turn's first source message), pinned for the whole turn. Forwarded as the
+      // `operatorOverride` to `renderObservationToCard` so every live tick signs
+      // the approval/user-input buttons (and persists the handle) for the
+      // initiator — NOT for whoever last @-mentioned the bot mid-turn (a group
+      // hazard: a later `@bot` would otherwise re-sign the buttons to a bystander
+      // who could then approve, and lock the real initiator out). `undefined`
+      // (unreachable empty dispatch) falls back to the live Ref. For p2p the
+      // initiator equals the chat owner equals the Ref value → byte-identical.
+      initiatorOperatorOpenId?: string,
     ): Effect.Effect<void, never, Scope.Scope> =>
       Effect.gen(function* () {
         const cardDone = yield* Deferred.make<void>();
         yield* Effect.gen(function* () {
           const initial = renderThreadCard(placeholderThread, { streaming: true }).card;
 
+          // M3a: real Feishu chatId + (topic-only) in-thread reply opts.
+          const { chatId: realChatId, larkThreadId } = splitChatKey(chatId);
+          const sendOpts = topicSendOpts(larkThreadId, replyToMessageId);
           const card = yield* gateway
-            .startStreamingCard(chatId, initial, { done: Deferred.await(cardDone) })
+            .startStreamingCard(realChatId, initial, { done: Deferred.await(cardDone) }, sendOpts)
             .pipe(
               // A failed card start must not abort the turn; the agent still runs.
               Effect.tapError((error) =>
@@ -1780,8 +1924,16 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
           if (handle !== null) {
             // The whole render loop (per-tick + terminal render + handle persistence)
             // is the shared `renderObservationToCard` helper (M2b-3 DRY): identical
-            // behaviour to the prior inline body.
-            yield* renderObservationToCard(chatId, threadId, observation, handle);
+            // behaviour to the prior inline body. Fix 1(a): pin this turn's initiator
+            // as the operator override so the live card's buttons stay signed for the
+            // initiator across the whole turn.
+            yield* renderObservationToCard(
+              chatId,
+              threadId,
+              observation,
+              handle,
+              initiatorOperatorOpenId,
+            );
           } else {
             // No card handle: still wait for the turn to settle (so the SDK
             // producer / completion path resolves identically).
@@ -1959,7 +2111,23 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
             yield* sent.add(dispatch.commandId).pipe(Effect.ignore);
             yield* Console.log(`[feishu-bot] started turn on thread ${target} for chat ${chatId}.`);
 
-            yield* driveTurn(chatId, target, observation);
+            // M3a: pass the *real* triggering Feishu message id (not the commandId
+            // fallback `triggerMessageId` uses for the offline receipt) as the topic
+            // reply anchor — `topicSendOpts` only emits in-thread send opts when this
+            // is a genuine message id, so a flush/replay with no live source posts at
+            // the root instead of replying to a non-message id.
+            //
+            // Fix 1(a): also pin this turn's *initiator* (the sender of the first
+            // source message) as the live card's operator override, so the approval
+            // buttons stay signed for the initiator for the turn's whole lifetime
+            // (and not for a later mid-turn `@bot` from a bystander).
+            yield* driveTurn(
+              chatId,
+              target,
+              observation,
+              dispatch.sources[0]?.message.messageId,
+              dispatch.sources[0]?.message.senderId,
+            );
           }).pipe(
             // Per-turn scope: tears down the thread subscription + card update
             // fiber on this turn's exit (inside the lock so teardown completes
@@ -2035,19 +2203,28 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
      */
     const ensureThread = (message: InboundMessage): Effect.Effect<ThreadId> =>
       Effect.gen(function* () {
+        // M3a: a Feishu topic backs its own thread, so every binding op keys on the
+        // composite `chatId[:larkThreadId]` (byte-identical to the bare chatId for
+        // p2p / plain group). `runtimeMode` is per chat type (p2p full-access;
+        // group/topic approval-required) and injected into both create paths.
+        const larkThreadId = anchorOf(message);
+        const chatKey = compositeChatKey(message.chatId, larkThreadId);
+        const runtimeMode = runtimeModeForChatType(message.chatType);
+
         // M2a: resolve the chat's *current* binding from the in-memory authority
         // (BindingState), not the store directly. A `/resume` takeover may have
         // re-pointed this chat at another end's thread (origin "resumed"); either
         // origin is honoured here by using the binding's threadId verbatim.
-        const existing = yield* bindings.get(message.chatId);
+        const existing = yield* bindings.get(chatKey);
         if (existing !== null) {
           return existing.threadId;
         }
 
         // First contact. Derive the deterministic threadId up front so both the
         // online and offline create paths agree on it (and on the stable create
-        // commandId), making re-delivery idempotent against the server.
-        const threadId = deriveThreadId(message.chatId);
+        // commandId), making re-delivery idempotent against the server. The topic
+        // is folded into the derivation so a topic gets a distinct thread id.
+        const threadId = deriveThreadId(message.chatId, larkThreadId);
 
         // Offline first contact (MEDIUM): visible ⏳ receipt + notice, then buffer
         // the `createThread` as an outbound intent that persists the binding *on
@@ -2060,11 +2237,15 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
           const firstCreate = yield* Ref.modify(
             pendingCreates,
             (set): readonly [boolean, ReadonlySet<string>] =>
-              set.has(message.chatId) ? [false, set] : [true, new Set(set).add(message.chatId)],
+              set.has(chatKey) ? [false, set] : [true, new Set(set).add(chatKey)],
           );
+          // Fix 5: the ⏳ receipt answers the user's just-sent message, so anchor it
+          // into the topic (composite `chatKey` + the message id); p2p / plain group
+          // degrade to the root (byte-identical).
           yield* sendNotice(
-            message.chatId,
+            chatKey,
             "⏳ The server is not connected right now — your message is queued and will be sent once it reconnects.",
+            message.messageId,
           );
           if (!firstCreate) {
             // A create for this brand-new chat is already buffered; its flush
@@ -2092,7 +2273,9 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
                 projectId: project.projectId,
                 title: `Feishu · ${message.senderName ?? message.senderId} (${message.chatId.slice(0, 12)})`,
                 modelSelection,
-                runtimeMode: "full-access",
+                // M3a: p2p stays full-access; group/topic creates an
+                // approval-required thread (matches the online create path).
+                runtimeMode,
                 interactionMode: "default",
                 branch: null,
                 worktreePath: null,
@@ -2103,7 +2286,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
               // failure (logged, not propagated) — so the create flush stays
               // total and the next message resolves the binding from memory.
               Effect.andThen(
-                bindings.bind(message.chatId, {
+                bindings.bind(chatKey, {
                   threadId,
                   origin: "self-created",
                 }),
@@ -2122,13 +2305,21 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         // exit so a mid-create environment drop (a TOCTOU between `isEnvReady` and
         // the dispatch — `runOnEnv` would orDie it into a defect) falls back to the
         // offline buffer instead of silently dropping the user's first message.
-        const ensuredExit = yield* ensureThreadForChat(message.chatId, message, {
-          environmentId,
-          projectId: project.projectId,
-          modelSelection,
-          dispatch: runOnEnv,
-          generateThreadId: genId(ThreadId),
-        }).pipe(Effect.provideService(BindingState, bindings), Effect.exit);
+        const ensuredExit = yield* ensureThreadForChat(
+          message.chatId,
+          message,
+          {
+            environmentId,
+            projectId: project.projectId,
+            modelSelection,
+            dispatch: runOnEnv,
+            generateThreadId: genId(ThreadId),
+          },
+          // M3a: per-chat-type runtimeMode + topic id (forms the composite binding
+          // key + the topic-aware thread id derivation inside the helper).
+          runtimeMode,
+          larkThreadId,
+        ).pipe(Effect.provideService(BindingState, bindings), Effect.exit);
 
         if (ensuredExit._tag === "Failure") {
           yield* Effect.logWarning(
@@ -2161,13 +2352,34 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
      */
     const handleInbound = (message: InboundMessage): Effect.Effect<void> =>
       Effect.gen(function* () {
-        // E④: remember who this chat's operator is (private chats are 1:1, so the
-        // latest sender is the chat owner). The interaction card binds its buttons
-        // to this open id at render time; the cardAction verify re-checks the
-        // actual clicker against the token's `o`.
-        yield* Ref.update(chatOperators, (map) =>
-          new Map(map).set(message.chatId, message.senderId),
-        );
+        // M3a: the composite conversation key — a topic (`omt_…`) is its own
+        // conversation, so binding / queue / operator / mirror state all key on
+        // `chatId[:larkThreadId]` (byte-identical to the bare chatId for p2p /
+        // plain group). All internal state below uses `chatKey`; the gateway sends
+        // recover the real Feishu chatId via `splitChatKey`.
+        const larkThreadId = anchorOf(message);
+        const chatKey = compositeChatKey(message.chatId, larkThreadId);
+
+        // E④: remember who this conversation's operator is (per topic). The
+        // interaction card binds its buttons to this open id at render time; the
+        // cardAction verify re-checks the actual clicker against the token's `o`.
+        //
+        // Fix 1(c)/(d) (M3a): record the operator ONLY when the conversation is
+        // currently idle — i.e. this message is (about to become) a fresh turn's
+        // initiator. While a turn is running OR coalescing (`isChatBusy`), the
+        // active turn's operator is already pinned by `driveTurn`'s
+        // `operatorOverride` (the initiator) and must NOT be overwritten: otherwise
+        // a bystander @-mentioning the bot mid-turn would flip the Ref, the next
+        // tick would re-sign the approval buttons to the bystander (who could then
+        // approve someone else's turn), and the real initiator's own click would be
+        // rejected (context-mismatch). The pinned-initiator override is the live
+        // backstop; this idle guard keeps the Ref itself sane for the idle paths
+        // (e.g. `surfacePendingApprovalIfNew`) that still read it. For p2p the
+        // operator is always the same person, so skipping a redundant rewrite while
+        // busy is a no-op → byte-identical.
+        if (!(yield* isChatBusy(chatKey))) {
+          yield* Ref.update(chatOperators, (map) => new Map(map).set(chatKey, message.senderId));
+        }
 
         // Content filter (M16): M1 dispatches text only. A message with no text
         // (image/file-only, or an empty body) must NOT become an empty-prompt
@@ -2177,7 +2389,10 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
             message.attachments.length > 0
               ? "I can only act on text right now (image/file attachments aren't supported yet)."
               : "I received an empty message — please send some text.";
-          yield* sendNotice(message.chatId, what);
+          // Fix 5: this reply answers a real triggering message, so anchor it into
+          // the topic (composite `chatKey` + the message id) instead of the group
+          // root; p2p / plain group degrade to the root (byte-identical).
+          yield* sendNotice(chatKey, what, message.messageId);
           return;
         }
 
@@ -2189,7 +2404,8 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         const outcome = yield* tryHandleCommand(message, commandTable);
         if (outcome.handled) {
           if (outcome.unknownCommand !== undefined) {
-            yield* sendNotice(message.chatId, "未知命令,/help 查看可用命令。");
+            // Fix 5: anchor the "unknown command" reply into the triggering topic.
+            yield* sendNotice(chatKey, "未知命令,/help 查看可用命令。", message.messageId);
           }
           return;
         }
@@ -2208,13 +2424,13 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         // the same chat collapse via the generation-debounce into one dispatch.
         // The returned merge carries `resolvedThreadId` — resolved at the same
         // instant its commandId was — which `runTurn` dispatches against.
-        const merged = yield* turnQueue.offer(message.chatId, message);
+        const merged = yield* turnQueue.offer(chatKey, message);
         if (merged === null) {
           return; // Coalesced into a peer offer, or held during a running turn.
         }
         // Live path: `offlineBuffer` buffers (succeeds) rather than signalling a
         // retry, so `OfflineRetry` is unreachable here — treat it as a defect.
-        yield* runTurn(message.chatId, merged, offlineBuffer).pipe(Effect.orDie);
+        yield* runTurn(chatKey, merged, offlineBuffer).pipe(Effect.orDie);
       });
 
     // ── M2b-1: cardAction (button click / form submit) → shared respond RPC ──
@@ -2284,9 +2500,21 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
           return;
         }
 
-        // 2. Resolve the chat's bound thread. No binding → the chat is not (or no
-        //    longer) driving a session; tell the operator and stop.
-        const binding = yield* bindings.get(evt.chatId);
+        // M3a: `CardActionEvent` carries no thread field, so the button echoes its
+        // topic id in the value (`parsed.larkThreadId`) — a PRE-VERIFY bootstrap used
+        // to locate the topic's binding (and thus its thread id) *before* the policy
+        // fingerprint can be recomputed to verify the token. It is untrusted on its
+        // own but tamper-evident: the signed fingerprint derives from the topic's
+        // thread id, so a forged/stripped `lt` resolves a different (or no) binding →
+        // a mismatched fingerprint → `verify` fails with `context-mismatch`. The
+        // signed `res.payload.lt` (read after verify succeeds) is the authoritative
+        // copy and, by that fingerprint binding, necessarily equals this bootstrap.
+        const chatKey = compositeChatKey(evt.chatId, parsed.larkThreadId);
+
+        // 2. Resolve the conversation's bound thread under the composite key. No
+        //    binding → the topic/chat is not (or no longer) driving a session; tell
+        //    the operator and stop.
+        const binding = yield* bindings.get(chatKey);
         if (binding === null) {
           yield* updateCardNotice(evt.messageId, "会话未接管,无法响应此操作。");
           return;
@@ -2315,8 +2543,48 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
           policyFingerprint: fp,
         });
 
-        // 6. Verification failure → degrade the card; never route.
+        // 6. Verification failure → bystander no-op, or degrade a stale card.
+        // In a group the approval buttons are bound to a single operator (owner /
+        // initiator). A non-authorised member clicking yields `context-mismatch`
+        // — but so does a genuinely stale card (e.g. threadId/fp changed after a
+        // `/resume`). Degrading on every failure lets ANY bystander destroy the
+        // approval card and lock out the real approver. Distinguish by whether the
+        // click targets the bridge's CURRENT card for this chat: same messageId →
+        // live card, wrong clicker → no-op (preserve buttons for the real
+        // approver); different/absent → old session's card → degrade as before.
         if (!res.ok) {
+          if (res.reason === "context-mismatch") {
+            const handleOpt = yield* cardHandles
+              .get(chatKey)
+              .pipe(Effect.orElseSucceed(() => Option.none<CardHandle>()));
+            if (Option.isSome(handleOpt) && handleOpt.value.messageId === evt.messageId) {
+              yield* Console.log(
+                `[feishu-bot] cardAction ignored for chat ${evt.chatId} — unauthorised click on the current card; card preserved.`,
+              );
+              // Fix B: dedup the "unauthorised" notice to at most once per
+              // (chatKey, card messageId, clicker). Repeated clicks still
+              // no-op (card stays intact) but don't spam the thread.
+              const dedupKey = `${chatKey}:${evt.messageId}:${evt.operator.openId}`;
+              const alreadyNotified = yield* Ref.modify(bystanderNoticed, (set) => {
+                if (set.has(dedupKey)) return [true, set] as const;
+                const next = new Set(set);
+                next.add(dedupKey);
+                return [false, next] as const;
+              });
+              if (!alreadyNotified) {
+                // Fix C: generic wording — the same branch covers both approval
+                // and user-input interactions, so "审批" is misleading.
+                // The WS card path has no native per-clicker toast, so post a
+                // short topic-anchored notice; card stays intact for real approver.
+                yield* sendNotice(
+                  chatKey,
+                  `<at id=${evt.operator.openId}></at> 你暂时没有此操作的权限,需由授权人处理。`,
+                  evt.messageId,
+                );
+              }
+              return;
+            }
+          }
           yield* Console.log(
             `[feishu-bot] cardAction rejected for chat ${evt.chatId} (${res.reason}).`,
           );
@@ -2454,22 +2722,29 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         };
 
         // P2: record the overlay BEFORE echoing so any render tick racing this
-        // handler already sees the request as resolved.
+        // handler already sees the request as resolved. M3a: keyed by the composite
+        // `chatKey` so every subsequent `driveTurn`/observe render of THIS topic
+        // (which read the overlay under the same composite key) keeps it greyed out.
         yield* Ref.update(chatResolvedNotices, (map) => {
-          const forChat = new Map(map.get(evt.chatId) ?? new Map<string, ResolvedNoticeEntry>());
+          const forChat = new Map(map.get(chatKey) ?? new Map<string, ResolvedNoticeEntry>());
           forChat.set(parsed.requestId, entry);
-          return new Map(map).set(evt.chatId, forChat);
+          return new Map(map).set(chatKey, forChat);
         });
 
         const echoResolved = (): Effect.Effect<void> => {
           const operatorOpenId = evt.operator.openId;
           const ctx: InteractionContext = {
+            // The token's `c`/`scope` is the real Feishu chatId (matched at verify
+            // against `evt.chatId`); the topic id rides in `larkThreadId` so any
+            // *other* still-pending request re-signed on this echo card stays
+            // topic-bound. Omitted for p2p / non-topic (token unchanged pre-M3a).
             chatId: evt.chatId,
             threadId,
             operatorOpenId,
             runtimeMode: shell.runtimeMode,
             auth,
             ttlMs: CALLBACK_TOKEN_TTL_MS,
+            ...(parsed.larkThreadId !== undefined ? { larkThreadId: parsed.larkThreadId } : {}),
           };
           const resolvedNotice = new Map<string, ResolvedNoticeEntry>([[parsed.requestId, entry]]);
           const elements = renderInteractionSection(
@@ -2553,12 +2828,19 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     // serially and individually swallowed (`sendNotice` already logs failures).
     const notifyReconnect: Effect.Effect<void> = Effect.gen(function* () {
       const entries = yield* bindings.entries;
+      // Fix 4 (M3a): a group with K topic bindings yields K composite keys that all
+      // split to the SAME Feishu chatId — sending one notice per binding would spam
+      // the group root with K identical reconnect prompts. Dedup on the real chatId
+      // (`splitChatKey`) so each Feishu chat is prompted exactly once. A bare chatId
+      // (p2p / plain group) splits to itself, so this collapses to the pre-Fix-4
+      // one-notice-per-chat behaviour.
+      const roots = Array.from(new Set(entries.map(([chatKey]) => splitChatKey(chatKey).chatId)));
       yield* Console.log(
-        `[feishu-bot] feishu websocket reconnected; prompting ${entries.length} known chat(s) to resend.`,
+        `[feishu-bot] feishu websocket reconnected; prompting ${roots.length} known chat(s) to resend.`,
       );
       yield* Effect.forEach(
-        entries,
-        ([chatId]) =>
+        roots,
+        (chatId) =>
           sendNotice(
             chatId,
             "⚠️ I briefly lost connection — any message you sent in the last moment may not have reached me. Please resend it if you didn't get a reply.",
@@ -2670,8 +2952,10 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
           // buttons) until the next inbound message. Planting the durable handle's
           // operator here means those paths pick up the recovered operator immediately,
           // so the buttons verify across the restart even when observe lands on a fresh
-          // card (修法 1 starts observe right below). 1:1 private chats: the takeover
-          // operator is the chat owner, so this open id is valid for follow-on requests.
+          // card (修法 1 starts observe right below). The recovered operator is seeded
+          // per composite key (chatId or chatId:larkThreadId), covering p2p, group,
+          // and topic chats; it is used for follow-on approval requests until the next
+          // inbound message refreshes `chatOperators`.
           yield* Ref.update(chatOperators, (map) =>
             new Map(map).set(chatId, handle.operatorOpenId),
           );
@@ -2870,10 +3154,22 @@ export const program = (
       // `deriveThreadId` fallback (the highest-priority M2a invariant). A
       // not-yet-bound chat (brand-new / offline-buffered) falls back to the
       // deterministic `deriveThreadId`, matching `ensureThread`'s own derivation.
-      turnQueueLayer((chatId) =>
+      // M3a: the queue keys its state (and this lookup) by the composite
+      // `chatId[:larkThreadId]` the bridge passes to `offer`/`onTurnComplete`, so a
+      // topic resolves its own thread. The binding is read under that composite key;
+      // the not-yet-bound fallback splits it back to `(chatId, larkThreadId)` and
+      // re-derives the SAME topic-aware thread id `ensureThread` derived (so the
+      // commandId's embedded threadId and the dispatch target stay identical).
+      turnQueueLayer((chatKey) =>
         BindingState.pipe(
-          Effect.flatMap((bindingState) => bindingState.get(chatId)),
-          Effect.map((binding) => binding?.threadId ?? deriveThreadId(chatId)),
+          Effect.flatMap((bindingState) => bindingState.get(chatKey)),
+          Effect.map((binding) => {
+            if (binding !== null) {
+              return binding.threadId;
+            }
+            const { chatId, larkThreadId } = splitChatKey(chatKey);
+            return deriveThreadId(chatId, larkThreadId);
+          }),
         ),
       ),
     ).pipe(Layer.provideMerge(baseLayer));
