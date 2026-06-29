@@ -509,11 +509,15 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
       nonces: nonceProbe,
     });
 
-    // M3a/M4-1: the approval allowlist for group/topic chats. Captured once from
-    // config (bot-side, like appId) so `buildInteraction` closures share a stable
-    // reference. M4-1 reads it as an N-of allowlist (any listed member may approve),
-    // not a single-owner binding.
-    const ownerOpenIds = config.feishu.ownerOpenIds;
+    // M3a/M4-1/M4-2: the approval allowlist for group/topic chats, read as an N-of
+    // allowlist (any listed member may approve), not a single-owner binding. Held in
+    // a Ref so the M4-2 live-refresh fiber (below) can fold in web-configured
+    // `ServerSettings.feishuApprovalAllowlist` at runtime: the effective allowlist is
+    // `env ∪ store`. Initialised to the env `FEISHU_OWNER_OPEN_IDS` floor — a
+    // fail-safe lower bound that is ALWAYS unioned in (the store can only ADD), so a
+    // missing / failed refresh keeps the owner floor as last-known-good rather than
+    // locking everyone out.
+    const allowlistRef = yield* Ref.make<ReadonlyArray<string>>(config.feishu.ownerOpenIds);
 
     // M4-1: the effective approval allowlist that gates a cardAction click, by
     // runtime mode. Only approval-gated chats consult the configured owners; a p2p
@@ -521,11 +525,13 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     // "initiator only" rule (the gate then falls back to the signed `payload.o`).
     // Shared by the cardAction authz gate and the M18 empty-operator recovery guard
     // so both derive "is the allowlist active here?" from one place.
-    const effectiveAllowlistFor = (runtimeMode: RuntimeMode): ReadonlyArray<string> =>
-      runtimeMode === "approval-required" ? ownerOpenIds : [];
+    const effectiveAllowlistFor = (
+      runtimeMode: RuntimeMode,
+    ): Effect.Effect<ReadonlyArray<string>> =>
+      runtimeMode === "approval-required" ? Ref.get(allowlistRef) : Effect.succeed([]);
 
     // M3b: render density for group / topic chats, captured once from config
-    // (bot-side, like `ownerOpenIds`) so every `renderThreadCard` call site below
+    // (bot-side, like the approval allowlist floor) so every `renderThreadCard` call site below
     // derives its layout from one place via `densityForRuntime(runtimeMode, …)`.
     // p2p (`full-access`) is always `card`; only an explicit
     // `FEISHU_GROUP_CHAT_DENSITY` lowers a group/topic below `card`.
@@ -734,6 +740,71 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
       )
       .pipe(Stream.orDie);
     const shellCache = yield* runShellCacheFiber({ shellStream: shellSubscription });
+
+    // ── M4-2: live-refresh the approval allowlist from server settings ───────
+    //
+    // Fold web-configured `ServerSettings.feishuApprovalAllowlist` into
+    // `allowlistRef` as it changes. The effective allowlist is ALWAYS `env ∪ store`:
+    // the env `FEISHU_OWNER_OPEN_IDS` floor is an immovable lower bound (the store can
+    // only ADD), so a misconfigured / empty store can never lock the owner out. A
+    // failed refresh keeps last-known-good — the Ref is never cleared on error — and
+    // on WS reconnect the first `snapshot` event automatically replays the latest
+    // store value. Mirrors the bare-`orDie` forked-subscription idiom of
+    // `shellSubscription` (:735) / the inbox + flush fibers: `subscribeServerConfig`
+    // has built-in WS reconnect, so a transient transport drop pauses the stream
+    // (drained inside `subscribe`, never bubbles) without terminating this fiber, and
+    // the handler is pure computation that never throws, so a single event never
+    // fails the stream. `Stream.orDie` therefore fires only on a schema defect or an
+    // unhandled *typed* server failure (e.g. a `ServerSettingsError` while the
+    // reconnect snapshot reloads settings) — rare, and even then fail-safe: the Ref
+    // keeps last-known-good (env floor at minimum) so authz stays correct; only
+    // live-refresh halts until the next bot restart, exactly as for the reference
+    // fibers above. (Optional future hardening: pass `onExpectedFailure` +
+    // `retryExpectedFailureAfter` to self-heal from a transient typed failure.)
+    yield* registry
+      .followStream(environmentId, EnvironmentRpc.subscribe(WS_METHODS.subscribeServerConfig, {}))
+      .pipe(
+        Stream.orDie,
+        Stream.runForEach((event) =>
+          Effect.gen(function* () {
+            // ServerConfigStreamEvent union: `snapshot` carries `config.settings`,
+            // `settingsUpdated` carries `payload.settings`; `keybindingsUpdated` /
+            // `providerStatuses` carry no settings → ignore.
+            const rawStore =
+              event.type === "snapshot"
+                ? event.config.settings.feishuApprovalAllowlist
+                : event.type === "settingsUpdated"
+                  ? event.payload.settings.feishuApprovalAllowlist
+                  : null;
+            if (rawStore === null) {
+              return;
+            }
+            // Defence in depth: same trim + drop-blank as the env parse
+            // (config.ts:245-248), so a hand-edited settings.json can never inject
+            // blank ids. `feishuApprovalAllowlist` decodes to `string[]` (never
+            // optional) so no `?? []` is needed.
+            const storeIds = rawStore.map((s) => s.trim()).filter((s) => s.length > 0);
+            const envIds = config.feishu.ownerOpenIds; // immovable floor, always unioned first
+            const merged = [...new Set([...envIds, ...storeIds])];
+            const previous = yield* Ref.get(allowlistRef);
+            yield* Ref.set(allowlistRef, merged);
+            // ④ Audit: log only when the EFFECTIVE allowlist actually changed. An
+            // allowlist change is a global config change with no lark-thread context,
+            // so this is a plain structured info log — NOT the M3b larkThreadId audit.
+            const added = merged.filter((id) => !previous.includes(id));
+            const removed = previous.filter((id) => !merged.includes(id));
+            if (added.length > 0 || removed.length > 0) {
+              yield* Effect.logInfo("[feishu-bot] approval allowlist updated", {
+                added,
+                removed,
+                effective: merged.length,
+                source: event.type,
+              });
+            }
+          }),
+        ),
+        Effect.forkScoped,
+      );
 
     // Render the last few messages of a takeover snapshot into a compact
     // markdown transcript (M2b-2). One line per message: `🧑 …` (user) / `🤖 …`
@@ -1292,7 +1363,11 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         // M3a: for approval-required chats, bind the primary owner (if configured)
         // as the approval operator so only the owner can click approve. p2p /
         // unconfigured owner falls back to the turn initiator (no regression).
-        const operatorOpenId = resolveApprover(thread.runtimeMode, ownerOpenIds, rawInitiator);
+        const operatorOpenId = resolveApprover(
+          thread.runtimeMode,
+          yield* Ref.get(allowlistRef),
+          rawInitiator,
+        );
         const staleSet = staleRequestIdsOf(thread.activities);
         // M3a: recover the real Feishu chatId (for the token's `c`/`scope`, matched
         // at verify against `evt.chatId`) and the topic id (signed into the token's
@@ -1441,7 +1516,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         // surface the card so the user *sees* a request is pending. M4-1: whether its
         // buttons are actionable now depends on the authz gate, not on this operator:
         // for an approval-gated chat with a configured allowlist, `buildInteraction`
-        // resolves the operator via `resolveApprover` (→ ownerOpenIds[0]) and the gate
+        // resolves the operator via `resolveApprover` (→ the allowlist's primary entry) and the gate
         // authorises by allowlist membership, so the card is approvable by any listed
         // member regardless of the empty operator here. Only in the empty-allowlist
         // fallback (p2p / unconfigured) does an empty operator yield a readable-but-
@@ -2712,7 +2787,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         //     approver) + neutral @notice. MUST run BEFORE the nonce consume (step 8)
         //     so a bystander click never burns the single-use nonce out from under
         //     the real approver.
-        const effectiveAllowlist = effectiveAllowlistFor(shell.runtimeMode);
+        const effectiveAllowlist = yield* effectiveAllowlistFor(shell.runtimeMode);
         const clicker = evt.operator.openId;
         const authorized =
           effectiveAllowlist.length > 0
@@ -3078,7 +3153,8 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
           if (handle.operatorOpenId.length === 0) {
             const recoveryShell = yield* shellCache.threadById(threadId);
             const allowlistActive =
-              recoveryShell !== null && effectiveAllowlistFor(recoveryShell.runtimeMode).length > 0;
+              recoveryShell !== null &&
+              (yield* effectiveAllowlistFor(recoveryShell.runtimeMode)).length > 0;
             if (!allowlistActive) {
               // Empty-allowlist fallback (p2p / unconfigured / cold cache): re-signing
               // with an empty open id would dead-end at verify time, so drop the stale
@@ -3095,7 +3171,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
               return;
             }
             // Allowlist active: fall through and recover. `buildInteraction` resolves
-            // the approval operator via `resolveApprover` (→ ownerOpenIds[0] for an
+            // the approval operator via `resolveApprover` (→ the allowlist's primary entry for an
             // approval-gated chat), so the recovered buttons are signed to a real
             // owner and approvable by any listed member regardless of the empty handle.
             yield* Console.log(
