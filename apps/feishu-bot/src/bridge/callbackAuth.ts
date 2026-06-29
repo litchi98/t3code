@@ -51,15 +51,18 @@ export interface CallbackSignInput {
 }
 
 /**
- * Context the verifier expects the token to match. Note: **no `action`** — the
- * action is carried by (and routed from) the signed payload (`payload.a`), so it
- * is integrity-protected without being part of the per-button expected context.
+ * Context the verifier expects the token to match — the **integrity** keys only.
+ * Note: **no `action`** (carried by / routed from the signed `payload.a`) and, as
+ * of M4-1, **no `operatorOpenId`**. Authz (who may click) is decoupled from
+ * `verify` (integrity) and enforced by the bot's cardAction handler against its
+ * configured allowlist; the clicker open id is therefore no longer a matched
+ * context key. `payload.o` is still signed/carried (see {@link CallbackPayload.o})
+ * — only the *comparison* moved out — so the token byte layout is unchanged.
  */
 export interface CallbackVerifyExpected {
   readonly runId: string;
   readonly scope: string;
   readonly chatId: string;
-  readonly operatorOpenId: string;
   readonly policyFingerprint: string;
 }
 
@@ -67,6 +70,14 @@ export interface CallbackPayload {
   r: string;
   s: string;
   c: string;
+  /**
+   * Initiator/approver open id the token was signed for. M4-1: still signed and
+   * carried (it is part of the HMAC-covered payload, and the bot's authz
+   * empty-allowlist fallback reads it as the "initiator only" rule) but NO LONGER
+   * compared in {@link matchesExpected} — authz is decoupled to the bot. MUST stay
+   * present: removing it would change the signed byte layout (red line) and
+   * `decodePayload` requires it.
+   */
   o: string;
   a: string;
   exp: number;
@@ -220,7 +231,6 @@ function matchesExpected(payload: CallbackPayload, expected: CallbackVerifyExpec
     payload.r === expected.runId &&
     payload.s === expected.scope &&
     payload.c === expected.chatId &&
-    payload.o === expected.operatorOpenId &&
     payload.fp === expected.policyFingerprint
   );
 }
