@@ -31,6 +31,7 @@ import {
   type OrchestrationThreadActivity,
   type OrchestrationThreadStreamItem,
   ProjectId,
+  type RuntimeMode,
   type ServerProvider,
   ThreadId,
   type TurnId,
@@ -508,9 +509,20 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
       nonces: nonceProbe,
     });
 
-    // M3a: primary owner open IDs for approval gating. Captured once from config
-    // (bot-side, like appId) so `buildInteraction` closures share a stable reference.
+    // M3a/M4-1: the approval allowlist for group/topic chats. Captured once from
+    // config (bot-side, like appId) so `buildInteraction` closures share a stable
+    // reference. M4-1 reads it as an N-of allowlist (any listed member may approve),
+    // not a single-owner binding.
     const ownerOpenIds = config.feishu.ownerOpenIds;
+
+    // M4-1: the effective approval allowlist that gates a cardAction click, by
+    // runtime mode. Only approval-gated chats consult the configured owners; a p2p
+    // (`full-access`) chat — or an unconfigured/empty allowlist — keeps the pre-M4
+    // "initiator only" rule (the gate then falls back to the signed `payload.o`).
+    // Shared by the cardAction authz gate and the M18 empty-operator recovery guard
+    // so both derive "is the allowlist active here?" from one place.
+    const effectiveAllowlistFor = (runtimeMode: RuntimeMode): ReadonlyArray<string> =>
+      runtimeMode === "approval-required" ? ownerOpenIds : [];
 
     // M3b: render density for group / topic chats, captured once from config
     // (bot-side, like `ownerOpenIds`) so every `renderThreadCard` call site below
@@ -1426,11 +1438,15 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         // (in a p2p private chat the takeover operator is the same person, so the
         // persisted open id is valid for the new request too). Reuse the handle read
         // above for the dedup so we don't fetch it twice. If BOTH are empty we still
-        // surface the card so the user *sees* a request is pending, but the buttons
-        // would not verify (empty open id) — `buildInteraction` signs with whatever
-        // operator we pass; an empty one yields a card the user can read but whose
-        // click would be rejected at verify time (no wildcard / auth bypass),
-        // prompting a resend. This mirrors M18's graceful fallback.
+        // surface the card so the user *sees* a request is pending. M4-1: whether its
+        // buttons are actionable now depends on the authz gate, not on this operator:
+        // for an approval-gated chat with a configured allowlist, `buildInteraction`
+        // resolves the operator via `resolveApprover` (→ ownerOpenIds[0]) and the gate
+        // authorises by allowlist membership, so the card is approvable by any listed
+        // member regardless of the empty operator here. Only in the empty-allowlist
+        // fallback (p2p / unconfigured) does an empty operator yield a readable-but-
+        // not-clickable card (gate falls back to the signed `payload.o`; no wildcard /
+        // auth bypass), prompting a resend — mirroring M18's graceful fallback.
         const operators = yield* Ref.get(chatOperators);
         const operatorOpenId =
           // #5: the trailing `?? ""` was unreachable — the conditional's else branch
@@ -2569,6 +2585,47 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         return resolved;
       });
 
+    // Bystander no-op (M3a; generalised + shared in M4-1). An unauthorised click on
+    // the CURRENT card is ignored WITHOUT mutating the card — the real approver's
+    // buttons stay live — and we only post a neutral, @-addressed notice, deduped to
+    // at most once per (chatKey, card messageId, clicker) so repeated taps don't spam
+    // the topic. Called from the authz gate: the token already passed `verify`, which
+    // proves the click targets the live card for this chat/thread/policy, so no
+    // messageId check is needed (it would be redundant). Generic wording covers both
+    // approval and user-input interactions.
+    const preserveCardForBystander = (
+      chatKey: string,
+      messageId: string,
+      clickerOpenId: string,
+    ): Effect.Effect<void> =>
+      Effect.gen(function* () {
+        yield* Console.log(
+          `[feishu-bot] cardAction ignored for chat ${chatKey} — unauthorised click on the current card; card preserved.`,
+        );
+        const dedupKey = `${chatKey}:${messageId}:${clickerOpenId}`;
+        const alreadyNotified = yield* Ref.modify(bystanderNoticed, (set) => {
+          if (set.has(dedupKey)) return [true, set] as const;
+          const next = new Set(set);
+          next.add(dedupKey);
+          // M3b: bound the set. On overflow keep the most recent ~80% (Set iteration
+          // order ≈ insertion order) and drop the oldest keys.
+          if (next.size > MAX_BYSTANDER_KEYS) {
+            const keep = Math.floor(MAX_BYSTANDER_KEYS * 0.8);
+            return [false, new Set(Array.from(next).slice(-keep))] as const;
+          }
+          return [false, next] as const;
+        });
+        if (!alreadyNotified) {
+          // The WS card path has no native per-clicker toast, so post a short
+          // topic-anchored notice; the card stays intact for the real approver.
+          yield* sendNotice(
+            chatKey,
+            `<at id=${clickerOpenId}></at> 你暂时没有此操作的权限,需由授权人处理。`,
+            messageId,
+          );
+        }
+      });
+
     /**
      * Handle one cardAction (button click / form submit) end to end (contract B9
      * §9). The bridge is a thin *shared* client: it verifies the signed token,
@@ -2619,68 +2676,50 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
         // 4. Recompute the policy fingerprint for the verify context.
         const fp = computePolicyFingerprint(evt.chatId, threadId, shell.runtimeMode);
 
-        // 5. Verify the token against the expected context (no `action` — it is
-        //    carried by and routed from the signed payload, adjustment 2).
+        // 5. Verify the token's INTEGRITY against the expected context. M4-1: no
+        //    `operatorOpenId` here either — authz (who may click) is decoupled from
+        //    verify and enforced by the authz gate (step 6b) below. Verify now only
+        //    proves the token is untampered and belongs to THIS chat/thread/policy
+        //    (no `action`, adjustment 2; no `operatorOpenId`, M4-1).
         const res = auth.verify(parsed.token, {
           runId: threadId,
           scope: evt.chatId,
           chatId: evt.chatId,
-          operatorOpenId: evt.operator.openId,
           policyFingerprint: fp,
         });
 
-        // 6. Verification failure → bystander no-op, or degrade a stale card.
-        // In a group the approval buttons are bound to a single operator (owner /
-        // initiator). A non-authorised member clicking yields `context-mismatch`
-        // — but so does a genuinely stale card (e.g. threadId/fp changed after a
-        // `/resume`). Degrading on every failure lets ANY bystander destroy the
-        // approval card and lock out the real approver. Distinguish by whether the
-        // click targets the bridge's CURRENT card for this chat: same messageId →
-        // live card, wrong clicker → no-op (preserve buttons for the real
-        // approver); different/absent → old session's card → degrade as before.
+        // 6. Verification failure = an INTEGRITY failure: a tampered token or a
+        //    genuinely stale card (e.g. threadId/fp changed after a `/resume` or a
+        //    runtimeMode change). M4-1: because authz is no longer folded into verify,
+        //    the live card passes verify for ANY clicker — so `context-mismatch` no
+        //    longer fires on a mere bystander click (that is now caught by the authz
+        //    gate below), only on a truly stale/foreign card. Degrade it
+        //    unconditionally; there is no live card left to preserve.
         if (!res.ok) {
-          if (res.reason === "context-mismatch") {
-            const handleOpt = yield* cardHandles
-              .get(chatKey)
-              .pipe(Effect.orElseSucceed(() => Option.none<CardHandle>()));
-            if (Option.isSome(handleOpt) && handleOpt.value.messageId === evt.messageId) {
-              yield* Console.log(
-                `[feishu-bot] cardAction ignored for chat ${evt.chatId} — unauthorised click on the current card; card preserved.`,
-              );
-              // Fix B: dedup the "unauthorised" notice to at most once per
-              // (chatKey, card messageId, clicker). Repeated clicks still
-              // no-op (card stays intact) but don't spam the thread.
-              const dedupKey = `${chatKey}:${evt.messageId}:${evt.operator.openId}`;
-              const alreadyNotified = yield* Ref.modify(bystanderNoticed, (set) => {
-                if (set.has(dedupKey)) return [true, set] as const;
-                const next = new Set(set);
-                next.add(dedupKey);
-                // M3b: bound the set. On overflow keep the most recent ~80% (Set
-                // iteration order ≈ insertion order) and drop the oldest keys.
-                if (next.size > MAX_BYSTANDER_KEYS) {
-                  const keep = Math.floor(MAX_BYSTANDER_KEYS * 0.8);
-                  return [false, new Set(Array.from(next).slice(-keep))] as const;
-                }
-                return [false, next] as const;
-              });
-              if (!alreadyNotified) {
-                // Fix C: generic wording — the same branch covers both approval
-                // and user-input interactions, so "审批" is misleading.
-                // The WS card path has no native per-clicker toast, so post a
-                // short topic-anchored notice; card stays intact for real approver.
-                yield* sendNotice(
-                  chatKey,
-                  `<at id=${evt.operator.openId}></at> 你暂时没有此操作的权限,需由授权人处理。`,
-                  evt.messageId,
-                );
-              }
-              return;
-            }
-          }
           yield* Console.log(
             `[feishu-bot] cardAction rejected for chat ${evt.chatId} (${res.reason}).`,
           );
           yield* updateCardNotice(evt.messageId, "⚠️ 按钮已失效,请回到最新卡片重新操作。");
+          return;
+        }
+
+        // 6b. Authz (M4-1): verify proved integrity (this IS the live card for this
+        //     chat/thread/policy); now decide WHO may act. The effective allowlist is
+        //     the configured owners, but only for approval-gated chats; a p2p
+        //     (`full-access`) chat or an unconfigured/empty allowlist keeps the pre-M4
+        //     "initiator only" rule by matching the signed `payload.o`. A non-listed
+        //     clicker is a bystander: no-op the card (preserve it for the real
+        //     approver) + neutral @notice. MUST run BEFORE the nonce consume (step 8)
+        //     so a bystander click never burns the single-use nonce out from under
+        //     the real approver.
+        const effectiveAllowlist = effectiveAllowlistFor(shell.runtimeMode);
+        const clicker = evt.operator.openId;
+        const authorized =
+          effectiveAllowlist.length > 0
+            ? effectiveAllowlist.includes(clicker)
+            : clicker.length > 0 && clicker === res.payload.o;
+        if (!authorized) {
+          yield* preserveCardForBystander(chatKey, evt.messageId, clicker);
           return;
         }
 
@@ -3026,21 +3065,42 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
 
           // #0/#1(c): graceful fallback when the persisted handle has no captured
           // operator (pre-M2b-2 data, or the card was rendered before any inbound
-          // message identified the chat's operator). Re-signing buttons with an
-          // empty open id would dead-end them at verify time, so instead of
-          // rendering dead buttons we drop the stale handle and nudge the user to
-          // send a message — which re-drives the turn and produces a fresh card
-          // with usable, correctly-signed buttons. No wildcard / auth bypass.
+          // message identified the chat's operator). M4-1: the "empty open id →
+          // dead button" premise only holds where the authz gate falls back to the
+          // signed `payload.o` (p2p / unconfigured allowlist). When an approval
+          // allowlist is ACTIVE for this chat (approval-required + a configured
+          // allowlist), the gate authorises by allowlist MEMBERSHIP and ignores
+          // `payload.o`, so the card is fully approvable by any listed member even
+          // with no captured operator — recover it as usual (the deadlock M4 roots
+          // out). Determine "allowlist active?" from the thread's current runtimeMode
+          // (same source the cardAction gate uses); a cold cache (null) is treated as
+          // not-active → the safe nudge fallback, preserving the prior invariant.
           if (handle.operatorOpenId.length === 0) {
-            yield* cardHandles.remove(chatId).pipe(Effect.ignore);
-            yield* sendNotice(
-              chatId,
-              "⚠️ 有待批准的操作,请发送一条消息以继续(将刷新可操作的卡片)。",
-            );
+            const recoveryShell = yield* shellCache.threadById(threadId);
+            const allowlistActive =
+              recoveryShell !== null && effectiveAllowlistFor(recoveryShell.runtimeMode).length > 0;
+            if (!allowlistActive) {
+              // Empty-allowlist fallback (p2p / unconfigured / cold cache): re-signing
+              // with an empty open id would dead-end at verify time, so drop the stale
+              // handle and nudge the user to send a message — which re-drives the turn
+              // and produces a fresh, correctly-signed card. No wildcard / auth bypass.
+              yield* cardHandles.remove(chatId).pipe(Effect.ignore);
+              yield* sendNotice(
+                chatId,
+                "⚠️ 有待批准的操作,请发送一条消息以继续(将刷新可操作的卡片)。",
+              );
+              yield* Console.log(
+                `[feishu-bot] skipping approval-card recovery for chat ${chatId} (no captured operator, no active allowlist); nudged user to resend.`,
+              );
+              return;
+            }
+            // Allowlist active: fall through and recover. `buildInteraction` resolves
+            // the approval operator via `resolveApprover` (→ ownerOpenIds[0] for an
+            // approval-gated chat), so the recovered buttons are signed to a real
+            // owner and approvable by any listed member regardless of the empty handle.
             yield* Console.log(
-              `[feishu-bot] skipping approval-card recovery for chat ${chatId} (no captured operator); nudged user to resend.`,
+              `[feishu-bot] recovering approval card for chat ${chatId} with no captured operator (allowlist active; any listed member may approve).`,
             );
-            return;
           }
 
           // 修法 3: seed the in-process `chatOperators` Ref with the recovered operator.

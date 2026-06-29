@@ -83,19 +83,26 @@ export const runtimeModeForChatType = (chatType: string): RuntimeMode =>
   chatType === "p2p" ? "full-access" : "approval-required";
 
 /**
- * M3a: who may approve an approval request in a given chat.
- * Single-owner binding (M3a): when an owner is configured AND the chat is
- * approval-gated (group/topic), bind the primary owner into the HMAC payload
- * so only the owner can approve. p2p (full-access) and unconfigured owner fall
- * back to the turn initiator = pre-M3a "initiator-only" behavior (no regression).
- * Multi-approver allowlist is a future web-config milestone (decouples authz
- * from callbackAuth.verify); M3a only consumes ownerOpenIds[0].
+ * M3a/M4-1: derive the open id stamped into the approval token's signed `payload.o`.
+ * When an owner is configured AND the chat is approval-gated (group/topic) this
+ * stamps `ownerOpenIds[0]`; p2p (full-access) and the unconfigured/empty case fall
+ * back to the turn initiator (pre-M3a "initiator-only" behavior, no regression).
  *
- * KNOWN LIMITATION: when owner-default selects `ownerOpenIds[0]`, that owner MUST
- * be a member of the group. If the configured owner is not in the group, members'
- * clicks fail verify and the owner never sees the card → the group approval
- * deadlocks and the turn blocks permanently. The unconfigured/empty fallback
- * (initiator approval) is safe. Root fix = multi-approver allowlist (M4).
+ * M4-1 NOTE: who may *approve* is no longer decided here. Authz is decoupled from
+ * the signed `payload.o` — the bot's cardAction gate authorises a clicker by
+ * MEMBERSHIP in the configured allowlist (any of `ownerOpenIds`, N-of-1), not by
+ * matching `payload.o`. This function still picks the single open id to *sign into*
+ * the token (an integrity-carried value), but for an approval-gated chat it is the
+ * allowlist — not `payload.o` — that gates approval. The empty-allowlist fallback
+ * still gates on `payload.o` = initiator (initiator-only path unchanged).
+ *
+ * STRUCTURAL FIX (M4-1) of the M3a single-owner deadlock: because approval is now
+ * N-of-1 over the whole allowlist, the turn no longer blocks just because
+ * `ownerOpenIds[0]` is not in the group — any other listed member who IS in the
+ * group can approve. A residual deadlock only remains if NONE of the listed members
+ * are in the group (an operational misconfiguration, self-diagnosable via
+ * `/whoami`). Leaving the allowlist empty falls back to initiator approval and can
+ * never deadlock.
  */
 export const resolveApprover = (
   runtimeMode: RuntimeMode,
