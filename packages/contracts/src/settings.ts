@@ -409,6 +409,17 @@ export const ServerSettings = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed({})),
   ),
   observability: ObservabilitySettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+  // Feishu/Lark approval allowlist: open_ids permitted to act on approval cards
+  // in approval-required group chats. Web-configured, server-persisted. The
+  // feishu-bot unions this with its env `FEISHU_OWNER_OPEN_IDS` floor at read
+  // time — env is an immovable floor, the store can only add. Element type is
+  // intentionally permissive (`Schema.String`, not non-empty): the bot trims
+  // and drops blank entries on read, so a hand-edited settings.json can never
+  // break decoding of the rest of the settings. Missing field decodes to `[]`
+  // (backward compatible with older servers/configs).
+  feishuApprovalAllowlist: Schema.Array(Schema.String).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
 });
 export type ServerSettings = typeof ServerSettings.Type;
 
@@ -530,6 +541,9 @@ export const ServerSettingsPatch = Schema.Struct({
   // patches risk leaving driver-specific config in a half-merged state.
   // The web UI sends a fully-formed map every time it edits this field.
   providerInstances: Schema.optionalKey(Schema.Record(ProviderInstanceId, ProviderInstanceConfig)),
+  // Whole-array replacement: the web UI sends the full allowlist on every edit
+  // (deepMerge replaces arrays wholesale, so no stale entries linger).
+  feishuApprovalAllowlist: Schema.optionalKey(Schema.Array(Schema.String)),
 });
 export type ServerSettingsPatch = typeof ServerSettingsPatch.Type;
 
