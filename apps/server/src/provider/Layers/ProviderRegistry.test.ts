@@ -331,6 +331,17 @@ function makeMutableServerSettingsService(
               } as const),
         ),
       ),
+      clearFeishuBinding: Ref.get(settingsRef).pipe(
+        Effect.flatMap((current) => {
+          if (current.feishuBinding === undefined) {
+            return Effect.void;
+          }
+          const { feishuBinding: _omitted, ...rest } = current;
+          return Ref.set(settingsRef, rest as ContractServerSettings).pipe(
+            Effect.andThen(Ref.set(feishuSecretRef, undefined)),
+          );
+        }),
+      ),
     } satisfies ServerSettingsModule.ServerSettingsService["Service"];
   });
 }
