@@ -420,6 +420,18 @@ export const ServerSettings = Schema.Struct({
   feishuApprovalAllowlist: Schema.Array(Schema.String).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
+  // Feishu/Lark bot binding provisioned via web QR-scan (device-code/RFC8628).
+  // Public identity only — `appSecret` lives in the server secret store, never
+  // here. Absent (optional, no decoding default) means "no bot bound yet", so
+  // `DEFAULT_SERVER_SETTINGS = decodeSync({})` still parses (backward
+  // compatible with older servers/configs).
+  feishuBinding: Schema.optional(
+    Schema.Struct({
+      appId: TrimmedNonEmptyString,
+      tenant: Schema.Literals(["feishu", "lark"]),
+      ownerOpenId: TrimmedNonEmptyString,
+    }),
+  ),
 });
 export type ServerSettings = typeof ServerSettings.Type;
 
@@ -544,6 +556,14 @@ export const ServerSettingsPatch = Schema.Struct({
   // Whole-array replacement: the web UI sends the full allowlist on every edit
   // (deepMerge replaces arrays wholesale, so no stale entries linger).
   feishuApprovalAllowlist: Schema.optionalKey(Schema.Array(Schema.String)),
+  // Whole-object replacement: the binding flow writes all three fields at once.
+  feishuBinding: Schema.optionalKey(
+    Schema.Struct({
+      appId: TrimmedNonEmptyString,
+      tenant: Schema.Literals(["feishu", "lark"]),
+      ownerOpenId: TrimmedNonEmptyString,
+    }),
+  ),
 });
 export type ServerSettingsPatch = typeof ServerSettingsPatch.Type;
 
