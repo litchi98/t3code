@@ -1,5 +1,6 @@
 import {
   type EnvironmentId,
+  type FeishuBindingStreamEvent,
   type ServerConfig,
   type ServerConfigStreamEvent,
   type ServerLifecycleWelcomePayload,
@@ -83,6 +84,47 @@ export function projectServerWelcome(
   }
   const welcome = event.payload as ServerLifecycleWelcomePayload;
   return [Option.some(welcome), [welcome]];
+}
+
+/**
+ * Accumulated view of the Feishu bot-binding device-code stream.
+ *
+ * The stream emits a single `qr` event, then a run of `status` polling events,
+ * then a terminal `bound`/`error` event. Because the subscription atom only
+ * retains the *latest* stream value, the QR url would vanish the instant the
+ * first `status` event arrives — so we scan the stream into this sticky
+ * projection (matching the config/terminal projection idiom). The dialog reads
+ * `qr` for the code, `status` for polling feedback, and `bound`/`error` for the
+ * terminal outcome. No `appSecret` is present anywhere in the stream.
+ */
+export interface FeishuBindingProjection {
+  readonly qr: Extract<FeishuBindingStreamEvent, { type: "qr" }>["payload"] | null;
+  readonly status: Extract<FeishuBindingStreamEvent, { type: "status" }>["payload"] | null;
+  readonly bound: Extract<FeishuBindingStreamEvent, { type: "bound" }>["payload"] | null;
+  readonly error: Extract<FeishuBindingStreamEvent, { type: "error" }>["payload"] | null;
+}
+
+export const EMPTY_FEISHU_BINDING_PROJECTION: FeishuBindingProjection = {
+  qr: null,
+  status: null,
+  bound: null,
+  error: null,
+};
+
+export function applyFeishuBindingStreamEvent(
+  state: FeishuBindingProjection,
+  event: FeishuBindingStreamEvent,
+): FeishuBindingProjection {
+  switch (event.type) {
+    case "qr":
+      return { ...state, qr: event.payload };
+    case "status":
+      return { ...state, status: event.payload };
+    case "bound":
+      return { ...state, bound: event.payload, error: null };
+    case "error":
+      return { ...state, error: event.payload };
+  }
 }
 
 export function createServerEnvironmentAtoms<R, E>(
@@ -185,6 +227,26 @@ export function createServerEnvironmentAtoms<R, E>(
       tag: WS_METHODS.serverUpdateSettings,
       scheduler: configScheduler,
       concurrency: configConcurrency,
+    }),
+    // Feishu bot binding: the QR-scan provisioning stream (driven only while the
+    // web binding dialog is open) and the unbind command. The stream carries no
+    // `appSecret` — only public binding identity in its `bound` event. The stream
+    // is scanned into a sticky projection so the QR url survives later `status`
+    // events (see FeishuBindingProjection).
+    feishuStartBinding: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
+      label: "environment-data:server:feishu-start-binding",
+      tag: WS_METHODS.feishuStartBinding,
+      // No idle grace: when the binding dialog closes (last subscriber leaves)
+      // the atom is disposed immediately, closing the stream scope so the
+      // server aborts the in-flight registerApp device-code polling at once
+      // instead of leaking it for the default 5-minute idle window.
+      idleTtlMs: 0,
+      transform: (stream) =>
+        stream.pipe(Stream.scan(EMPTY_FEISHU_BINDING_PROJECTION, applyFeishuBindingStreamEvent)),
+    }),
+    feishuClearBinding: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:feishu-clear-binding",
+      tag: WS_METHODS.feishuClearBinding,
     }),
     signalProcess: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:signal-process",

@@ -346,6 +346,7 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [WS_METHODS.subscribeAuthAccess, AuthAccessReadScope],
   [WS_METHODS.feishuStartBinding, AuthOrchestrationOperateScope],
   [WS_METHODS.feishuGetBotCredentials, AuthOrchestrationOperateScope],
+  [WS_METHODS.feishuClearBinding, AuthOrchestrationOperateScope],
 ]);
 
 function toAuthAccessStreamEvent(
@@ -1243,6 +1244,12 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
           observeRpcEffect(
             WS_METHODS.feishuGetBotCredentials,
             serverSettings.getFeishuBotCredentials,
+            { "rpc.aggregate": "server" },
+          ),
+        [WS_METHODS.feishuClearBinding]: (_input) =>
+          observeRpcEffect(
+            WS_METHODS.feishuClearBinding,
+            serverSettings.clearFeishuBinding.pipe(Effect.as({})),
             { "rpc.aggregate": "server" },
           ),
         [WS_METHODS.serverDiscoverSourceControl]: (_input) =>

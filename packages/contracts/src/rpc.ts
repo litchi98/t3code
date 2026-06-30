@@ -226,6 +226,7 @@ export const WS_METHODS = {
   // Feishu bot binding
   feishuStartBinding: "feishu.startBinding",
   feishuGetBotCredentials: "feishu.getBotCredentials",
+  feishuClearBinding: "feishu.clearBinding",
 
   // Streaming subscriptions
   subscribeVcsStatus: "subscribeVcsStatus",
@@ -697,6 +698,12 @@ export const WsFeishuGetBotCredentialsRpc = Rpc.make(WS_METHODS.feishuGetBotCred
   error: Schema.Union([ServerSettingsError, EnvironmentAuthorizationError]),
 });
 
+export const WsFeishuClearBindingRpc = Rpc.make(WS_METHODS.feishuClearBinding, {
+  payload: Schema.Struct({}),
+  success: Schema.Struct({}),
+  error: Schema.Union([ServerSettingsError, EnvironmentAuthorizationError]),
+});
+
 export const WsRpcGroup = RpcGroup.make(
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,
@@ -761,6 +768,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsSubscribeAuthAccessRpc,
   WsFeishuStartBindingRpc,
   WsFeishuGetBotCredentialsRpc,
+  WsFeishuClearBindingRpc,
   WsOrchestrationDispatchCommandRpc,
   WsOrchestrationGetTurnDiffRpc,
   WsOrchestrationGetFullThreadDiffRpc,

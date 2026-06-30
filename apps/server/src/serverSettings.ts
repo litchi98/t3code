@@ -150,6 +150,14 @@ export class ServerSettingsService extends Context.Service<
      * when the secret is missing.
      */
     readonly getFeishuBotCredentials: Effect.Effect<FeishuBotCredentials, ServerSettingsError>;
+
+    /**
+     * Clear the Feishu bot binding: drop the `feishuBinding` identity from
+     * settings and best-effort remove the stored `appSecret`. Idempotent when
+     * already unbound. Emits a change so the bot detects unbind and the web
+     * refreshes live.
+     */
+    readonly clearFeishuBinding: Effect.Effect<void, ServerSettingsError>;
   }
 >()("t3/serverSettings/ServerSettingsService") {
   /** @deprecated Import and use `layerTest` from this module. */
@@ -217,6 +225,17 @@ const makeTest = (overrides: DeepPartial<ServerSettings> = {}) =>
                   tenant: settings.feishuBinding.tenant,
                 },
         ),
+      ),
+      clearFeishuBinding: Ref.get(currentSettingsRef).pipe(
+        Effect.flatMap((current) => {
+          if (current.feishuBinding === undefined) {
+            return Effect.void;
+          }
+          const { feishuBinding: _omitted, ...rest } = current;
+          return Ref.set(currentSettingsRef, rest as ServerSettings).pipe(
+            Effect.andThen(Ref.set(feishuSecretRef, undefined)),
+          );
+        }),
       ),
     } satisfies ServerSettingsService["Service"];
   });
@@ -729,6 +748,27 @@ const make = Effect.gen(function* () {
                 },
           ),
         );
+      }),
+    ),
+    clearFeishuBinding: writeSemaphore.withPermits(1)(
+      Effect.gen(function* () {
+        const current = yield* getSettingsFromCache;
+        // Idempotent: nothing to clear when no binding exists.
+        if (current.feishuBinding === undefined) {
+          return;
+        }
+        const appId = current.feishuBinding.appId;
+        // Drop the `feishuBinding` key entirely. `deepMerge` (used by the patch
+        // path) can't delete keys, so we rewrite the whole settings object.
+        const { feishuBinding: _omitted, ...rest } = current;
+        const next = rest as ServerSettings;
+        yield* writeSettingsAtomically(next);
+        yield* Cache.set(settingsCache, cacheKey, next);
+        yield* emitChange(next);
+        // Best-effort secret removal after the field is cleared. A failure here
+        // at worst leaves a dormant orphaned secret that a same-appId re-bind
+        // overwrites — never fail the whole RPC for it.
+        yield* secretStore.remove(feishuSecretName(appId)).pipe(Effect.catch(() => Effect.void));
       }),
     ),
   } satisfies ServerSettingsService["Service"];
