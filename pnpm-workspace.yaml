@@ -22,6 +22,7 @@ catalog:
   "@effect/sql-sqlite-bun": 4.0.0-beta.78
   "@effect/tsgo": 0.13.2
   "@effect/vitest": 4.0.0-beta.78
+  "@larksuiteoapi/node-sdk": 1.67.0
   "@noble/curves": 1.9.1
   "@noble/hashes": 1.8.0
   "@pierre/diffs": 1.3.0-beta.5

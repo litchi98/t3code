@@ -78,6 +78,7 @@ import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import * as ServerSettings from "./serverSettings.ts";
+import { makeFeishuBindingStream } from "./feishu/binding.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as PreviewManager from "./preview/Manager.ts";
@@ -343,6 +344,8 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [WS_METHODS.subscribeServerConfig, AuthOrchestrationReadScope],
   [WS_METHODS.subscribeServerLifecycle, AuthOrchestrationReadScope],
   [WS_METHODS.subscribeAuthAccess, AuthAccessReadScope],
+  [WS_METHODS.feishuStartBinding, AuthOrchestrationOperateScope],
+  [WS_METHODS.feishuGetBotCredentials, AuthOrchestrationOperateScope],
 ]);
 
 function toAuthAccessStreamEvent(
@@ -1225,6 +1228,22 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
             {
               "rpc.aggregate": "server",
             },
+          ),
+        [WS_METHODS.feishuStartBinding]: (_input) =>
+          observeRpcStreamEffect(
+            WS_METHODS.feishuStartBinding,
+            Effect.sync(() =>
+              makeFeishuBindingStream({
+                persist: (creds) => serverSettings.persistFeishuBinding(creds),
+              }),
+            ),
+            { "rpc.aggregate": "server" },
+          ),
+        [WS_METHODS.feishuGetBotCredentials]: (_input) =>
+          observeRpcEffect(
+            WS_METHODS.feishuGetBotCredentials,
+            serverSettings.getFeishuBotCredentials,
+            { "rpc.aggregate": "server" },
           ),
         [WS_METHODS.serverDiscoverSourceControl]: (_input) =>
           observeRpcEffect(

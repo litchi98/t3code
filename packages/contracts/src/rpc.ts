@@ -131,6 +131,7 @@ import {
   ServerUpsertKeybindingResult,
 } from "./server.ts";
 import { ServerSettings, ServerSettingsError, ServerSettingsPatch } from "./settings.ts";
+import { FeishuBindingStreamEvent, FeishuBotCredentials } from "./feishu.ts";
 import {
   SourceControlCloneRepositoryInput,
   SourceControlCloneRepositoryResult,
@@ -221,6 +222,10 @@ export const WS_METHODS = {
   sourceControlLookupRepository: "sourceControl.lookupRepository",
   sourceControlCloneRepository: "sourceControl.cloneRepository",
   sourceControlPublishRepository: "sourceControl.publishRepository",
+
+  // Feishu bot binding
+  feishuStartBinding: "feishu.startBinding",
+  feishuGetBotCredentials: "feishu.getBotCredentials",
 
   // Streaming subscriptions
   subscribeVcsStatus: "subscribeVcsStatus",
@@ -679,6 +684,19 @@ export const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess,
   stream: true,
 });
 
+export const WsFeishuStartBindingRpc = Rpc.make(WS_METHODS.feishuStartBinding, {
+  payload: Schema.Struct({}),
+  success: FeishuBindingStreamEvent,
+  error: Schema.Union([ServerSettingsError, EnvironmentAuthorizationError]),
+  stream: true,
+});
+
+export const WsFeishuGetBotCredentialsRpc = Rpc.make(WS_METHODS.feishuGetBotCredentials, {
+  payload: Schema.Struct({}),
+  success: FeishuBotCredentials,
+  error: Schema.Union([ServerSettingsError, EnvironmentAuthorizationError]),
+});
+
 export const WsRpcGroup = RpcGroup.make(
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,
@@ -741,6 +759,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsSubscribeServerConfigRpc,
   WsSubscribeServerLifecycleRpc,
   WsSubscribeAuthAccessRpc,
+  WsFeishuStartBindingRpc,
+  WsFeishuGetBotCredentialsRpc,
   WsOrchestrationDispatchCommandRpc,
   WsOrchestrationGetTurnDiffRpc,
   WsOrchestrationGetFullThreadDiffRpc,

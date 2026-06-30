@@ -15,6 +15,7 @@ import {
   DEFAULT_GIT_TEXT_GENERATION_MODEL_BY_PROVIDER,
   DEFAULT_MODEL_BY_PROVIDER,
   DEFAULT_SERVER_SETTINGS,
+  type FeishuBotCredentials,
   isProviderDriverKind,
   type ModelSelection,
   type ProviderInstanceConfig,
@@ -49,6 +50,7 @@ import { type DeepPartial, deepMerge } from "@t3tools/shared/Struct";
 import { fromJsonStringPretty, fromLenientJson } from "@t3tools/shared/schemaJson";
 import { applyServerSettingsPatch } from "@t3tools/shared/serverSettings";
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
+import type { FeishuBindingCredentials } from "./feishu/binding.ts";
 
 const encodeServerSettings = Schema.encodeEffect(ServerSettings);
 const encodeServerSettingsJson = Schema.encodeUnknownEffect(fromJsonStringPretty(ServerSettings));
@@ -77,6 +79,10 @@ function providerEnvironmentSecretName(input: {
   readonly name: string;
 }): string {
   return `provider-env-${Buffer.from(input.instanceId, "utf8").toString("base64url")}-${Buffer.from(input.name, "utf8").toString("base64url")}`;
+}
+
+function feishuSecretName(appId: string): string {
+  return `feishu-bot-secret-${Buffer.from(appId, "utf8").toString("base64url")}`;
 }
 
 function redactProviderEnvironmentVariable(
@@ -127,6 +133,23 @@ export class ServerSettingsService extends Context.Service<
 
     /** Stream of settings change events. */
     readonly streamChanges: Stream.Stream<ServerSettings>;
+
+    /**
+     * Persist a freshly-provisioned Feishu bot binding: write `appSecret` to the
+     * secret store, then record the public binding identity in settings and
+     * append the owner to `feishuApprovalAllowlist`. `appSecret` never touches
+     * settings.json or logs.
+     */
+    readonly persistFeishuBinding: (
+      input: FeishuBindingCredentials,
+    ) => Effect.Effect<ServerSettings, ServerSettingsError>;
+
+    /**
+     * Read the bound bot's credentials (the single `appSecret` crossing point,
+     * consumed by the paired bot). Returns `{ bound: false }` when unbound or
+     * when the secret is missing.
+     */
+    readonly getFeishuBotCredentials: Effect.Effect<FeishuBotCredentials, ServerSettingsError>;
   }
 >()("t3/serverSettings/ServerSettingsService") {
   /** @deprecated Import and use `layerTest` from this module. */
@@ -144,18 +167,57 @@ const makeTest = (overrides: DeepPartial<ServerSettings> = {}) =>
         : {}),
     });
     const currentSettingsRef = yield* Ref.make<ServerSettings>(initialSettings);
+    const feishuSecretRef = yield* Ref.make<string | undefined>(undefined);
+
+    const updateSettings = (patch: ServerSettingsPatch) =>
+      Ref.get(currentSettingsRef).pipe(
+        Effect.map((currentSettings) => applyServerSettingsPatch(currentSettings, patch)),
+        Effect.flatMap(normalizeServerSettings),
+        Effect.tap((nextSettings) => Ref.set(currentSettingsRef, nextSettings)),
+      );
 
     return {
       start: Effect.void,
       ready: Effect.void,
       getSettings: Ref.get(currentSettingsRef),
-      updateSettings: (patch) =>
-        Ref.get(currentSettingsRef).pipe(
-          Effect.map((currentSettings) => applyServerSettingsPatch(currentSettings, patch)),
-          Effect.flatMap(normalizeServerSettings),
-          Effect.tap((nextSettings) => Ref.set(currentSettingsRef, nextSettings)),
-        ),
+      updateSettings,
       streamChanges: Stream.empty,
+      persistFeishuBinding: (input) =>
+        Ref.set(feishuSecretRef, input.appSecret).pipe(
+          Effect.andThen(Ref.get(currentSettingsRef)),
+          Effect.flatMap((current) =>
+            updateSettings({
+              feishuBinding: {
+                appId: input.appId,
+                tenant: input.tenant,
+                ownerOpenId: input.ownerOpenId,
+              },
+              feishuApprovalAllowlist: Array.from(
+                new Set(
+                  [...current.feishuApprovalAllowlist, input.ownerOpenId]
+                    .map((entry) => entry.trim())
+                    .filter((entry) => entry.length > 0),
+                ),
+              ),
+            }),
+          ),
+        ),
+      getFeishuBotCredentials: Effect.all([
+        Ref.get(currentSettingsRef),
+        Ref.get(feishuSecretRef),
+      ]).pipe(
+        Effect.map(
+          ([settings, secret]): FeishuBotCredentials =>
+            settings.feishuBinding === undefined || secret === undefined
+              ? { bound: false }
+              : {
+                  bound: true,
+                  appId: settings.feishuBinding.appId,
+                  appSecret: secret,
+                  tenant: settings.feishuBinding.tenant,
+                },
+        ),
+      ),
     } satisfies ServerSettingsService["Service"];
   });
 
@@ -556,6 +618,23 @@ const make = Effect.gen(function* () {
     yield* Deferred.succeed(startedDeferred, undefined).pipe(Effect.orDie);
   });
 
+  const updateSettings = (patch: ServerSettingsPatch) =>
+    writeSemaphore.withPermits(1)(
+      Effect.gen(function* () {
+        const current = yield* getSettingsFromCache;
+        const nextPersisted = yield* persistProviderEnvironmentSecrets(
+          current,
+          applyServerSettingsPatch(current, patch),
+        );
+        const next = yield* normalizeServerSettings(nextPersisted);
+        yield* writeSettingsAtomically(next);
+        yield* Cache.set(settingsCache, cacheKey, next);
+        yield* emitChange(next);
+        const materialized = yield* materializeProviderEnvironmentSecrets(next);
+        return resolveTextGenerationProvider(materialized);
+      }),
+    );
+
   return {
     start,
     ready: Deferred.await(startedDeferred),
@@ -563,22 +642,7 @@ const make = Effect.gen(function* () {
       Effect.flatMap(materializeProviderEnvironmentSecrets),
       Effect.map(resolveTextGenerationProvider),
     ),
-    updateSettings: (patch) =>
-      writeSemaphore.withPermits(1)(
-        Effect.gen(function* () {
-          const current = yield* getSettingsFromCache;
-          const nextPersisted = yield* persistProviderEnvironmentSecrets(
-            current,
-            applyServerSettingsPatch(current, patch),
-          );
-          const next = yield* normalizeServerSettings(nextPersisted);
-          yield* writeSettingsAtomically(next);
-          yield* Cache.set(settingsCache, cacheKey, next);
-          yield* emitChange(next);
-          const materialized = yield* materializeProviderEnvironmentSecrets(next);
-          return resolveTextGenerationProvider(materialized);
-        }),
-      ),
+    updateSettings,
     get streamChanges() {
       return Stream.fromPubSub(changesPubSub).pipe(
         Stream.mapEffect((settings) =>
@@ -596,6 +660,77 @@ const make = Effect.gen(function* () {
         Stream.map(resolveTextGenerationProvider),
       );
     },
+    persistFeishuBinding: (input) =>
+      Effect.gen(function* () {
+        // Secret goes to the secret store only — never to settings.json/logs.
+        yield* secretStore
+          .set(feishuSecretName(input.appId), textEncoder.encode(input.appSecret))
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new ServerSettingsError({
+                  settingsPath,
+                  operation: "write-secret",
+                  cause,
+                }),
+            ),
+          );
+
+        const current = yield* getSettingsFromCache;
+        const allowlist = Array.from(
+          new Set(
+            [...current.feishuApprovalAllowlist, input.ownerOpenId]
+              .map((entry) => entry.trim())
+              .filter((entry) => entry.length > 0),
+          ),
+        );
+
+        return yield* updateSettings({
+          feishuBinding: {
+            appId: input.appId,
+            tenant: input.tenant,
+            ownerOpenId: input.ownerOpenId,
+          },
+          feishuApprovalAllowlist: allowlist,
+        }).pipe(
+          // If the settings write fails after the secret was stored, roll the
+          // secret back so we never leave an orphaned appSecret behind.
+          Effect.catch((error) =>
+            secretStore.remove(feishuSecretName(input.appId)).pipe(
+              Effect.catch(() => Effect.void),
+              Effect.flatMap(() => Effect.fail(error)),
+            ),
+          ),
+        );
+      }),
+    getFeishuBotCredentials: getSettingsFromCache.pipe(
+      Effect.flatMap((settings): Effect.Effect<FeishuBotCredentials, ServerSettingsError> => {
+        const binding = settings.feishuBinding;
+        if (binding === undefined) {
+          return Effect.succeed({ bound: false });
+        }
+        return secretStore.get(feishuSecretName(binding.appId)).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ServerSettingsError({
+                settingsPath,
+                operation: "read-secret",
+                cause,
+              }),
+          ),
+          Effect.map((secret) =>
+            Option.isNone(secret)
+              ? { bound: false }
+              : {
+                  bound: true,
+                  appId: binding.appId,
+                  appSecret: textDecoder.decode(secret.value),
+                  tenant: binding.tenant,
+                },
+          ),
+        );
+      }),
+    ),
   } satisfies ServerSettingsService["Service"];
 });
 

@@ -277,23 +277,60 @@ function makeMutableServerSettingsService(
   return Effect.gen(function* () {
     const settingsRef = yield* Ref.make(initial);
     const changes = yield* PubSub.unbounded<ContractServerSettings>();
+    const feishuSecretRef = yield* Ref.make<string | undefined>(undefined);
+
+    const updateSettings = (
+      patch: Parameters<ServerSettingsModule.ServerSettingsService["Service"]["updateSettings"]>[0],
+    ) =>
+      Effect.gen(function* () {
+        const current = yield* Ref.get(settingsRef);
+        const next = applyServerSettingsPatch(current, patch);
+        encodeServerSettings(next);
+        yield* Ref.set(settingsRef, next);
+        yield* PubSub.publish(changes, next);
+        return next;
+      });
 
     return {
       start: Effect.void,
       ready: Effect.void,
       getSettings: Ref.get(settingsRef),
-      updateSettings: (patch) =>
-        Effect.gen(function* () {
-          const current = yield* Ref.get(settingsRef);
-          const next = applyServerSettingsPatch(current, patch);
-          encodeServerSettings(next);
-          yield* Ref.set(settingsRef, next);
-          yield* PubSub.publish(changes, next);
-          return next;
-        }),
+      updateSettings,
       get streamChanges() {
         return Stream.fromPubSub(changes);
       },
+      persistFeishuBinding: (input) =>
+        Ref.set(feishuSecretRef, input.appSecret).pipe(
+          Effect.andThen(Ref.get(settingsRef)),
+          Effect.flatMap((current) =>
+            updateSettings({
+              feishuBinding: {
+                appId: input.appId,
+                tenant: input.tenant,
+                ownerOpenId: input.ownerOpenId,
+              },
+              feishuApprovalAllowlist: Array.from(
+                new Set(
+                  [...current.feishuApprovalAllowlist, input.ownerOpenId]
+                    .map((entry) => entry.trim())
+                    .filter((entry) => entry.length > 0),
+                ),
+              ),
+            }),
+          ),
+        ),
+      getFeishuBotCredentials: Effect.all([Ref.get(settingsRef), Ref.get(feishuSecretRef)]).pipe(
+        Effect.map(([settings, secret]) =>
+          settings.feishuBinding === undefined || secret === undefined
+            ? ({ bound: false } as const)
+            : ({
+                bound: true,
+                appId: settings.feishuBinding.appId,
+                appSecret: secret,
+                tenant: settings.feishuBinding.tenant,
+              } as const),
+        ),
+      ),
     } satisfies ServerSettingsModule.ServerSettingsService["Service"];
   });
 }
