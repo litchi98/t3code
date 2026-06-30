@@ -52,8 +52,17 @@ export type FeishuTenant = "feishu" | "lark";
  * Long-connection credentials for the Feishu/Lark open platform. The bot uses
  * App ID + App Secret over a WebSocket transport (no scan-code, no user OAuth);
  * the SDK auto-exchanges these for a `tenant_access_token`.
+ *
+ * PR2 (bot-binding) makes these credentials *runtime-dynamic*: the normal source
+ * is the t3code server (web QR-scan binding → `feishuGetBotCredentials` RPC), not
+ * `.env`. So `appId`/`appSecret`/`tenant`/`domain` no longer live on
+ * {@link FeishuAppConfig} directly — they are folded into an optional
+ * {@link FeishuCredentialOverride}. A non-null override (both `FEISHU_APP_ID` and
+ * `FEISHU_APP_SECRET` present in `.env`/CLI) is a *dev escape hatch* that pins the
+ * bot to a fixed app and skips the server fetch; a null override means "fetch the
+ * bound bot's credentials from the server" (the standard path).
  */
-export interface FeishuAppConfig {
+export interface FeishuCredentialOverride {
   /** Open-platform app id (`cli_...`). From `FEISHU_APP_ID`. */
   readonly appId: string;
   /** Open-platform app secret. From `FEISHU_APP_SECRET`. */
@@ -66,6 +75,22 @@ export interface FeishuAppConfig {
    * straight to `createLarkChannel({ domain })`.
    */
   readonly domain: string;
+}
+
+/**
+ * Bot-own Feishu configuration: the optional credential override plus the two
+ * bot-side knobs (approval allowlist floor, group render density) that are NOT
+ * shared with the server and are always present (with sensible defaults).
+ */
+export interface FeishuAppConfig {
+  /**
+   * `.env`/CLI dev override for the bound bot's credentials, or `null` to fetch
+   * them from the server (the standard PR2 path). Non-null only when BOTH
+   * `FEISHU_APP_ID` and `FEISHU_APP_SECRET` are set; the `appSecret` here must be
+   * byte-identical to the bound app's secret so the cardAction HMAC key is the
+   * same on either path (no dev behaviour change).
+   */
+  readonly credentialOverride: FeishuCredentialOverride | null;
   /**
    * Bot-side approval allowlist for group/topic chats (M3a; N-of-1 in M4-1). From
    * `FEISHU_OWNER_OPEN_IDS` (comma-separated). Like `appId`, this is bot-own config
@@ -94,8 +119,13 @@ export interface FeishuAppConfig {
   readonly groupChatDensity: RenderDensity;
 }
 
-/** Map a {@link FeishuTenant} to its open-platform domain origin. */
-const DOMAIN_BY_TENANT: Readonly<Record<FeishuTenant, string>> = {
+/**
+ * Map a {@link FeishuTenant} to its open-platform domain origin. Exported so the
+ * bot can complete the server-fetched credentials (the
+ * `feishuGetBotCredentials` RPC carries `tenant` but not `domain`) the same way
+ * the env-override path does here.
+ */
+export const DOMAIN_BY_TENANT: Readonly<Record<FeishuTenant, string>> = {
   feishu: "https://open.feishu.cn",
   lark: "https://open.larksuite.com",
 };
@@ -204,10 +234,18 @@ export const loadConfig: Effect.Effect<FeishuBotConfig, FeishuBotConfigError> = 
 );
 
 /**
- * Resolve the Feishu/Lark app credentials from env/CLI. `appId`/`appSecret`
- * are required (no scan-code fallback in the headless bot); `tenant` defaults
- * to `feishu` and selects the open-platform domain. Missing/invalid values
- * yield a clear, actionable {@link FeishuBotConfigError}.
+ * Resolve the bot-own Feishu configuration from env/CLI.
+ *
+ * PR2 (bot-binding): `appId`/`appSecret` are NO LONGER required. The standard
+ * path leaves them unset and the bot fetches the bound bot's credentials from the
+ * server at runtime. A {@link FeishuCredentialOverride} is produced *only* when
+ * BOTH `FEISHU_APP_ID` and `FEISHU_APP_SECRET` are present (a dev escape hatch
+ * pinning a fixed app); otherwise the override is `null`. Exactly one of the two
+ * being set is treated as "no override" (fall through to the server) with a
+ * warning, so a typo never silently swaps which credentials are used without a
+ * trace — but it is non-fatal (no crash). `ownerOpenIds`/`groupChatDensity` are
+ * bot-own and always present (with defaults); an invalid `FEISHU_TENANT`/
+ * `FEISHU_GROUP_CHAT_DENSITY` is reported only when it actually feeds a value.
  */
 const resolveFeishuAppConfig = (
   env: Readonly<Record<string, string | undefined>>,
@@ -215,32 +253,37 @@ const resolveFeishuAppConfig = (
 ): Effect.Effect<FeishuAppConfig, FeishuBotConfigError> =>
   Effect.gen(function* () {
     const appId = resolveValue("FEISHU_APP_ID", env, args);
-    if (appId === undefined) {
-      return yield* new FeishuBotConfigError({
-        message:
-          "Missing Feishu app id. Set FEISHU_APP_ID (or pass --feishu-app-id <cli_...>) " +
-          "to your open-platform app's App ID.",
-      });
-    }
-
     const appSecret = resolveValue("FEISHU_APP_SECRET", env, args);
-    if (appSecret === undefined) {
-      return yield* new FeishuBotConfigError({
-        message:
-          "Missing Feishu app secret. Set FEISHU_APP_SECRET (or pass --feishu-app-secret <secret>) " +
-          "to your open-platform app's App Secret.",
-      });
-    }
 
-    const rawTenant = (resolveValue("FEISHU_TENANT", env, args) ?? "feishu").toLowerCase();
-    if (rawTenant !== "feishu" && rawTenant !== "lark") {
-      return yield* new FeishuBotConfigError({
-        message:
-          `Invalid FEISHU_TENANT "${rawTenant}". Expected "feishu" (open.feishu.cn) ` +
-          'or "lark" (open.larksuite.com).',
-      });
+    // Dev override only when BOTH app id and secret are present; otherwise null
+    // (standard PR2 path → fetch the bound bot's credentials from the server).
+    let credentialOverride: FeishuCredentialOverride | null = null;
+    if (appId !== undefined && appSecret !== undefined) {
+      const rawTenant = (resolveValue("FEISHU_TENANT", env, args) ?? "feishu").toLowerCase();
+      if (rawTenant !== "feishu" && rawTenant !== "lark") {
+        return yield* new FeishuBotConfigError({
+          message:
+            `Invalid FEISHU_TENANT "${rawTenant}". Expected "feishu" (open.feishu.cn) ` +
+            'or "lark" (open.larksuite.com).',
+        });
+      }
+      const tenant: FeishuTenant = rawTenant;
+      credentialOverride = {
+        appId,
+        appSecret,
+        tenant,
+        domain: DOMAIN_BY_TENANT[tenant],
+      };
+    } else if (appId !== undefined || appSecret !== undefined) {
+      // Half-configured override: warn (without echoing any value) and fall
+      // through to the server fetch rather than crashing.
+      yield* Effect.logWarning(
+        `[feishu-bot] Ignoring partial Feishu credential override: ` +
+          `${appId !== undefined ? "FEISHU_APP_ID" : "FEISHU_APP_SECRET"} is set but ` +
+          `${appId !== undefined ? "FEISHU_APP_SECRET" : "FEISHU_APP_ID"} is missing. ` +
+          "Set BOTH to pin a fixed app, or NEITHER to bind a bot via the web QR-scan flow.",
+      );
     }
-    const tenant: FeishuTenant = rawTenant;
 
     const ownerOpenIds = (resolveValue("FEISHU_OWNER_OPEN_IDS", env, args) ?? "")
       .split(",")
@@ -263,10 +306,7 @@ const resolveFeishuAppConfig = (
     }
 
     return {
-      appId,
-      appSecret,
-      tenant,
-      domain: DOMAIN_BY_TENANT[tenant],
+      credentialOverride,
       ownerOpenIds,
       groupChatDensity,
     } satisfies FeishuAppConfig;

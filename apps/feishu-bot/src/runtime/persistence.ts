@@ -523,7 +523,7 @@ export interface NonceRecord {
  * `CallbackAuth.verify` needs a *synchronous* view of nonce state (it returns a
  * plain result, no Effect), so the store exposes {@link probe}: a one-shot
  * effect yielding a stable {@link NonceProbe} that reads the live in-memory map.
- * `runBridge` yields it once at start-up and hands it to `CallbackAuth`; because
+ * `runBoundSession` yields it once at start-up and hands it to `CallbackAuth`; because
  * the underlying `Map` is mutated in place, the probe always reflects the latest
  * state without re-fetching.
  *

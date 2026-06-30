@@ -39,6 +39,7 @@ import {
   WS_METHODS,
 } from "@t3tools/contracts";
 import { resolveSelectableModel } from "@t3tools/shared/model";
+import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Console from "effect/Console";
 import * as Crypto from "effect/Crypto";
@@ -60,8 +61,14 @@ import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
+import * as SubscriptionRef from "effect/SubscriptionRef";
 
-import type { FeishuBotConfig } from "./config.ts";
+import {
+  DOMAIN_BY_TENANT,
+  type FeishuBotConfig,
+  type FeishuCredentialOverride,
+  type FeishuTenant,
+} from "./config.ts";
 import { resolveEnvironment, type ResolvedEnvironment } from "./auth.ts";
 import { connectionLayer } from "./runtime/connection.ts";
 import {
@@ -403,12 +410,25 @@ const topicSendOpts = (
 // ── Resident bridge core ─────────────────────────────────────────────────────
 
 /**
- * The resident core: connect to Feishu, then route every private-chat message
- * through the bridge (bind → dispatch/queue → observe → render → stream card),
- * looping forever. Runs inside the connection layer (so `EnvironmentRegistry` is
- * available) and the bot's own scope (so subscriptions/fibers tear down on exit).
+ * One bound session: connect to Feishu with the given credentials, then route
+ * every chat message through the bridge (bind → dispatch/queue → observe →
+ * render → stream card), parking on `Effect.never` so it lives as long as the
+ * binding does. PR2 makes this *per-binding*: it is built once per resolved
+ * credential set inside its own `Effect.scoped` sub-scope (see `program`), so a
+ * re-bind/unbind interrupts it (tearing the Lark socket + every forked fiber
+ * down) and the resident loop starts a fresh session with the new credentials.
+ *
+ * Runs inside the outer layer (so `EnvironmentRegistry` and the durable stores
+ * are available) and the per-binding `boundLayer` (Lark gateway + queues). The
+ * `creds` carry the resolved app id/secret/domain; `allowlistRef` is the shared
+ * approval allowlist owned by the resident loop (live-refreshed across bindings).
  */
-const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
+const runBoundSession = (
+  config: FeishuBotConfig,
+  resolved: ResolvedEnvironment,
+  creds: FeishuCredentialOverride,
+  allowlistRef: Ref.Ref<ReadonlyArray<string>>,
+) =>
   Effect.gen(function* () {
     const registry = yield* EnvironmentRegistry;
     const gateway = yield* LarkGateway;
@@ -439,12 +459,18 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     const bindings = yield* BindingState;
     const environmentId = resolved.target.environmentId;
 
-    // M2b-3: the bridge's own (root) scope, captured from `program`'s
-    // `Effect.scoped` wrapper. Resident observe fibers (the cross-end mirror of a
-    // takeover's running turn) are `forkIn(rootScope)`'d onto it so they live the
-    // whole bridge lifetime and are interrupted only when the bridge tears down —
-    // unless a stronger source (a new bridge-driven turn, `/release`, the watcher's
-    // reconciliation) interrupts them first via `stopObserve`.
+    // M2b-3: the bridge's own (root) scope. PR2: this is now the *per-binding*
+    // sub-scope — `program` wraps each `runBoundSession` in its own `Effect.scoped`,
+    // so `Effect.scope` here resolves to that session's scope, NOT the resident
+    // outer scope. Resident observe fibers (the cross-end mirror of a takeover's
+    // running turn) are `forkIn(rootScope)`'d onto it so they live the binding's
+    // lifetime and are interrupted when the binding tears down (re-bind/unbind
+    // closes this sub-scope, which also disconnects the Lark gateway provided into
+    // it) — unless a stronger source (a new bridge-driven turn, `/release`, the
+    // watcher's reconciliation) interrupts them first via `stopObserve`. Binding
+    // this scope per-session (not to the long-lived outer scope) is what prevents
+    // observe fibers from outliving — and holding a dead reference to — a
+    // disconnected gateway after a re-bind.
     const rootScope = yield* Effect.scope;
 
     yield* Console.log(`[feishu-bot] connected to ${resolved.target.label} (${environmentId}).`);
@@ -505,19 +531,18 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     // `(chat, thread, runtimeMode, operator, action)` context (policy
     // fingerprint) so a stale or cross-context click fails verification.
     const auth = new CallbackAuth({
-      keys: [{ version: 1, secret: config.feishu.appSecret }],
+      keys: [{ version: 1, secret: creds.appSecret }],
       nonces: nonceProbe,
     });
 
     // M3a/M4-1/M4-2: the approval allowlist for group/topic chats, read as an N-of
-    // allowlist (any listed member may approve), not a single-owner binding. Held in
-    // a Ref so the M4-2 live-refresh fiber (below) can fold in web-configured
-    // `ServerSettings.feishuApprovalAllowlist` at runtime: the effective allowlist is
-    // `env ∪ store`. Initialised to the env `FEISHU_OWNER_OPEN_IDS` floor — a
-    // fail-safe lower bound that is ALWAYS unioned in (the store can only ADD), so a
+    // allowlist (any listed member may approve), not a single-owner binding. PR2:
+    // the Ref is now owned by the resident loop and passed in, so its `env ∪ store`
+    // live-refresh (the M4-2 fiber, now hoisted to the OUTER scope) survives a
+    // re-bind — the durable allowlist is binding-independent. It is still seeded
+    // from the env `FEISHU_OWNER_OPEN_IDS` floor and the store can only ADD, so a
     // missing / failed refresh keeps the owner floor as last-known-good rather than
     // locking everyone out.
-    const allowlistRef = yield* Ref.make<ReadonlyArray<string>>(config.feishu.ownerOpenIds);
 
     // M4-1: the effective approval allowlist that gates a cardAction click, by
     // runtime mode. Only approval-gated chats consult the configured owners; a p2p
@@ -731,7 +756,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     // and would never deliver further frames. `followStream` replays a full
     // snapshot first and never fails (orDie'd), and `runShellCacheFiber` folds it
     // into the resident `ShellSnapshotCache` via the SAME shell reducer the
-    // web/mobile clients use. Forked on `runBridge`'s scope, so it tears down
+    // web/mobile clients use. Forked on `runBoundSession`'s scope, so it tears down
     // with the connection (same lifetime as the inbox/flush fibers below).
     const shellSubscription = registry
       .followStream(
@@ -741,70 +766,12 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
       .pipe(Stream.orDie);
     const shellCache = yield* runShellCacheFiber({ shellStream: shellSubscription });
 
-    // ── M4-2: live-refresh the approval allowlist from server settings ───────
-    //
-    // Fold web-configured `ServerSettings.feishuApprovalAllowlist` into
-    // `allowlistRef` as it changes. The effective allowlist is ALWAYS `env ∪ store`:
-    // the env `FEISHU_OWNER_OPEN_IDS` floor is an immovable lower bound (the store can
-    // only ADD), so a misconfigured / empty store can never lock the owner out. A
-    // failed refresh keeps last-known-good — the Ref is never cleared on error — and
-    // on WS reconnect the first `snapshot` event automatically replays the latest
-    // store value. Mirrors the bare-`orDie` forked-subscription idiom of
-    // `shellSubscription` (:735) / the inbox + flush fibers: `subscribeServerConfig`
-    // has built-in WS reconnect, so a transient transport drop pauses the stream
-    // (drained inside `subscribe`, never bubbles) without terminating this fiber, and
-    // the handler is pure computation that never throws, so a single event never
-    // fails the stream. `Stream.orDie` therefore fires only on a schema defect or an
-    // unhandled *typed* server failure (e.g. a `ServerSettingsError` while the
-    // reconnect snapshot reloads settings) — rare, and even then fail-safe: the Ref
-    // keeps last-known-good (env floor at minimum) so authz stays correct; only
-    // live-refresh halts until the next bot restart, exactly as for the reference
-    // fibers above. (Optional future hardening: pass `onExpectedFailure` +
-    // `retryExpectedFailureAfter` to self-heal from a transient typed failure.)
-    yield* registry
-      .followStream(environmentId, EnvironmentRpc.subscribe(WS_METHODS.subscribeServerConfig, {}))
-      .pipe(
-        Stream.orDie,
-        Stream.runForEach((event) =>
-          Effect.gen(function* () {
-            // ServerConfigStreamEvent union: `snapshot` carries `config.settings`,
-            // `settingsUpdated` carries `payload.settings`; `keybindingsUpdated` /
-            // `providerStatuses` carry no settings → ignore.
-            const rawStore =
-              event.type === "snapshot"
-                ? event.config.settings.feishuApprovalAllowlist
-                : event.type === "settingsUpdated"
-                  ? event.payload.settings.feishuApprovalAllowlist
-                  : null;
-            if (rawStore === null) {
-              return;
-            }
-            // Defence in depth: same trim + drop-blank as the env parse
-            // (config.ts:245-248), so a hand-edited settings.json can never inject
-            // blank ids. `feishuApprovalAllowlist` decodes to `string[]` (never
-            // optional) so no `?? []` is needed.
-            const storeIds = rawStore.map((s) => s.trim()).filter((s) => s.length > 0);
-            const envIds = config.feishu.ownerOpenIds; // immovable floor, always unioned first
-            const merged = [...new Set([...envIds, ...storeIds])];
-            const previous = yield* Ref.get(allowlistRef);
-            yield* Ref.set(allowlistRef, merged);
-            // ④ Audit: log only when the EFFECTIVE allowlist actually changed. An
-            // allowlist change is a global config change with no lark-thread context,
-            // so this is a plain structured info log — NOT the M3b larkThreadId audit.
-            const added = merged.filter((id) => !previous.includes(id));
-            const removed = previous.filter((id) => !merged.includes(id));
-            if (added.length > 0 || removed.length > 0) {
-              yield* Effect.logInfo("[feishu-bot] approval allowlist updated", {
-                added,
-                removed,
-                effective: merged.length,
-                source: event.type,
-              });
-            }
-          }),
-        ),
-        Effect.forkScoped,
-      );
+    // PR2: the M4-2 approval-allowlist live-refresh fiber is hoisted OUT of this
+    // per-binding session into the resident loop's OUTER scope (see
+    // `runApprovalAllowlistAndBindingFiber`). It must outlive any single binding —
+    // the durable `env ∪ store` allowlist is binding-independent — and it doubles
+    // as the binding-change watcher that drives re-bind. Here we only consume the
+    // shared `allowlistRef` it maintains.
 
     // Render the last few messages of a takeover snapshot into a compact
     // markdown transcript (M2b-2). One line per message: `🧑 …` (user) / `🤖 …`
@@ -3199,7 +3166,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
           // retries the subscription forever on an expected failure, so a thread
           // that was deleted/archived while the bot was down (or a server that never
           // delivers its first frame) would otherwise hang this read — and, since it
-          // runs synchronously on the main `runBridge` fiber before `Effect.never`,
+          // runs synchronously on the main `runBoundSession` fiber before `Effect.never`,
           // wedge startup. A `timeout` turns that into a `None` we skip past.
           const firstFrame = yield* Stream.runHead(
             subscribeThread(threadId).pipe(Stream.take(1)),
@@ -3302,7 +3269,7 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
             // follow-on #2 renders on the same card with verifiable buttons.
             //
             // `recoverApprovalCards` runs BEFORE `shellWatcher.start`, inside this same
-            // `runBridge` gen scope, so `ensureObserving` is callable here. Its own
+            // `runBoundSession` gen scope, so `ensureObserving` is callable here. Its own
             // gates apply: `isChatBusy` (turnQueue empty post-restart → false) lets it
             // through, and the atomic claim dedups per-chat (multiple bindings each get
             // their own observe, keyed by `chatId`). A null `activeTurnId` (turn already
@@ -3352,65 +3319,401 @@ const runBridge = (config: FeishuBotConfig, resolved: ResolvedEnvironment) =>
     return yield* Effect.never;
   });
 
+// ── PR2: runtime credential resolution + the resident re-bind loop ───────────
+
 /**
- * Top-level program: resolve the environment, build the resident bridge with the
- * connection + persistence + lark + queue layers, and run it forever. The whole
- * flow is wrapped in `Effect.scoped` so the connection (and every forked fiber)
- * tears down cleanly on exit. Auth failures are reported as actionable
- * one-liners before exiting; only genuinely unexpected defects die.
+ * The public identity of a bound bot — what changes on a re-bind (bind a new
+ * app, unbind, or swap tenant). Deliberately excludes `appSecret`: the secret is
+ * fetched on demand via the credentials RPC and never travels on the settings
+ * stream or this view (so a leak surface is one place, not two).
+ */
+interface BindingIdentity {
+  readonly appId: string;
+  readonly tenant: FeishuTenant;
+}
+
+/** Structural equality for {@link BindingIdentity} (null = unbound). */
+const bindingIdentityEq = (a: BindingIdentity | null, b: BindingIdentity | null): boolean =>
+  a === null || b === null ? a === b : a.appId === b.appId && a.tenant === b.tenant;
+
+/**
+ * Project the public `ServerSettings.feishuBinding` (or `undefined` = no bot
+ * bound) onto a {@link BindingIdentity}. Drops `ownerOpenId` — only app id +
+ * tenant decide whether the running session must be re-bound.
+ */
+const toBindingIdentity = (
+  binding: { readonly appId: string; readonly tenant: FeishuTenant } | undefined,
+): BindingIdentity | null =>
+  binding === undefined ? null : { appId: binding.appId, tenant: binding.tenant };
+
+/**
+ * The outcome of resolving the bot's credentials for one loop iteration: either a
+ * full credential set (from the `.env` dev override or the server fetch) or
+ * "unbound" (no bot bound yet, or the server was transiently unreachable — both
+ * collapse to a backoff-and-retry in the resident loop).
+ */
+type CredentialResolution =
+  | {
+      readonly _tag: "Resolved";
+      readonly creds: FeishuCredentialOverride;
+      readonly source: "env" | "rpc";
+    }
+  | { readonly _tag: "Unbound" };
+
+/**
+ * Internal marker that a per-binding session ended on a NON-interrupt cause
+ * (e.g. the orDie'd Lark `connect` defect, or any unexpected session defect). It
+ * never surfaces to the user: it exists only to feed `Effect.retry`'s typed
+ * failure channel so the session self-heals (rebuild scope+gateway) with backoff.
+ * An interrupt (a re-bind won by `raceFirst`) is NOT wrapped — it propagates
+ * directly, so the retry never swallows it and re-bind always wins. `effect-smol`
+ * has no `Effect.unsandbox`, so this typed-failure bridge replaces the
+ * sandbox/retry/unsandbox idiom.
+ */
+class FeishuSessionFailure extends Data.TaggedError("FeishuSessionFailure") {}
+
+/**
+ * Strip a known secret from a string (e.g. a stringified {@link Cause.Cause})
+ * before it is logged, so the secret-isolation red line holds even in the rare
+ * case the Lark SDK echoes the `appSecret` inside a connect/session error. A
+ * no-op when the secret is empty — a blank `replaceAll` would splice the marker
+ * between every character. The bound-session `creds.appSecret` is always present,
+ * so this only redacts; it never mangles.
+ */
+const redactSecret = (text: string, secret: string): string =>
+  secret.length > 0 ? text.replaceAll(secret, "***") : text;
+
+/**
+ * Per-session self-heal schedule: exponential from 1s, capped at 30s, recurring
+ * forever (mirrors apps/web's `exponential ∪ spaced` cap idiom — `either` takes
+ * the min delay). Used to rebuild the Lark gateway after a transient connect
+ * failure (the `gateway.connect` `orDie` defect) without crashing the loop.
+ */
+const SESSION_RETRY_SCHEDULE = Schedule.exponential(Duration.seconds(1)).pipe(
+  Schedule.either(Schedule.spaced(Duration.seconds(30))),
+);
+
+/**
+ * Safety re-check interval for the Unbound wait: even with no binding-change
+ * wakeup we re-acquire periodically, so a secret injected without a
+ * `feishuBinding` change (the split-injection e2e) — or a lost wakeup — recovers
+ * within this bound instead of parking forever.
+ */
+const UNBOUND_RECHECK_INTERVAL = Duration.seconds(30);
+
+/**
+ * Resolve the bound thread for a composite chat key from {@link BindingState},
+ * falling back to the deterministic `deriveThreadId` for a not-yet-bound chat.
+ * Hoisted out of `program` so each per-binding `turnQueueLayer` reuses the SAME
+ * lookup (its `BindingState` requirement is satisfied by the outer layer). See
+ * the M2a/M3a invariant note on `turnQueueLayer`.
+ */
+const threadIdForChatKey = (chatKey: string): Effect.Effect<ThreadId, never, BindingState> =>
+  BindingState.pipe(
+    Effect.flatMap((bindingState) => bindingState.get(chatKey)),
+    Effect.map((binding) => {
+      if (binding !== null) {
+        return binding.threadId;
+      }
+      const { chatId, larkThreadId } = splitChatKey(chatKey);
+      return deriveThreadId(chatId, larkThreadId);
+    }),
+  );
+
+/**
+ * Resolve the bot's Feishu credentials for one loop iteration (never fails).
+ *
+ * - `.env` dev override present → use it verbatim (`source: "env"`); the bot
+ *   never consults the server and never re-binds.
+ * - Otherwise fetch the bound bot's credentials from the server via the
+ *   `feishuGetBotCredentials` RPC. `{bound:false}` (no bot bound yet, or the
+ *   secret was lost) → Unbound. `{bound:true}` → assemble the full credential set,
+ *   deriving `domain` from `tenant` (the RPC carries `tenant`, not `domain`).
+ *
+ * A transient RPC failure (server briefly unreachable, reconnect snapshot
+ * reload) is caught and collapsed to Unbound so the resident loop backs off and
+ * retries — credential acquisition is total, matching the long-lived bot's
+ * "wait, don't crash" contract. The logged cause is a typed RPC error and
+ * structurally cannot carry the `appSecret` (that only rides a SUCCESS payload),
+ * so logging it leaks nothing.
+ */
+const acquireCredentials = (
+  config: FeishuBotConfig,
+  environmentId: EnvironmentId,
+): Effect.Effect<CredentialResolution, never, EnvironmentRegistry> =>
+  Effect.gen(function* () {
+    const override = config.feishu.credentialOverride;
+    if (override !== null) {
+      return { _tag: "Resolved", creds: override, source: "env" } as const;
+    }
+    const registry = yield* EnvironmentRegistry;
+    return yield* registry
+      .run(environmentId, EnvironmentRpc.request(WS_METHODS.feishuGetBotCredentials, {}))
+      .pipe(
+        Effect.map(
+          (result): CredentialResolution =>
+            result.bound
+              ? {
+                  _tag: "Resolved",
+                  creds: {
+                    appId: result.appId,
+                    appSecret: result.appSecret,
+                    tenant: result.tenant,
+                    domain: DOMAIN_BY_TENANT[result.tenant],
+                  },
+                  source: "rpc",
+                }
+              : { _tag: "Unbound" },
+        ),
+        Effect.catchCause((cause) =>
+          // Symmetric with the bound-session self-heal: let an interrupt (process
+          // shutdown) propagate verbatim instead of swallowing it into Unbound; any
+          // OTHER cause — a registry/transport defect or the two typed RPC errors —
+          // collapses to Unbound, preserving the never-fail contract (the resident
+          // loop then backs off and retries). The cause here is an RPC error and
+          // structurally cannot carry the `appSecret` (it only rides a SUCCESS
+          // payload), so no redaction is needed.
+          Cause.hasInterrupts(cause)
+            ? Effect.interrupt
+            : Effect.logWarning(
+                "[feishu-bot] could not fetch bot credentials from the server; will retry.",
+                cause,
+              ).pipe(Effect.as({ _tag: "Unbound" } as const)),
+        ),
+      );
+  });
+
+/**
+ * Outer (binding-independent) watcher over `subscribeServerConfig`, hoisted from
+ * the per-binding session (was the M4-2 fiber) so it survives every re-bind. It
+ * carries DOUBLE duty on each `snapshot` / `settingsUpdated` event:
+ *
+ *  1. **Approval allowlist live-refresh — FIRST and fail-safe.** Fold web-configured
+ *     `feishuApprovalAllowlist` into `allowlistRef` as `env ∪ store` (the env
+ *     `FEISHU_OWNER_OPEN_IDS` floor is immovable — the store can only ADD — so a
+ *     misconfigured/empty store can never lock the owner out). The Ref is never
+ *     cleared on error → last-known-good. This MUST stay ahead of (2) and must not
+ *     throw, preserving the M4-2 authz fail-safe.
+ *  2. **Binding view.** Publish the public binding identity (no secret) to
+ *     `bindingView` so the resident loop can re-bind on a change. `payload.settings`
+ *     is the FULL `ServerSettings` (not a delta), so `feishuBinding` always reflects
+ *     the current binding — an unrelated settings change re-publishes the SAME
+ *     identity, which `bindingIdentityEq` filters out (no spurious re-bind).
+ *
+ * `Stream.orDie` mirrors the other forked subscriptions: `subscribeServerConfig`
+ * self-heals transient WS drops, and the handler is pure computation that never
+ * throws, so `orDie` fires only on a schema defect / unhandled typed failure —
+ * rare, and even then fail-safe (the Ref keeps last-known-good). Forked onto the
+ * OUTER scope by the caller.
+ */
+const runAllowlistAndBindingWatcher = (
+  config: FeishuBotConfig,
+  environmentId: EnvironmentId,
+  allowlistRef: Ref.Ref<ReadonlyArray<string>>,
+  bindingView: SubscriptionRef.SubscriptionRef<BindingIdentity | null>,
+): Effect.Effect<void, never, EnvironmentRegistry> =>
+  Effect.gen(function* () {
+    const registry = yield* EnvironmentRegistry;
+    yield* registry
+      .followStream(environmentId, EnvironmentRpc.subscribe(WS_METHODS.subscribeServerConfig, {}))
+      .pipe(
+        Stream.orDie,
+        Stream.runForEach((event) =>
+          Effect.gen(function* () {
+            // ServerConfigStreamEvent union: `snapshot` carries the full
+            // `config.settings`, `settingsUpdated` the full `payload.settings`;
+            // `keybindingsUpdated` / `providerStatuses` carry no settings → ignore.
+            const settings =
+              event.type === "snapshot"
+                ? event.config.settings
+                : event.type === "settingsUpdated"
+                  ? event.payload.settings
+                  : null;
+            if (settings === null) {
+              return;
+            }
+            // (1) Approval allowlist — env ∪ store, FIRST and fail-safe.
+            // Defence in depth: same trim + drop-blank as the env parse, so a
+            // hand-edited settings.json can never inject blank ids.
+            const storeIds = settings.feishuApprovalAllowlist
+              .map((s) => s.trim())
+              .filter((s) => s.length > 0);
+            const envIds = config.feishu.ownerOpenIds; // immovable floor, unioned first
+            const merged = [...new Set([...envIds, ...storeIds])];
+            const previous = yield* Ref.get(allowlistRef);
+            yield* Ref.set(allowlistRef, merged);
+            const added = merged.filter((id) => !previous.includes(id));
+            const removed = previous.filter((id) => !merged.includes(id));
+            if (added.length > 0 || removed.length > 0) {
+              yield* Effect.logInfo("[feishu-bot] approval allowlist updated", {
+                added,
+                removed,
+                effective: merged.length,
+                source: event.type,
+              });
+            }
+            // (2) Binding view — drives re-bind. Pure extraction, never throws.
+            yield* SubscriptionRef.set(bindingView, toBindingIdentity(settings.feishuBinding));
+          }),
+        ),
+      );
+  });
+
+/**
+ * Top-level program: resolve the environment, build the long-lived OUTER layer
+ * (connection + durable stores + binding authority) once, then run the resident
+ * re-bind loop. The whole flow is wrapped in `Effect.scoped` so the connection
+ * (and the outer watcher fiber) tear down cleanly on exit; each per-binding
+ * session lives in its own nested `Effect.scoped` sub-scope so a re-bind/unbind
+ * tears just that session (Lark socket + its fibers) down. Auth failures are
+ * reported as actionable one-liners before exiting; only genuinely unexpected
+ * defects die.
  */
 export const program = (
   config: FeishuBotConfig,
 ): Effect.Effect<void, never, FileSystem.FileSystem | Path.Path> =>
   Effect.gen(function* () {
     const resolved = yield* resolveEnvironment(config);
+    const environmentId = resolved.target.environmentId;
 
-    // Lark gateway and the durable stores. `bindingStateLayer` is the in-memory
-    // binding authority the bridge + queue both read from; it requires the
+    // OUTER layer (long-lived, built once): the durable stores + the in-memory
+    // binding authority + the server connection. `bindingStateLayer` requires the
     // `ChatThreadMapStore` that `fileStoresLayer` provides, so `provideMerge` it
     // *with* the store set below it (the store is fed to it and both outputs are
-    // retained, so `ChatThreadMapStore` does not leak into the program's RIn).
-    const baseLayer = bindingStateLayer.pipe(
+    // retained, so `ChatThreadMapStore` does not leak into the program's RIn). The
+    // Lark gateway is NO LONGER here — it is per-binding (see `boundLayer` below).
+    const outerLayer = bindingStateLayer.pipe(
       Layer.provideMerge(
         Layer.mergeAll(
           connectionLayer({ target: resolved.target, accessToken: resolved.accessToken }),
           fileStoresLayer({ stateDir: config.stateDir }),
-          larkGatewayLayer(config.feishu),
         ),
       ),
     );
 
-    const queuesLayer = Layer.merge(
-      outboundQueueLayer,
-      // The queue needs the bound threadId to derive a merged dispatch's stable
-      // commandId. M2a: resolve it from `BindingState` so a `/resume` takeover
-      // (which points the chat at a non-derived thread, origin "resumed") gets the
-      // *right* threadId in its commandId triple — and so this lookup, `ensureThread`,
-      // and the `runTurn` dispatch all read the SAME authority with the SAME
-      // `deriveThreadId` fallback (the highest-priority M2a invariant). A
-      // not-yet-bound chat (brand-new / offline-buffered) falls back to the
-      // deterministic `deriveThreadId`, matching `ensureThread`'s own derivation.
-      // M3a: the queue keys its state (and this lookup) by the composite
-      // `chatId[:larkThreadId]` the bridge passes to `offer`/`onTurnComplete`, so a
-      // topic resolves its own thread. The binding is read under that composite key;
-      // the not-yet-bound fallback splits it back to `(chatId, larkThreadId)` and
-      // re-derives the SAME topic-aware thread id `ensureThread` derived (so the
-      // commandId's embedded threadId and the dispatch target stay identical).
-      turnQueueLayer((chatKey) =>
-        BindingState.pipe(
-          Effect.flatMap((bindingState) => bindingState.get(chatKey)),
-          Effect.map((binding) => {
-            if (binding !== null) {
-              return binding.threadId;
-            }
-            const { chatId, larkThreadId } = splitChatKey(chatKey);
-            return deriveThreadId(chatId, larkThreadId);
-          }),
-        ),
-      ),
-    ).pipe(Layer.provideMerge(baseLayer));
+    // Resident loop: maintain the binding-independent allowlist + binding view in
+    // the OUTER scope, then (re)build a per-binding session as the binding comes
+    // and goes. Provided the OUTER layer once and wrapped in `Effect.scoped`.
+    const resident = Effect.gen(function* () {
+      // Shared, binding-independent approval allowlist. Seeded from the env
+      // `FEISHU_OWNER_OPEN_IDS` floor; live-refreshed as `env ∪ store` by the outer
+      // watcher below and read by every per-binding session via `allowlistRef`.
+      const allowlistRef = yield* Ref.make<ReadonlyArray<string>>(config.feishu.ownerOpenIds);
+      // The current bound identity as seen in server settings (null = unbound).
+      // Drives re-bind; never carries the secret.
+      const bindingView = yield* SubscriptionRef.make<BindingIdentity | null>(null);
 
-    return yield* runBridge(config, resolved).pipe(Effect.provide(queuesLayer), Effect.scoped);
+      // Outer watcher: allowlist live-refresh + binding view. Forked onto the
+      // OUTER (resident) scope so it outlives every per-binding session.
+      yield* runAllowlistAndBindingWatcher(config, environmentId, allowlistRef, bindingView).pipe(
+        Effect.forkScoped,
+      );
+
+      // Re-bind loop. Each iteration: acquire credentials, then either wait for a
+      // binding (Unbound) or run one bound session until the binding changes.
+      return yield* Effect.gen(function* () {
+        const resolution = yield* acquireCredentials(config, environmentId);
+
+        if (resolution._tag === "Unbound") {
+          yield* Console.log("[feishu-bot] no bot credentials yet; waiting for a binding...");
+          // Wait for the NEXT binding change — `Stream.drop(1)` skips the replayed
+          // current value so we never tight-loop when a binding is present but its
+          // secret is still missing (RPC keeps returning `{bound:false}`). A fixed
+          // re-check interval is the safety net for a lost wakeup or a secret
+          // injected without a `feishuBinding` change. Whichever fires first → loop.
+          yield* Effect.raceFirst(
+            SubscriptionRef.changes(bindingView).pipe(
+              Stream.drop(1),
+              Stream.filter((id) => id !== null),
+              Stream.runHead,
+              Effect.asVoid,
+            ),
+            Effect.sleep(UNBOUND_RECHECK_INTERVAL),
+          );
+          return;
+        }
+
+        const creds = resolution.creds;
+        const sessionIdentity: BindingIdentity = { appId: creds.appId, tenant: creds.tenant };
+
+        // Per-binding layer: the Lark gateway (built from `creds`) plus the two
+        // queues. `provideMerge(larkGatewayLayer)` discharges the queues' gateway
+        // requirement and retains `LarkGateway`; the residual `SentCommandStore` /
+        // `BindingState` bubble up to the outer layer. The `turnQueue` threadId
+        // lookup is the shared `threadIdForChatKey` (its `BindingState` comes from
+        // the outer layer, captured at build time).
+        const boundLayer = Layer.merge(outboundQueueLayer, turnQueueLayer(threadIdForChatKey)).pipe(
+          Layer.provideMerge(larkGatewayLayer(creds)),
+        );
+
+        // The bound session in its OWN sub-scope (so `runBoundSession`'s
+        // `Effect.scope` is THIS scope and a re-bind interrupt tears it — gateway +
+        // forked fibers — down). Self-heal: any NON-interrupt cause (incl. the
+        // `gateway.connect` `orDie` defect) is logged and converted to a typed
+        // `FeishuSessionFailure`, which `retry` rebuilds the scope+gateway for with
+        // backoff (the infinite schedule means it never actually surfaces). An
+        // interrupt (raceFirst won by a binding change) is re-raised via
+        // `Effect.interrupt` — NOT a typed failure, so `retry` lets it through and
+        // re-bind always wins. Env-override credentials self-heal the same way.
+        const boundSession = Effect.scoped(
+          runBoundSession(config, resolved, creds, allowlistRef).pipe(Effect.provide(boundLayer)),
+        ).pipe(
+          Effect.catchCause((cause) =>
+            // Interrupt (re-bind won by raceFirst): re-interrupt so this fiber
+            // terminates and the winner proceeds. NOT a typed failure → `retry`
+            // never retries it. (Re-raising via `failCause` would leak the
+            // session's typed-error union back into the channel; a fresh
+            // `Effect.interrupt` is `Effect<never, never>` and equally terminal.)
+            Cause.hasInterrupts(cause)
+              ? Effect.interrupt
+              : // Stringify + redact the cause before logging: `creds.appSecret`
+                // is in scope here, so even if the Lark SDK ever echoes it inside a
+                // connect/session error, the secret-isolation red line holds. We log
+                // the redacted `Cause.pretty` text (not the raw cause object, which
+                // the structured logger could serialise verbatim) — non-secret
+                // debug detail is preserved.
+                Effect.logWarning(
+                  "[feishu-bot] feishu session ended unexpectedly; reconnecting with backoff... " +
+                    redactSecret(Cause.pretty(cause), creds.appSecret),
+                ).pipe(Effect.andThen(Effect.fail(new FeishuSessionFailure()))),
+          ),
+          Effect.retry(SESSION_RETRY_SCHEDULE),
+        );
+
+        if (resolution.source === "env") {
+          // Dev override: credentials are fixed → never re-bind; run (self-healing)
+          // until the process exits. `boundSession` never succeeds, so `return
+          // yield*` marks the definitive exit point.
+          return yield* boundSession;
+        } else {
+          // Server-fetched: run until the binding changes away from the creds we
+          // are running (`sessionIdentity`). `Stream.drop(1)` skips the REPLAYED
+          // current value so we only react to genuine FUTURE changes — without it,
+          // a startup race where the loop's RPC beats the watcher's first snapshot
+          // (so `bindingView` is still the seed `null`) would read that `null` as a
+          // change and tear the just-started session down spuriously. After the
+          // drop, the watcher's snapshot re-publishes the SAME identity, which
+          // `bindingIdentityEq` filters out; a real re-bind / unbind publishes a
+          // differing identity (or `null`) and wins the race. (The vanishingly rare
+          // case where the binding moved on between the RPC and this subscribe is
+          // re-synced by the next binding change — acceptable per the known-races
+          // note.)
+          yield* boundSession.pipe(
+            Effect.raceFirst(
+              SubscriptionRef.changes(bindingView).pipe(
+                Stream.drop(1),
+                Stream.filter((id) => !bindingIdentityEq(id, sessionIdentity)),
+                Stream.runHead,
+                Effect.asVoid,
+              ),
+            ),
+          );
+          yield* Console.log("[feishu-bot] bot binding changed; re-acquiring credentials...");
+        }
+      }).pipe(Effect.forever);
+    });
+
+    return yield* resident.pipe(Effect.provide(outerLayer), Effect.scoped);
   }).pipe(
     Effect.catchTags({
       EnvironmentRequestInvalidError: reportAuthFailure,
