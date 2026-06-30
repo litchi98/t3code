@@ -1,7 +1,7 @@
 /**
  * `@larksuite/channel` wiring for {@link LarkGateway} (M1).
  *
- * Constructs the `LarkChannel` from {@link FeishuAppConfig}, registers the SDK
+ * Constructs the `LarkChannel` from {@link FeishuCredentials}, registers the SDK
  * `on({ message, reconnecting, reconnected, error })` handlers and adapts them
  * onto the bridge's {@link BridgeHandlers}, and implements the outbound methods
  * (streaming card via `stream(...)`, reactions, resource download) by wrapping
@@ -14,7 +14,6 @@ import { createLarkChannel } from "@larksuite/channel";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
-import type { FeishuAppConfig } from "../config.ts";
 import { streamingCardInput } from "./card.ts";
 import {
   LarkGateway,
@@ -164,6 +163,20 @@ const normalizeInbound = (message: NormalizedMessage): InboundMessage => {
 };
 
 /**
+ * Just the open-platform credentials `createLarkChannel` needs to bring up the
+ * WebSocket: app id, app secret, and the tenant-derived domain. PR2 narrows the
+ * gateway layer's input to this triple (down from the whole bot Feishu config)
+ * so the credentials can be resolved at runtime — from the server's bot binding
+ * or the `.env` dev override — and passed in per binding without dragging the
+ * bot-own knobs (`ownerOpenIds`/`groupChatDensity`) through this layer.
+ */
+export interface FeishuCredentials {
+  readonly appId: string;
+  readonly appSecret: string;
+  readonly domain: string;
+}
+
+/**
  * Build the {@link LarkGateway} layer for the given Feishu app credentials.
  *
  * The channel is constructed eagerly (cheap, synchronous — no network), and a
@@ -171,7 +184,7 @@ const normalizeInbound = (message: NormalizedMessage): InboundMessage => {
  * the layer is released. `connect` registers the handlers and opens the socket;
  * the outbound methods wrap the SDK's Promise surface.
  */
-export const larkGatewayLayer = (config: FeishuAppConfig): Layer.Layer<LarkGateway> =>
+export const larkGatewayLayer = (config: FeishuCredentials): Layer.Layer<LarkGateway> =>
   Layer.effect(
     LarkGateway,
     Effect.gen(function* () {
