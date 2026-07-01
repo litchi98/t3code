@@ -70,6 +70,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
           cwd: Option.none(),
           devUrl: Option.none(),
           noBrowser: Option.none(),
+          feishuBotManaged: Option.none(),
           bootstrapFd: Option.none(),
           autoBootstrapProjectFromCwd: Option.none(),
           logWebSocketEvents: Option.none(),
@@ -112,6 +113,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
         staticDir: undefined,
         devUrl: new URL("http://127.0.0.1:5173"),
         noBrowser: true,
+        feishuBotManaged: false,
         startupPresentation: "browser",
         desktopBootstrapToken: undefined,
         autoBootstrapProjectFromCwd: false,
@@ -136,6 +138,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
           cwd: Option.none(),
           devUrl: Option.some(new URL("http://127.0.0.1:4173")),
           noBrowser: Option.some(true),
+          feishuBotManaged: Option.none(),
           bootstrapFd: Option.none(),
           autoBootstrapProjectFromCwd: Option.some(true),
           logWebSocketEvents: Option.some(true),
@@ -178,6 +181,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
         staticDir: undefined,
         devUrl: new URL("http://127.0.0.1:4173"),
         noBrowser: true,
+        feishuBotManaged: true,
         startupPresentation: "browser",
         desktopBootstrapToken: undefined,
         autoBootstrapProjectFromCwd: true,
@@ -210,6 +214,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
           cwd: Option.none(),
           devUrl: Option.some(new URL("http://127.0.0.1:4173")),
           noBrowser: Option.some(false),
+          feishuBotManaged: Option.none(),
           bootstrapFd: Option.none(),
           autoBootstrapProjectFromCwd: Option.some(false),
           logWebSocketEvents: Option.some(false),
@@ -247,6 +252,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
         staticDir: undefined,
         devUrl: new URL("http://127.0.0.1:4173"),
         noBrowser: false,
+        feishuBotManaged: true,
         startupPresentation: "browser",
         desktopBootstrapToken: "desktop-bootstrap-token",
         autoBootstrapProjectFromCwd: false,
@@ -285,6 +291,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
           cwd: Option.none(),
           devUrl: Option.none(),
           noBrowser: Option.none(),
+          feishuBotManaged: Option.none(),
           bootstrapFd: Option.none(),
           autoBootstrapProjectFromCwd: Option.none(),
           logWebSocketEvents: Option.none(),
@@ -321,6 +328,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
         staticDir: resolved.staticDir,
         devUrl: undefined,
         noBrowser: true,
+        feishuBotManaged: false,
         startupPresentation: "browser",
         desktopBootstrapToken: "desktop-token",
         autoBootstrapProjectFromCwd: false,
@@ -348,6 +356,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
           cwd: Option.some(customCwd),
           devUrl: Option.some(new URL("http://127.0.0.1:5173")),
           noBrowser: Option.none(),
+          feishuBotManaged: Option.none(),
           bootstrapFd: Option.none(),
           autoBootstrapProjectFromCwd: Option.none(),
           logWebSocketEvents: Option.none(),
@@ -407,6 +416,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
           cwd: Option.none(),
           devUrl: Option.some(new URL("http://127.0.0.1:4173")),
           noBrowser: Option.none(),
+          feishuBotManaged: Option.none(),
           bootstrapFd: Option.none(),
           autoBootstrapProjectFromCwd: Option.none(),
           logWebSocketEvents: Option.none(),
@@ -446,6 +456,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
         staticDir: undefined,
         devUrl: new URL("http://127.0.0.1:4173"),
         noBrowser: true,
+        feishuBotManaged: true,
         startupPresentation: "browser",
         desktopBootstrapToken: "desktop-token",
         autoBootstrapProjectFromCwd: true,
@@ -483,6 +494,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
           cwd: Option.none(),
           devUrl: Option.none(),
           noBrowser: Option.none(),
+          feishuBotManaged: Option.none(),
           bootstrapFd: Option.none(),
           autoBootstrapProjectFromCwd: Option.none(),
           logWebSocketEvents: Option.none(),
@@ -515,6 +527,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
         staticDir: resolved.staticDir,
         devUrl: undefined,
         noBrowser: true,
+        feishuBotManaged: false,
         startupPresentation: "browser",
         desktopBootstrapToken: undefined,
         autoBootstrapProjectFromCwd: false,
@@ -540,6 +553,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
           cwd: Option.none(),
           devUrl: Option.none(),
           noBrowser: Option.none(),
+          feishuBotManaged: Option.none(),
           bootstrapFd: Option.none(),
           autoBootstrapProjectFromCwd: Option.none(),
           logWebSocketEvents: Option.none(),
@@ -578,6 +592,7 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
         staticDir: resolved.staticDir,
         devUrl: undefined,
         noBrowser: true,
+        feishuBotManaged: true,
         startupPresentation: "headless",
         desktopBootstrapToken: undefined,
         autoBootstrapProjectFromCwd: false,
@@ -585,6 +600,115 @@ it.layer(NodeServices.layer)("cli config resolution", (it) => {
         tailscaleServeEnabled: false,
         tailscaleServePort: 443,
       });
+    }),
+  );
+
+  it.effect("resolves feishuBotManaged=false from env (the dev escape hatch)", () =>
+    Effect.gen(function* () {
+      const { join } = yield* Path.Path;
+      const baseDir = join(NodeOS.tmpdir(), "t3-cli-config-feishu-managed-env");
+      const resolved = yield* resolveServerConfig(
+        {
+          mode: Option.none(),
+          port: Option.some(3773),
+          host: Option.none(),
+          baseDir: Option.some(baseDir),
+          cwd: Option.none(),
+          devUrl: Option.none(),
+          noBrowser: Option.none(),
+          feishuBotManaged: Option.none(),
+          bootstrapFd: Option.none(),
+          autoBootstrapProjectFromCwd: Option.none(),
+          logWebSocketEvents: Option.none(),
+          tailscaleServeEnabled: Option.none(),
+          tailscaleServePort: Option.none(),
+        },
+        Option.none(),
+      ).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            ConfigProvider.layer(
+              ConfigProvider.fromEnv({ env: { T3CODE_FEISHU_BOT_MANAGED: "false" } }),
+            ),
+            NetService.layer,
+          ),
+        ),
+      );
+
+      assert.strictEqual(resolved.feishuBotManaged, false);
+    }),
+  );
+
+  it.effect("prefers an explicit feishuBotManaged CLI flag over env", () =>
+    Effect.gen(function* () {
+      const { join } = yield* Path.Path;
+      const baseDir = join(NodeOS.tmpdir(), "t3-cli-config-feishu-managed-flag");
+      const resolved = yield* resolveServerConfig(
+        {
+          mode: Option.none(),
+          port: Option.some(3773),
+          host: Option.none(),
+          baseDir: Option.some(baseDir),
+          cwd: Option.none(),
+          devUrl: Option.none(),
+          noBrowser: Option.none(),
+          feishuBotManaged: Option.some(false),
+          bootstrapFd: Option.none(),
+          autoBootstrapProjectFromCwd: Option.none(),
+          logWebSocketEvents: Option.none(),
+          tailscaleServeEnabled: Option.none(),
+          tailscaleServePort: Option.none(),
+        },
+        Option.none(),
+      ).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            ConfigProvider.layer(
+              ConfigProvider.fromEnv({ env: { T3CODE_FEISHU_BOT_MANAGED: "true" } }),
+            ),
+            NetService.layer,
+          ),
+        ),
+      );
+
+      assert.strictEqual(resolved.feishuBotManaged, false);
+    }),
+  );
+
+  it.effect("defaults feishuBotManaged on for web but off for desktop", () =>
+    Effect.gen(function* () {
+      const { join } = yield* Path.Path;
+      const resolveForMode = (mode: "web" | "desktop") =>
+        resolveServerConfig(
+          {
+            mode: Option.some(mode),
+            port: Option.some(3773),
+            host: Option.none(),
+            baseDir: Option.some(join(NodeOS.tmpdir(), `t3-cli-feishu-managed-default-${mode}`)),
+            cwd: Option.none(),
+            devUrl: Option.none(),
+            noBrowser: Option.none(),
+            feishuBotManaged: Option.none(),
+            bootstrapFd: Option.none(),
+            autoBootstrapProjectFromCwd: Option.none(),
+            logWebSocketEvents: Option.none(),
+            tailscaleServeEnabled: Option.none(),
+            tailscaleServePort: Option.none(),
+          },
+          Option.none(),
+        ).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} })),
+              NetService.layer,
+            ),
+          ),
+        );
+
+      // No flag/env/bootstrap → mode-aware fallback: on for web/CLI, off for the
+      // (source-less) desktop bundle so it never doom-spawns the bot entry.
+      assert.strictEqual((yield* resolveForMode("web")).feishuBotManaged, true);
+      assert.strictEqual((yield* resolveForMode("desktop")).feishuBotManaged, false);
     }),
   );
 });

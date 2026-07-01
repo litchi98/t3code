@@ -69,6 +69,13 @@ export class ServerConfig extends Context.Service<
     readonly staticDir: string | undefined;
     readonly devUrl: URL | undefined;
     readonly noBrowser: boolean;
+    /**
+     * When true (the global default), the server owns the feishu-bot child
+     * process lifecycle: it spawns/stops the bot based on whether a Feishu bot
+     * binding is present in settings. When false, the server never touches the
+     * bot — the dev escape hatch for running the bot by hand.
+     */
+    readonly feishuBotManaged: boolean;
     readonly startupPresentation: StartupPresentation;
     readonly desktopBootstrapToken: string | undefined;
     readonly autoBootstrapProjectFromCwd: boolean;
@@ -180,6 +187,7 @@ const makeTest = Effect.fn("ServerConfig.makeTest")(function* (
     staticDir: undefined,
     devUrl,
     noBrowser: false,
+    feishuBotManaged: false,
     startupPresentation: "browser",
   });
 });

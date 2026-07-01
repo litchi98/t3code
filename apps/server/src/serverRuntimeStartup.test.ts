@@ -1,5 +1,12 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { DEFAULT_MODEL, ProjectId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import {
+  DEFAULT_MODEL,
+  DEFAULT_SERVER_SETTINGS,
+  ProjectId,
+  ProviderInstanceId,
+  ServerSettings,
+  ThreadId,
+} from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
@@ -7,7 +14,9 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "./config.ts";
@@ -267,4 +276,124 @@ it.effect("resolveAutoBootstrapWelcomeTargets preserves typed UUID generation fa
     assert.strictEqual(error, uuidError);
     assert.deepStrictEqual(yield* Ref.get(dispatchCalls), []);
   }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+const decodeServerSettings = Schema.decodeSync(ServerSettings);
+const unboundSettings = DEFAULT_SERVER_SETTINGS;
+const boundSettings = (appId: string) =>
+  decodeServerSettings({ feishuBinding: { appId, tenant: "feishu", ownerOpenId: "ou_owner" } });
+
+/**
+ * Records every start/stop into a queue so tests block deterministically on the
+ * forked reconcile fiber (`Queue.take` waits for the action to be driven).
+ */
+const makeManagerStub = (events: Queue.Queue<string>) => ({
+  start: Queue.offer(events, "start").pipe(Effect.asVoid),
+  stop: () => Queue.offer(events, "stop").pipe(Effect.asVoid),
+});
+
+it("feishuBotShouldRun maps binding existence to desired-run (re-bind still runs)", () => {
+  assert.isTrue(ServerRuntimeStartup.feishuBotShouldRun(boundSettings("cli_a")));
+  assert.isTrue(ServerRuntimeStartup.feishuBotShouldRun(boundSettings("cli_b")));
+  assert.isFalse(ServerRuntimeStartup.feishuBotShouldRun(unboundSettings));
+});
+
+it.effect("reconcile restores a running bot when a binding is persisted on boot", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const events = yield* Queue.unbounded<string>();
+      yield* ServerRuntimeStartup.reconcileFeishuBotLifecycle({
+        feishuBotManaged: true,
+        manager: makeManagerStub(events),
+        serverSettings: {
+          getSettings: Effect.succeed(boundSettings("cli_boot")),
+          streamChanges: Stream.empty,
+        },
+      });
+      assert.equal(yield* Queue.take(events), "start");
+    }),
+  ),
+);
+
+it.effect("reconcile stops the bot when no binding is present on boot", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const events = yield* Queue.unbounded<string>();
+      yield* ServerRuntimeStartup.reconcileFeishuBotLifecycle({
+        feishuBotManaged: true,
+        manager: makeManagerStub(events),
+        serverSettings: {
+          getSettings: Effect.succeed(unboundSettings),
+          streamChanges: Stream.empty,
+        },
+      });
+      assert.equal(yield* Queue.take(events), "stop");
+    }),
+  ),
+);
+
+it.effect("reconcile drives start/stop from settings-change events in stream order", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const events = yield* Queue.unbounded<string>();
+      // `getSettings` never resolves so the seed cannot interleave; the forked
+      // subscription (established first) processes the re-bind then the unbind in
+      // order — proving a bound event → start and an unbind event → stop.
+      yield* Effect.forkScoped(
+        ServerRuntimeStartup.reconcileFeishuBotLifecycle({
+          feishuBotManaged: true,
+          manager: makeManagerStub(events),
+          serverSettings: {
+            getSettings: Effect.never,
+            streamChanges: Stream.fromIterable([boundSettings("cli_b"), unboundSettings]),
+          },
+        }),
+      );
+      assert.equal(yield* Queue.take(events), "start");
+      assert.equal(yield* Queue.take(events), "stop");
+    }),
+  ),
+);
+
+it.effect("reconcile keeps following changes after one reconcile fails", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const events = yield* Queue.unbounded<string>();
+      yield* Effect.forkScoped(
+        ServerRuntimeStartup.reconcileFeishuBotLifecycle({
+          feishuBotManaged: true,
+          manager: {
+            // The re-bind's start defects; the per-event catch must swallow it so
+            // the following unbind still drives stop — one bad event never tears
+            // down the stream.
+            start: Effect.die("start defect for one event"),
+            stop: () => Queue.offer(events, "stop").pipe(Effect.asVoid),
+          },
+          serverSettings: {
+            getSettings: Effect.never,
+            streamChanges: Stream.fromIterable([boundSettings("cli_b"), unboundSettings]),
+          },
+        }),
+      );
+      assert.equal(yield* Queue.take(events), "stop");
+    }),
+  ),
+);
+
+it.effect("reconcile skips lifecycle entirely when feishuBotManaged is false", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const events = yield* Queue.unbounded<string>();
+      yield* ServerRuntimeStartup.reconcileFeishuBotLifecycle({
+        feishuBotManaged: false,
+        manager: makeManagerStub(events),
+        // getSettings dies if the gate fails to short-circuit before reading it.
+        serverSettings: {
+          getSettings: Effect.die("getSettings must not run when feishuBotManaged=false"),
+          streamChanges: Stream.empty,
+        },
+      });
+      assert.equal(yield* Queue.size(events), 0);
+    }),
+  ),
 );

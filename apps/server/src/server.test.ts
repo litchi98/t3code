@@ -375,6 +375,7 @@ const buildAppUnderTest = (options?: {
       staticDir: undefined,
       devUrl,
       noBrowser: true,
+      feishuBotManaged: false,
       startupPresentation: "browser",
       desktopBootstrapToken: defaultDesktopBootstrapToken,
       autoBootstrapProjectFromCwd: false,

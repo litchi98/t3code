@@ -40,6 +40,7 @@ import * as PreviewManager from "./preview/Manager.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
 import * as ProcessRunner from "./processRunner.ts";
 import * as GitManager from "./git/GitManager.ts";
+import * as FeishuBotManager from "./feishu/FeishuBotManager.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import { OrchestrationReactorLive } from "./orchestration/Layers/OrchestrationReactor.ts";
@@ -327,15 +328,24 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   ),
 );
 
-const RuntimeDependenciesLive = RuntimeCoreDependenciesLive.pipe(
-  // Misc.
-  Layer.provideMerge(ProcessDiagnostics.layer),
-  Layer.provideMerge(ProcessResourceMonitor.layer),
-  Layer.provideMerge(TraceDiagnostics.layer),
-  Layer.provideMerge(AnalyticsService.layer),
-  Layer.provideMerge(ExternalLauncher.layer),
-  Layer.provideMerge(ServerLifecycleEvents.layer),
-  Layer.provide(NetService.layer),
+// `FeishuBotManager` is the server-side supervisor for the feishu-bot child
+// process. It consumes runtime deps (PairingGrantStore, ServerConfig,
+// ChildProcessSpawner, Path), so it sits on top of the rest of the runtime
+// dependency graph: `provideMerge` feeds those services into it and keeps it in
+// the exposed set for `ServerRuntimeStartup`'s reconcile fiber.
+const RuntimeDependenciesLive = FeishuBotManager.layer.pipe(
+  Layer.provideMerge(
+    RuntimeCoreDependenciesLive.pipe(
+      // Misc.
+      Layer.provideMerge(ProcessDiagnostics.layer),
+      Layer.provideMerge(ProcessResourceMonitor.layer),
+      Layer.provideMerge(TraceDiagnostics.layer),
+      Layer.provideMerge(AnalyticsService.layer),
+      Layer.provideMerge(ExternalLauncher.layer),
+      Layer.provideMerge(ServerLifecycleEvents.layer),
+      Layer.provide(NetService.layer),
+    ),
+  ),
 );
 
 const RuntimeServicesLive = ServerRuntimeStartup.layer.pipe(

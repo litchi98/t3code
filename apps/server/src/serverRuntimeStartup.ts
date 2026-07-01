@@ -5,6 +5,7 @@ import {
   type ModelSelection,
   ProjectId,
   ProviderInstanceId,
+  type ServerSettings as ServerSettingsValue,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Console from "effect/Console";
@@ -21,8 +22,10 @@ import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "./config.ts";
+import * as FeishuBotManager from "./feishu/FeishuBotManager.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
@@ -288,6 +291,78 @@ const runStartupPhase = <A, E, R>(phase: string, effect: Effect.Effect<A, E, R>)
     Effect.withSpan(`server.startup.${phase}`),
   );
 
+/**
+ * Desired-state map for the server-managed feishu-bot: a bound bot (a
+ * `feishuBinding` present in settings) should be running; an unbound bot should
+ * be stopped. Only the *existence* of the binding matters, so a re-bind (the
+ * `appId` changes but a binding is still present) stays "should run" — the
+ * idempotent `manager.start` is then a no-op and the process is never restarted
+ * (the bot re-fetches credentials via its own watcher). Single bot only:
+ * `feishuBinding` is one object, not a list.
+ */
+export const feishuBotShouldRun = (settings: Pick<ServerSettingsValue, "feishuBinding">): boolean =>
+  settings.feishuBinding !== undefined;
+
+/**
+ * Reconcile the feishu-bot lifecycle against settings: reflect the current
+ * `feishuBinding` presence into `manager.start` / `manager.stop`, then keep
+ * following settings changes forever (until the enclosing scope closes).
+ *
+ * `feishuBotManaged=false` is the dev escape hatch — the server never touches a
+ * hand-started bot, so this returns immediately without reading settings or
+ * calling the manager.
+ *
+ * Extracted (manager + settings passed in) so the settings→start/stop mapping,
+ * the toggle gate, and the resilience below are unit-testable without spawning a
+ * child process.
+ */
+export const reconcileFeishuBotLifecycle = (input: {
+  readonly feishuBotManaged: boolean;
+  readonly manager: Pick<FeishuBotManager.FeishuBotManager["Service"], "start" | "stop">;
+  readonly serverSettings: Pick<
+    ServerSettings.ServerSettingsService["Service"],
+    "getSettings" | "streamChanges"
+  >;
+}): Effect.Effect<void, never, Scope.Scope> =>
+  Effect.gen(function* () {
+    if (!input.feishuBotManaged) {
+      yield* Effect.logInfo(
+        "feishu-bot manager disabled (feishuBotManaged=false); skipping server-managed lifecycle",
+      );
+      return;
+    }
+
+    // Per-event error handling: a single reconcile's failure (or defect) is
+    // logged and swallowed so one bad change never tears down the subscription
+    // — bind/unbind must keep driving start/stop. Mirrors the ServerSettings
+    // watcher in ProviderInstanceRegistry (catchCause, not catch).
+    const reconcile = (settings: ServerSettingsValue): Effect.Effect<void> =>
+      (feishuBotShouldRun(settings) ? input.manager.start : input.manager.stop()).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("feishu-bot reconcile failed for a settings change", { cause }),
+        ),
+      );
+
+    // Subscribe FIRST, then seed. `streamChanges` is a no-replay PubSub, so a
+    // change published between reading the seed and subscribing would be *lost*
+    // (dropped, not merely duplicated — idempotency cannot recover a missed
+    // event), leaving the bot out of sync with the on-disk binding until the
+    // next unrelated change. Establishing the subscription before the seed read
+    // closes that window; each event carries a full settings snapshot and
+    // `reconcile` is idempotent, so the seed and any early events converge.
+    yield* Effect.forkScoped(Stream.runForEach(input.serverSettings.streamChanges, reconcile));
+
+    // Seed from the current on-disk value (restore a persisted binding on boot).
+    // A one-off read/reconcile failure is logged, not fatal: the subscription
+    // above stays live so later bind/unbind changes still drive start/stop.
+    yield* input.serverSettings.getSettings.pipe(
+      Effect.flatMap(reconcile),
+      Effect.catchCause((cause) =>
+        Effect.logWarning("feishu-bot boot reconcile failed", { cause }),
+      ),
+    );
+  });
+
 export const make = Effect.gen(function* () {
   const serverConfig = yield* ServerConfig.ServerConfig;
   const keybindings = yield* Keybindings.Keybindings;
@@ -335,6 +410,24 @@ export const make = Effect.gen(function* () {
         ),
         Effect.forkScoped,
       ),
+    );
+
+    yield* Effect.logDebug("startup phase: reconciling feishu-bot lifecycle");
+    yield* runStartupPhase(
+      "feishu-bot.reconcile",
+      Effect.gen(function* () {
+        // Acquire the (always-built) supervisor; the toggle gate inside
+        // `reconcileFeishuBotLifecycle` decides whether we ever call start/stop,
+        // so a disabled server never touches a hand-started bot. Reconcile owns
+        // its own per-event/boot error handling (see there), so no outer catch is
+        // needed — forkScoped just keeps the seed off the startup critical path.
+        const feishuBotManager = yield* FeishuBotManager.FeishuBotManager;
+        yield* reconcileFeishuBotLifecycle({
+          feishuBotManaged: serverConfig.feishuBotManaged,
+          manager: feishuBotManager,
+          serverSettings,
+        });
+      }).pipe(Effect.forkScoped),
     );
 
     yield* Effect.logDebug("startup phase: starting orchestration reactors");
