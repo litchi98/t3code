@@ -42,6 +42,12 @@ export default mergeConfig(
         js: "#!/usr/bin/env node\n",
       },
       define: {
+        // Compile-time marker: `true` only inside this packed bundle. The server
+        // reads it (via a `typeof` guard, so dev source sees `undefined` not a
+        // ReferenceError) to spawn the bot's production `dist/main.mjs` instead
+        // of its `.ts` source. See `src/feishu/FeishuBotManager.ts`
+        // (`isPackedBuild`).
+        __T3_PACKED__: JSON.stringify(true),
         __T3CODE_BUILD_RELAY_URL__: JSON.stringify(repoEnv.T3CODE_RELAY_URL?.trim() ?? ""),
         __T3CODE_BUILD_CLERK_PUBLISHABLE_KEY__: JSON.stringify(
           repoEnv.T3CODE_CLERK_PUBLISHABLE_KEY?.trim() ?? "",

@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "node --watch src/main.ts",
+    "build:bundle": "vp pack",
     "typecheck": "tsgo --noEmit",
     "test": "vp test run --passWithNoTests"
   },
