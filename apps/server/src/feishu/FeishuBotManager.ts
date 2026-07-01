@@ -47,6 +47,7 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
@@ -77,11 +78,67 @@ const FEISHU_BOT_TOKEN_SUBJECT = "feishu-bot";
 /** State subdirectory handed to the bot under the server's state dir. */
 const FEISHU_BOT_STATE_SUBDIR = "feishu-bot";
 /**
- * Path from this module to the bot entry, resolved at runtime. dev runs the
- * `.ts` source directly via Node's native type-stripping (`node <abs .ts>`,
- * no loader flag). Production bundling is a separate milestone.
+ * True only inside the packed production bundle. `vp pack` string-replaces this
+ * via `pack.define` (apps/server/vite.config.ts) with the literal `true`. When
+ * the server runs from `.ts` source (dev / `node src/bin.ts serve`) the
+ * identifier is never declared, so the `typeof` guard below evaluates to `false`
+ * without a `ReferenceError` — hence we never reference `__T3_PACKED__` bare.
  */
-const BOT_ENTRY_RELATIVE_PATH = "../../../feishu-bot/src/main.ts";
+declare const __T3_PACKED__: boolean | undefined;
+const isPackedBuild = (): boolean => typeof __T3_PACKED__ !== "undefined" && __T3_PACKED__ === true;
+
+/**
+ * Relative paths from this module to the bot entry, resolved at runtime. The
+ * `../` depth is tied to WHERE this module runs from, which differs by form:
+ *
+ * dev: runs from source at `apps/server/src/feishu/` — three levels up to
+ * `apps/`, then into the bot's `.ts` source (Node's native type-stripping runs
+ * it directly, `node <abs .ts>`, no loader flag).
+ *
+ * prod: `vp pack` flattens the server to a single file `apps/server/dist/bin.mjs`
+ * (FeishuBotManager is inlined), so this module's dir is `apps/server/dist` —
+ * only *two* levels up to `apps/`. The prod bundle is `dist/main.mjs`; the prod
+ * *source* fallback (used when that bundle is missing) targets the bot's `.ts`
+ * source but MUST also resolve from the `dist` dir, so it is likewise two levels
+ * up — NOT the dev constant, whose three levels only hold from the dev dir
+ * (using it while packed resolves one level too high and spawns a missing path).
+ * The three constants deliberately use different `../` depths / targets; do not
+ * collapse them.
+ */
+const BOT_ENTRY_RELATIVE_PATH_DEV = "../../../feishu-bot/src/main.ts";
+const BOT_ENTRY_RELATIVE_PATH_PROD = "../../feishu-bot/dist/main.mjs";
+const BOT_ENTRY_RELATIVE_PATH_PROD_SOURCE = "../../feishu-bot/src/main.ts";
+
+/**
+ * Choose the bot entry for one spawn. Pure (existence is passed in) so the
+ * dev/prod branch and the missing-bundle fallback are unit-testable without fs.
+ *
+ * A prod build whose `dist/main.mjs` is missing (production server, but the bot
+ * was never built) degrades to the prod *source* entry + a warning rather than
+ * spawning a non-existent path in a crash-backoff loop — mirroring the
+ * server-managed milestone's "no doomed spawn" rule. The fallback uses
+ * `prodSourceEntryPath` (source resolved from the prod `dist` dir), NOT
+ * `devEntryPath` (source resolved from the dev dir): both name the bot's `.ts`
+ * source, but only the prod-dir-relative one resolves correctly while packed.
+ * The existence check only ever *downgrades* a prod build; it never upgrades dev
+ * (a stale `dist/` must not hijack a dev run, so dev returns its own source
+ * without consulting `prodEntryExists`).
+ */
+export const chooseBotEntry = (input: {
+  readonly packed: boolean;
+  readonly devEntryPath: string;
+  readonly prodEntryPath: string;
+  readonly prodSourceEntryPath: string;
+  readonly prodEntryExists: boolean;
+}): { readonly entryPath: string; readonly usedSourceFallback: boolean } => {
+  if (!input.packed) {
+    return { entryPath: input.devEntryPath, usedSourceFallback: false };
+  }
+  if (input.prodEntryExists) {
+    return { entryPath: input.prodEntryPath, usedSourceFallback: false };
+  }
+  return { entryPath: input.prodSourceEntryPath, usedSourceFallback: true };
+};
 
 /**
  * Every environment variable the bot reads as *configuration* that we are NOT
@@ -203,6 +260,9 @@ const logInfo = (message: string, data?: Record<string, unknown>) =>
 
 const logError = (message: string, data?: Record<string, unknown>) =>
   Effect.logError(message, data).pipe(Effect.annotateLogs({ component: LOG_COMPONENT }));
+
+const logWarning = (message: string, data?: Record<string, unknown>) =>
+  Effect.logWarning(message, data).pipe(Effect.annotateLogs({ component: LOG_COMPONENT }));
 
 interface BotProcessExit {
   readonly code: Option.Option<number>;
@@ -366,6 +426,7 @@ const runBotProcess = Effect.fn("feishu.botManager.runBotProcess")(function* (
 export const make = Effect.gen(function* () {
   const parentScope = yield* Scope.Scope;
   const path = yield* Path.Path;
+  const fs = yield* FileSystem.FileSystem;
   const serverConfig = yield* ServerConfig.ServerConfig;
   const pairingGrants = yield* PairingGrantStore.PairingGrantStore;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -376,9 +437,46 @@ export const make = Effect.gen(function* () {
 
   // The bot entry + its package dir. The entry is absolute, so cwd does not
   // affect module resolution; we point cwd at the bot package for cleanliness.
+  // dev spawns the `.ts` source; a packed production server spawns the bot's own
+  // `dist/main.mjs` bundle, degrading to source if that bundle is missing.
   const executablePath = process.execPath;
-  const entryPath = path.resolve(import.meta.dirname, BOT_ENTRY_RELATIVE_PATH);
-  const cwd = path.dirname(path.dirname(entryPath));
+  const packed = isPackedBuild();
+  const devEntryPath = path.resolve(import.meta.dirname, BOT_ENTRY_RELATIVE_PATH_DEV);
+  const prodEntryPath = path.resolve(import.meta.dirname, BOT_ENTRY_RELATIVE_PATH_PROD);
+  const prodSourceEntryPath = path.resolve(
+    import.meta.dirname,
+    BOT_ENTRY_RELATIVE_PATH_PROD_SOURCE,
+  );
+
+  // Resolve the entry per (re)spawn — NOT once at construction. A prod build
+  // re-probes `dist/main.mjs` on every launch, so a bundle removed at runtime
+  // degrades the *next* restart to the source entry instead of looping forever
+  // on a vanished path (the "no doomed spawn" red line). dev short-circuits to
+  // the source entry without touching the filesystem; a failed probe counts as
+  // "missing" so we degrade to source rather than spawn a maybe-absent bundle.
+  const resolveBotEntry = Effect.gen(function* () {
+    const prodEntryExists = packed
+      ? yield* fs.exists(prodEntryPath).pipe(Effect.orElseSucceed(() => false))
+      : false;
+    const entry = chooseBotEntry({
+      packed,
+      devEntryPath,
+      prodEntryPath,
+      prodSourceEntryPath,
+      prodEntryExists,
+    });
+    if (entry.usedSourceFallback) {
+      yield* logWarning(
+        "feishu-bot production bundle missing; falling back to the .ts source entry. " +
+          "Build it with `pnpm --filter @t3tools/feishu-bot run build:bundle`.",
+        { expected: prodEntryPath },
+      );
+    }
+    return {
+      entryPath: entry.entryPath,
+      cwd: path.dirname(path.dirname(entry.entryPath)),
+    };
+  });
 
   // Static child-env pieces (the per-spawn one-time token is added at spawn time).
   // Loopback + serverConfig.port is the local server the bot bootstraps against
@@ -518,6 +616,10 @@ export const make = Effect.gen(function* () {
         }),
       );
     });
+
+    // Re-resolve the entry for THIS launch so a bundle deleted at runtime
+    // degrades to source on the next restart instead of looping on a gone path.
+    const { entryPath, cwd } = yield* resolveBotEntry;
 
     const program = runBotProcess({
       executablePath,

@@ -635,4 +635,51 @@ describe("FeishuBotManager", () => {
     assert.equal(merged.T3_WORKSPACE_ROOT, "/srv/project");
     assert.equal(merged.PATH, "/usr/bin");
   });
+
+  it("chooseBotEntry: dev→dev entry, prod→bundle, prod-missing→prod-source fallback (not the dev path)", () => {
+    // Distinct sentinels for the two source paths: in a real run both resolve to
+    // the same src/main.ts, but from DIFFERENT dirs (dev dir vs the packed dist
+    // dir), so the constants carry different `../` depths. Keeping them distinct
+    // here proves the packed fallback returns the prod-dir-relative source, never
+    // the dev one — the layout bug that spawned a missing path and looped.
+    const devEntryPath = "/dev-frame/feishu-bot/src/main.ts";
+    const prodEntryPath = "/prod-frame/feishu-bot/dist/main.mjs";
+    const prodSourceEntryPath = "/prod-frame/feishu-bot/src/main.ts";
+
+    // dev (unpacked): always the dev source — never a prod path, even if a stale dist exists.
+    assert.deepStrictEqual(
+      FeishuBotManager.chooseBotEntry({
+        packed: false,
+        devEntryPath,
+        prodEntryPath,
+        prodSourceEntryPath,
+        prodEntryExists: true,
+      }),
+      { entryPath: devEntryPath, usedSourceFallback: false },
+    );
+
+    // prod build with its bundle present: spawn the bundle.
+    assert.deepStrictEqual(
+      FeishuBotManager.chooseBotEntry({
+        packed: true,
+        devEntryPath,
+        prodEntryPath,
+        prodSourceEntryPath,
+        prodEntryExists: true,
+      }),
+      { entryPath: prodEntryPath, usedSourceFallback: false },
+    );
+
+    // prod build but bundle missing: degrade to the PROD source, flag the fallback.
+    const fallback = FeishuBotManager.chooseBotEntry({
+      packed: true,
+      devEntryPath,
+      prodEntryPath,
+      prodSourceEntryPath,
+      prodEntryExists: false,
+    });
+    assert.deepStrictEqual(fallback, { entryPath: prodSourceEntryPath, usedSourceFallback: true });
+    // Guards the layout bug: fallback must NOT be the dev-dir source path.
+    assert.notEqual(fallback.entryPath, devEntryPath);
+  });
 });
