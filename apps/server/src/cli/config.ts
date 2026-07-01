@@ -43,6 +43,12 @@ export const noBrowserFlag = Flag.boolean("no-browser").pipe(
   Flag.withDescription("Disable automatic browser opening."),
   Flag.optional,
 );
+export const feishuBotManagedFlag = Flag.boolean("feishu-bot-managed").pipe(
+  Flag.withDescription(
+    "Let the server own the feishu-bot child process lifecycle (spawn/stop it based on the bound Feishu app). Defaults to on; disable to run the bot by hand.",
+  ),
+  Flag.optional,
+);
 export const bootstrapFdFlag = Flag.integer("bootstrap-fd").pipe(
   Flag.withSchema(Schema.Int),
   Flag.withDescription("Read one-time bootstrap secrets from the given file descriptor."),
@@ -108,6 +114,10 @@ const EnvServerConfig = Config.all({
     Config.option,
     Config.map(Option.getOrUndefined),
   ),
+  feishuBotManaged: Config.boolean("T3CODE_FEISHU_BOT_MANAGED").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
   bootstrapFd: Config.int("T3CODE_BOOTSTRAP_FD").pipe(
     Config.option,
     Config.map(Option.getOrUndefined),
@@ -138,6 +148,7 @@ export interface CliServerFlags {
   readonly cwd: Option.Option<string>;
   readonly devUrl: Option.Option<URL>;
   readonly noBrowser: Option.Option<boolean>;
+  readonly feishuBotManaged: Option.Option<boolean>;
   readonly bootstrapFd: Option.Option<number>;
   readonly autoBootstrapProjectFromCwd: Option.Option<boolean>;
   readonly logWebSocketEvents: Option.Option<boolean>;
@@ -172,6 +183,7 @@ export const sharedServerCommandFlags = {
   ),
   devUrl: devUrlFlag,
   noBrowser: noBrowserFlag,
+  feishuBotManaged: feishuBotManagedFlag,
   bootstrapFd: bootstrapFdFlag,
   autoBootstrapProjectFromCwd: autoBootstrapProjectFromCwdFlag,
   logWebSocketEvents: logWebSocketEventsFlag,
@@ -217,6 +229,7 @@ export const resolveServerConfig = (
       cwd: flags.cwd ?? Option.none(),
       devUrl: flags.devUrl ?? Option.none(),
       noBrowser: flags.noBrowser ?? Option.none(),
+      feishuBotManaged: flags.feishuBotManaged ?? Option.none(),
       bootstrapFd: flags.bootstrapFd ?? Option.none(),
       autoBootstrapProjectFromCwd: flags.autoBootstrapProjectFromCwd ?? Option.none(),
       logWebSocketEvents: flags.logWebSocketEvents ?? Option.none(),
@@ -289,6 +302,21 @@ export const resolveServerConfig = (
       ),
       () => mode === "desktop",
     );
+    // Default on for web/CLI servers (the dev + headless loop this milestone
+    // targets), off for `desktop`: desktop packages ship `apps/server/dist`
+    // without the feishu-bot `.ts` source, so a managed spawn of the source
+    // entry would fail readiness and thrash the restart backoff forever. The
+    // desktop three-process tree is a later milestone; until then it must not
+    // auto-adopt the bot. A flag/env/bootstrap can still opt in/out explicitly.
+    // Mode-aware fallback mirrors `noBrowser`'s `() => mode === "desktop"`.
+    const feishuBotManaged = Option.getOrElse(
+      resolveOptionPrecedence(
+        normalizedFlags.feishuBotManaged,
+        Option.fromUndefinedOr(env.feishuBotManaged),
+        Option.fromUndefinedOr(bootstrap?.feishuBotManaged),
+      ),
+      () => mode !== "desktop",
+    );
     const desktopBootstrapToken = bootstrap?.desktopBootstrapToken;
     const autoBootstrapProjectFromCwd = Option.getOrElse(
       resolveOptionPrecedence(
@@ -360,6 +388,7 @@ export const resolveServerConfig = (
       staticDir,
       devUrl,
       noBrowser,
+      feishuBotManaged,
       startupPresentation,
       desktopBootstrapToken,
       autoBootstrapProjectFromCwd,
@@ -384,6 +413,7 @@ export const resolveCliAuthConfig = (
       cwd: Option.none(),
       devUrl: flags.devUrl ?? Option.none(),
       noBrowser: Option.none(),
+      feishuBotManaged: Option.none(),
       bootstrapFd: Option.none(),
       autoBootstrapProjectFromCwd: Option.none(),
       logWebSocketEvents: Option.none(),
