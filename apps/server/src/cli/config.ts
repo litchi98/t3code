@@ -302,13 +302,19 @@ export const resolveServerConfig = (
       ),
       () => mode === "desktop",
     );
-    // Default on for web/CLI servers (the dev + headless loop this milestone
-    // targets), off for `desktop`: desktop packages ship `apps/server/dist`
-    // without the feishu-bot `.ts` source, so a managed spawn of the source
-    // entry would fail readiness and thrash the restart backoff forever. The
-    // desktop three-process tree is a later milestone; until then it must not
-    // auto-adopt the bot. A flag/env/bootstrap can still opt in/out explicitly.
-    // Mode-aware fallback mirrors `noBrowser`'s `() => mode === "desktop"`.
+    // Default on for web/CLI servers, off for `desktop`. The desktop three-tier
+    // process tree (electron → server → bot) and the packaged bot bundle now
+    // exist — build-desktop-artifact stages `apps/feishu-bot/dist` and
+    // FeishuBotManager resolves the electron-as-node prod entry — so the original
+    // doomed-spawn reason (server dist shipped without the bot) is gone. It stays
+    // off pending desktop workspace semantics: a desktop server has cwd=home and
+    // no auto-bootstrapped project, so a spawned bot would create an isolated
+    // project at the home dir instead of tracking the project the user opens in
+    // the GUI — the "shared session" goal would not hold. Enabling by default +
+    // workspace-follow is a later milestone. A flag/env/bootstrap can still opt in
+    // explicitly (e.g. to exercise the tree in e2e).
+    // Mode-aware fallback — the inverse of `noBrowser`'s `() => mode === "desktop"`:
+    // feishuBotManaged defaults on everywhere EXCEPT desktop.
     const feishuBotManaged = Option.getOrElse(
       resolveOptionPrecedence(
         normalizedFlags.feishuBotManaged,

@@ -598,6 +598,7 @@ describe("FeishuBotManager", () => {
       httpBaseUrl: "http://127.0.0.1:9999",
       stateDir: "/state/feishu-bot",
       workspaceRoot: "/srv/project",
+      electronRunAsNode: false,
     });
 
     assert.equal(env.T3_PAIRING_TOKEN, "the-token");
@@ -634,6 +635,33 @@ describe("FeishuBotManager", () => {
     assert.isUndefined(merged.FEISHU_APP_SECRET);
     assert.equal(merged.T3_WORKSPACE_ROOT, "/srv/project");
     assert.equal(merged.PATH, "/usr/bin");
+
+    // Headless (node) server: the electron-as-node key is omitted entirely — not
+    // set to undefined — so it never scrubs an inherited value.
+    assert.isFalse("ELECTRON_RUN_AS_NODE" in env);
+  });
+
+  it("buildChildEnv sets ELECTRON_RUN_AS_NODE only for the desktop electron-as-node tree", () => {
+    const env = FeishuBotManager.buildChildEnv({
+      credential: "the-token",
+      httpBaseUrl: "http://127.0.0.1:9999",
+      stateDir: "/state/feishu-bot",
+      workspaceRoot: "/srv/project",
+      electronRunAsNode: true,
+    });
+
+    // The one new key, only for desktop: electron then executes dist/main.mjs as Node.
+    assert.equal(env.ELECTRON_RUN_AS_NODE, "1");
+
+    // The desktop branch must not disturb the four injected keys or the scrub set.
+    assert.equal(env.T3_PAIRING_TOKEN, "the-token");
+    assert.equal(env.T3_HTTP_BASE_URL, "http://127.0.0.1:9999");
+    assert.equal(env.T3_STATE_DIR, "/state/feishu-bot");
+    assert.equal(env.T3_WORKSPACE_ROOT, "/srv/project");
+    for (const key of FeishuBotManager.FEISHU_BOT_SCRUBBED_ENV_KEYS) {
+      assert.isTrue(key in env, `expected ${key} to be scrubbed`);
+      assert.isUndefined(env[key]);
+    }
   });
 
   it("chooseBotEntry: dev→dev entry, prod→bundle, prod-missing→prod-source fallback (not the dev path)", () => {

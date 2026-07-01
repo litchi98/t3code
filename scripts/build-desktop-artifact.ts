@@ -9,6 +9,7 @@ import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import rootPackageJson from "../package.json" with { type: "json" };
 import desktopPackageJson from "../apps/desktop/package.json" with { type: "json" };
 import serverPackageJson from "../apps/server/package.json" with { type: "json" };
+import feishuBotPackageJson from "../apps/feishu-bot/package.json" with { type: "json" };
 
 import { BRAND_ASSET_PATHS } from "./lib/brand-assets.ts";
 import { getDefaultBuildArch } from "./lib/build-target-arch.ts";
@@ -265,11 +266,13 @@ const dependencyResolutionDescriptions = {
   "server-production": "production dependencies",
   "workspace-overrides": "overrides",
   "desktop-runtime": "desktop runtime dependencies",
+  "feishu-bot-production": "feishu-bot production dependencies",
 } as const;
 const DependencyResolutionKind = Schema.Literals([
   "server-production",
   "workspace-overrides",
   "desktop-runtime",
+  "feishu-bot-production",
 ]);
 
 export class DesktopBuildDependencyResolutionError extends Schema.TaggedErrorClass<DesktopBuildDependencyResolutionError>()(
@@ -301,6 +304,7 @@ const DesktopBuildInputArtifact = Schema.Literals([
   "desktop-resources",
   "server-dist",
   "bundled-server-client",
+  "feishu-bot-dist",
 ]);
 type DesktopBuildInputArtifact = typeof DesktopBuildInputArtifact.Type;
 const desktopBuildInputArtifactNames = {
@@ -308,6 +312,7 @@ const desktopBuildInputArtifactNames = {
   "desktop-resources": "desktopResources",
   "server-dist": "serverDist",
   "bundled-server-client": "bundled server client",
+  "feishu-bot-dist": "feishu-bot dist",
 } satisfies Record<DesktopBuildInputArtifact, string>;
 
 export class MissingDesktopBuildInputError extends Schema.TaggedErrorClass<MissingDesktopBuildInputError>()(
@@ -1446,6 +1451,29 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
         cause,
       }),
   });
+  // The bot ships as a `vp pack` bundle that inlines only its workspace deps
+  // (@t3tools/*) and leaves its third-party deps (@larksuite/channel,
+  // @noble/curves, effect, @effect/platform-node) external — resolved from
+  // node_modules at runtime. Unlike the server, these are NOT a subset of the
+  // server/desktop deps (the server uses a different lark SDK), so they must be
+  // added to the stage or the packaged bot crashes with ERR_MODULE_NOT_FOUND.
+  // Filter workspace: specs: they are inside the bundle and would break
+  // `pnpm install --prod` in the stage (no workspace context).
+  const feishuBotDependencies = Object.fromEntries(
+    Object.entries(feishuBotPackageJson.dependencies).filter(
+      ([, spec]) => typeof spec === "string" && !spec.startsWith("workspace:"),
+    ),
+  );
+  const resolvedFeishuBotDependencies = yield* Effect.try({
+    try: () =>
+      resolveCatalogDependencies(feishuBotDependencies, workspaceCatalog, "apps/feishu-bot"),
+    catch: (cause) =>
+      new DesktopBuildDependencyResolutionError({
+        kind: "feishu-bot-production",
+        manifestPath: "apps/feishu-bot/package.json",
+        cause,
+      }),
+  });
 
   const appVersion = options.version ?? serverPackageJson.version;
   const iconAssets = resolveDesktopBuildIconAssets(appVersion);
@@ -1461,6 +1489,11 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     desktopDist: path.join(repoRoot, "apps/desktop/dist-electron"),
     desktopResources: path.join(repoRoot, "apps/desktop/resources"),
     serverDist: path.join(repoRoot, "apps/server/dist"),
+    // The feishu-bot production bundle. Staged alongside the server dist so the
+    // relative layout (apps/server/dist + apps/feishu-bot/dist) matches the repo,
+    // keeping FeishuBotManager's prod entry `../../feishu-bot/dist/main.mjs`
+    // resolvable from the packaged app root.
+    botDist: path.join(repoRoot, "apps/feishu-bot/dist"),
   };
   const bundledClientEntry = path.join(distDirs.serverDist, "client/index.html");
 
@@ -1480,6 +1513,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
     { artifact: "desktop-dist", artifactPath: distDirs.desktopDist },
     { artifact: "desktop-resources", artifactPath: distDirs.desktopResources },
     { artifact: "server-dist", artifactPath: distDirs.serverDist },
+    { artifact: "feishu-bot-dist", artifactPath: distDirs.botDist },
   ] as const;
   for (const input of requiredBuildInputs) {
     if (!(yield* fs.exists(input.artifactPath))) {
@@ -1502,11 +1536,13 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
 
   yield* fs.makeDirectory(path.join(stageAppDir, "apps/desktop"), { recursive: true });
   yield* fs.makeDirectory(path.join(stageAppDir, "apps/server"), { recursive: true });
+  yield* fs.makeDirectory(path.join(stageAppDir, "apps/feishu-bot"), { recursive: true });
 
   yield* Effect.log("[desktop-artifact] Staging release app...");
   yield* fs.copy(distDirs.desktopDist, path.join(stageAppDir, "apps/desktop/dist-electron"));
   yield* fs.copy(distDirs.desktopResources, stageResourcesDir);
   yield* fs.copy(distDirs.serverDist, path.join(stageAppDir, "apps/server/dist"));
+  yield* fs.copy(distDirs.botDist, path.join(stageAppDir, "apps/feishu-bot/dist"));
 
   yield* assertPlatformBuildResources(
     options.platform,
@@ -1553,6 +1589,7 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   const stageDependencies = {
     ...resolvedServerDependencies,
     ...resolvedDesktopRuntimeDependencies,
+    ...resolvedFeishuBotDependencies,
     ...resolveFffNativeDependencies(
       options.platform,
       options.arch,

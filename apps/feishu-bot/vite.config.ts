@@ -23,6 +23,18 @@ function shouldBundleBotDependency(id: string): boolean {
 export default mergeConfig(
   baseConfig,
   defineConfig({
+    run: {
+      tasks: {
+        build: {
+          // Produce the production bundle (dist/main.mjs) via `vp pack` so a root
+          // `vp run ... build` — and `build:desktop` (which now filters this
+          // package) — builds the bot. Unlike the server's build task there is no
+          // `dependsOn`: the bot does not embed the web client.
+          command: "vp pack",
+          cache: false,
+        },
+      },
+    },
     pack: {
       entry: ["src/main.ts"],
       outDir: "dist",
