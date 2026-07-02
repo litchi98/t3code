@@ -99,43 +99,12 @@ export const refusesFullAccessTakeover = (
 ): boolean => requiredMode === "approval-required" && threadMode === "full-access";
 
 /**
- * M3a/M4-1: derive the open id stamped into the approval token's signed `payload.o`.
- * When an owner is configured AND the chat is approval-gated (group/topic) this
- * stamps `ownerOpenIds[0]`; p2p (full-access) and the unconfigured/empty case fall
- * back to the turn initiator (pre-M3a "initiator-only" behavior, no regression).
- *
- * M4-1 NOTE: who may *approve* is no longer decided here. Authz is decoupled from
- * the signed `payload.o` — the bot's cardAction gate authorises a clicker by
- * MEMBERSHIP in the configured allowlist (any of `ownerOpenIds`, N-of-1), not by
- * matching `payload.o`. This function still picks the single open id to *sign into*
- * the token (an integrity-carried value), but for an approval-gated chat it is the
- * allowlist — not `payload.o` — that gates approval. The empty-allowlist fallback
- * still gates on `payload.o` = initiator (initiator-only path unchanged).
- *
- * STRUCTURAL FIX (M4-1) of the M3a single-owner deadlock: because approval is now
- * N-of-1 over the whole allowlist, the turn no longer blocks just because
- * `ownerOpenIds[0]` is not in the group — any other listed member who IS in the
- * group can approve. A residual deadlock only remains if NONE of the listed members
- * are in the group (an operational misconfiguration, self-diagnosable via
- * `/whoami`). Leaving the allowlist empty falls back to initiator approval and can
- * never deadlock.
- */
-export const resolveApprover = (
-  runtimeMode: RuntimeMode,
-  ownerOpenIds: ReadonlyArray<string>,
-  initiatorOpenId: string,
-): string =>
-  runtimeMode === "approval-required" && ownerOpenIds.length > 0
-    ? (ownerOpenIds[0] ?? initiatorOpenId)
-    : initiatorOpenId;
-
-/**
  * M3b: render density per runtime mode. A p2p 1:1 chat (`full-access`) is always
  * the full `card` layout; a group / topic chat (`approval-required`) honours the
  * configured `groupChatDensity` (default `card`; opt-in `markdown` / `text`).
  * Pure function of `(runtimeMode, groupChatDensity)` — lives here next to
- * `runtimeModeForChatType` / `resolveApprover` so the turn pipeline and renderer
- * derive density from one place. Default-no-auto-downgrade: only an explicit
+ * `runtimeModeForChatType` so the turn pipeline and renderer derive density from
+ * one place. Default-no-auto-downgrade: only an explicit
  * config lowers a group below `card`, so p2p noise control is never affected.
  */
 export const densityForRuntime = (

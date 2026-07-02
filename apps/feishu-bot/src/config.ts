@@ -78,9 +78,10 @@ export interface FeishuCredentialOverride {
 }
 
 /**
- * Bot-own Feishu configuration: the optional credential override plus the two
- * bot-side knobs (approval allowlist floor, group render density) that are NOT
- * shared with the server and are always present (with sensible defaults).
+ * Bot-own Feishu configuration: the optional credential override plus the bot-side
+ * group render density knob — NOT shared with the server, always present (with a
+ * sensible default). (M-2/PR2b removed the `FEISHU_OWNER_OPEN_IDS` approval-floor
+ * knob; approval authority is now the binding owner + per-chat three-state config.)
  */
 export interface FeishuAppConfig {
   /**
@@ -92,26 +93,9 @@ export interface FeishuAppConfig {
    */
   readonly credentialOverride: FeishuCredentialOverride | null;
   /**
-   * Bot-side approval allowlist for group/topic chats (M3a; N-of-1 in M4-1). From
-   * `FEISHU_OWNER_OPEN_IDS` (comma-separated). Like `appId`, this is bot-own config
-   * — not shared with the server. Empty array = fall back to turn initiator (pre-M3a
-   * behavior, no regression). When set, M4-1 treats the WHOLE list as an approval
-   * allowlist: the cardAction gate authorises ANY listed member to approve an
-   * approval-gated chat (the signed `payload.o` still carries `ownerOpenIds[0]`, but
-   * approval is gated by allowlist membership, not by `payload.o`).
-   *
-   * STRUCTURAL FIX (M4-1) of the M3a single-owner deadlock: approval is now N-of-1,
-   * so a group no longer hangs just because `ownerOpenIds[0]` is not a member — any
-   * other listed member who IS in the group can approve. A residual deadlock only
-   * remains if NONE of the listed members are in the target group (operational
-   * misconfiguration, self-diagnosable via `/whoami`). The empty-array default
-   * (initiator approval) can never deadlock.
-   */
-  readonly ownerOpenIds: ReadonlyArray<string>;
-  /**
    * Render density for group / topic chats (M3b). From `FEISHU_GROUP_CHAT_DENSITY`
-   * (`card` | `markdown` | `text`). Like `ownerOpenIds`, this is bot-own config —
-   * not shared with the server. p2p 1:1 chats are always `card` regardless of this
+   * (`card` | `markdown` | `text`). Like `appId`, this is bot-own config — not
+   * shared with the server. p2p 1:1 chats are always `card` regardless of this
    * value (see `densityForRuntime`); this seam only lowers group/topic noise when
    * set explicitly. Defaults to `card` (no auto-downgrade); an unrecognised value
    * falls back to `card` (non-fatal).
@@ -143,7 +127,6 @@ const FLAG_BY_ENV: Readonly<Record<string, string>> = {
   FEISHU_APP_ID: "--feishu-app-id",
   FEISHU_APP_SECRET: "--feishu-app-secret",
   FEISHU_TENANT: "--feishu-tenant",
-  FEISHU_OWNER_OPEN_IDS: "--feishu-owner-open-ids",
   FEISHU_GROUP_CHAT_DENSITY: "--feishu-group-chat-density",
   T3_STATE_DIR: "--state-dir",
 };
@@ -243,9 +226,9 @@ export const loadConfig: Effect.Effect<FeishuBotConfig, FeishuBotConfigError> = 
  * pinning a fixed app); otherwise the override is `null`. Exactly one of the two
  * being set is treated as "no override" (fall through to the server) with a
  * warning, so a typo never silently swaps which credentials are used without a
- * trace — but it is non-fatal (no crash). `ownerOpenIds`/`groupChatDensity` are
- * bot-own and always present (with defaults); an invalid `FEISHU_TENANT`/
- * `FEISHU_GROUP_CHAT_DENSITY` is reported only when it actually feeds a value.
+ * trace — but it is non-fatal (no crash). `groupChatDensity` is bot-own and always
+ * present (with a default); an invalid `FEISHU_TENANT`/`FEISHU_GROUP_CHAT_DENSITY`
+ * is reported only when it actually feeds a value.
  */
 const resolveFeishuAppConfig = (
   env: Readonly<Record<string, string | undefined>>,
@@ -285,14 +268,9 @@ const resolveFeishuAppConfig = (
       );
     }
 
-    const ownerOpenIds = (resolveValue("FEISHU_OWNER_OPEN_IDS", env, args) ?? "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0);
-
     // M3b: group/topic render density. Validated against the three known modes;
     // an unset value defaults to `card`, an unrecognised one falls back to `card`
-    // (non-fatal — mirrors the forgiving ownerOpenIds default) with a warning.
+    // (non-fatal) with a warning.
     const rawDensity = resolveValue("FEISHU_GROUP_CHAT_DENSITY", env, args);
     const groupChatDensity: RenderDensity =
       rawDensity === "card" || rawDensity === "markdown" || rawDensity === "text"
@@ -307,7 +285,6 @@ const resolveFeishuAppConfig = (
 
     return {
       credentialOverride,
-      ownerOpenIds,
       groupChatDensity,
     } satisfies FeishuAppConfig;
   });

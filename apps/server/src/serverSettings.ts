@@ -136,9 +136,10 @@ export class ServerSettingsService extends Context.Service<
 
     /**
      * Persist a freshly-provisioned Feishu bot binding: write `appSecret` to the
-     * secret store, then record the public binding identity in settings and
-     * append the owner to `feishuApprovalAllowlist`. `appSecret` never touches
-     * settings.json or logs.
+     * secret store, then record the public binding identity in settings.
+     * `appSecret` never touches settings.json or logs. (M-2/PR2b: the owner is
+     * NOT seeded into `feishuApprovalAllowlist` any more — owner authority is the
+     * binding's `ownerOpenId` (owner-always) + per-chat three-state config.)
      */
     readonly persistFeishuBinding: (
       input: FeishuBindingCredentials,
@@ -191,22 +192,17 @@ const makeTest = (overrides: DeepPartial<ServerSettings> = {}) =>
       updateSettings,
       streamChanges: Stream.empty,
       persistFeishuBinding: (input) =>
+        // M-2/PR2b: owner authority is the binding's `ownerOpenId` (owner-always)
+        // + per-chat three-state config — no longer seeded into the deprecated
+        // `feishuApprovalAllowlist`. Persist the binding only.
         Ref.set(feishuSecretRef, input.appSecret).pipe(
-          Effect.andThen(Ref.get(currentSettingsRef)),
-          Effect.flatMap((current) =>
+          Effect.andThen(
             updateSettings({
               feishuBinding: {
                 appId: input.appId,
                 tenant: input.tenant,
                 ownerOpenId: input.ownerOpenId,
               },
-              feishuApprovalAllowlist: Array.from(
-                new Set(
-                  [...current.feishuApprovalAllowlist, input.ownerOpenId]
-                    .map((entry) => entry.trim())
-                    .filter((entry) => entry.length > 0),
-                ),
-              ),
             }),
           ),
         ),
@@ -695,22 +691,15 @@ const make = Effect.gen(function* () {
             ),
           );
 
-        const current = yield* getSettingsFromCache;
-        const allowlist = Array.from(
-          new Set(
-            [...current.feishuApprovalAllowlist, input.ownerOpenId]
-              .map((entry) => entry.trim())
-              .filter((entry) => entry.length > 0),
-          ),
-        );
-
+        // M-2/PR2b: owner authority is the binding's `ownerOpenId` (owner-always)
+        // + per-chat three-state config — no longer seeded into the deprecated
+        // `feishuApprovalAllowlist`. Persist the binding only.
         return yield* updateSettings({
           feishuBinding: {
             appId: input.appId,
             tenant: input.tenant,
             ownerOpenId: input.ownerOpenId,
           },
-          feishuApprovalAllowlist: allowlist,
         }).pipe(
           // If the settings write fails after the secret was stored, roll the
           // secret back so we never leave an orphaned appSecret behind.

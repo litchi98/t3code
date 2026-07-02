@@ -3,100 +3,114 @@ import { describe, expect, it } from "vite-plus/test";
 import { authorizeApprovalClick } from "./authz.ts";
 
 const OWNER = "ou_owner";
-const MEMBER = "ou_member";
+const APPROVER = "ou_approver";
 const INITIATOR = "ou_initiator";
 const STRANGER = "ou_stranger";
 
-describe("authorizeApprovalClick — owner-always (PR2a)", () => {
-  it("authorizes the owner even when not in the allowlist and not the initiator", () => {
-    expect(
-      authorizeApprovalClick({
-        owner: OWNER,
-        effectiveAllowlist: [MEMBER],
-        clicker: OWNER,
-        initiator: INITIATOR,
-      }),
-    ).toBe(true);
+describe("authorizeApprovalClick — empty clicker + owner-always overlay", () => {
+  it("never authorizes an empty clicker in any mode", () => {
+    for (const mode of ["initiator", "designated", "all"] as const) {
+      expect(
+        authorizeApprovalClick({
+          owner: OWNER,
+          mode,
+          approvers: [OWNER],
+          clicker: "",
+          initiator: "",
+        }),
+      ).toBe(false);
+    }
   });
 
-  it("authorizes the owner when the allowlist is empty (owner-always beats initiator fallback)", () => {
-    expect(
-      authorizeApprovalClick({
-        owner: OWNER,
-        effectiveAllowlist: [],
-        clicker: OWNER,
-        initiator: INITIATOR,
-      }),
-    ).toBe(true);
+  it("authorizes the owner in every mode, even when not initiator/approver", () => {
+    for (const mode of ["initiator", "designated", "all"] as const) {
+      expect(
+        authorizeApprovalClick({
+          owner: OWNER,
+          mode,
+          approvers: [APPROVER],
+          clicker: OWNER,
+          initiator: INITIATOR,
+        }),
+      ).toBe(true);
+    }
   });
 
-  it("does not treat an unbound (null) owner as a match for an empty clicker", () => {
+  it("does not treat a null owner as a match", () => {
     expect(
       authorizeApprovalClick({
         owner: null,
-        effectiveAllowlist: [],
-        clicker: "",
-        initiator: "",
-      }),
-    ).toBe(false);
-  });
-});
-
-describe("authorizeApprovalClick — allowlist branch (active)", () => {
-  it("authorizes a clicker present in a non-empty allowlist", () => {
-    expect(
-      authorizeApprovalClick({
-        owner: OWNER,
-        effectiveAllowlist: [MEMBER, STRANGER],
-        clicker: MEMBER,
-        initiator: INITIATOR,
-      }),
-    ).toBe(true);
-  });
-
-  it("denies a clicker absent from a non-empty allowlist (and not the owner)", () => {
-    expect(
-      authorizeApprovalClick({
-        owner: OWNER,
-        effectiveAllowlist: [MEMBER],
+        mode: "designated",
+        approvers: [APPROVER],
         clicker: STRANGER,
-        initiator: STRANGER,
+        initiator: INITIATOR,
       }),
     ).toBe(false);
   });
 });
 
-describe("authorizeApprovalClick — initiator fallback (empty allowlist)", () => {
-  it("authorizes the signed initiator when the allowlist is empty", () => {
+describe("authorizeApprovalClick — initiator mode", () => {
+  it("authorizes the signed initiator", () => {
     expect(
       authorizeApprovalClick({
         owner: null,
-        effectiveAllowlist: [],
+        mode: "initiator",
+        approvers: [],
         clicker: INITIATOR,
         initiator: INITIATOR,
       }),
     ).toBe(true);
   });
 
-  it("denies a non-initiator when the allowlist is empty", () => {
+  it("denies a non-initiator (bystander)", () => {
     expect(
       authorizeApprovalClick({
-        owner: null,
-        effectiveAllowlist: [],
+        owner: OWNER,
+        mode: "initiator",
+        approvers: [STRANGER],
         clicker: STRANGER,
         initiator: INITIATOR,
       }),
     ).toBe(false);
   });
+});
 
-  it("denies an empty clicker even when the signed initiator is also empty", () => {
+describe("authorizeApprovalClick — designated mode", () => {
+  it("authorizes an open_id in the approvers list", () => {
     expect(
       authorizeApprovalClick({
         owner: null,
-        effectiveAllowlist: [],
-        clicker: "",
-        initiator: "",
+        mode: "designated",
+        approvers: [APPROVER, "ou_other"],
+        clicker: APPROVER,
+        initiator: INITIATOR,
+      }),
+    ).toBe(true);
+  });
+
+  it("denies an open_id absent from the approvers list (even the initiator)", () => {
+    expect(
+      authorizeApprovalClick({
+        owner: null,
+        mode: "designated",
+        approvers: [APPROVER],
+        clicker: INITIATOR,
+        initiator: INITIATOR,
       }),
     ).toBe(false);
+  });
+});
+
+describe("authorizeApprovalClick — all mode", () => {
+  it("authorizes any non-empty clicker (a card clicker is a chat member by construction)", () => {
+    expect(
+      authorizeApprovalClick({
+        owner: null,
+        mode: "all",
+        approvers: [],
+        clicker: STRANGER,
+        initiator: INITIATOR,
+      }),
+    ).toBe(true);
   });
 });
