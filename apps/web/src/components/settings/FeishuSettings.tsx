@@ -1,29 +1,47 @@
 "use client";
 
-import { LinkIcon, PlusIcon, XIcon } from "lucide-react";
-import { useCallback, useState } from "react";
+import type { FeishuChatConfig, FeishuChatDirectoryEntry } from "@t3tools/contracts";
+import { LinkIcon, PlusIcon, UsersIcon, XIcon } from "lucide-react";
+import { useCallback, useRef, useState } from "react";
 
 import { usePrimaryEnvironment } from "~/state/environments";
+import { useEnvironmentQuery } from "~/state/query";
 import { serverEnvironment } from "~/state/server";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { usePrimarySettings, useUpdatePrimarySettings } from "../../hooks/useSettings";
 import { Button } from "../ui/button";
+import { Checkbox } from "../ui/checkbox";
 import { Input } from "../ui/input";
-import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { FeishuBindingDialog } from "./FeishuBindingDialog";
+import {
+  APPROVAL_MODE_LABELS,
+  APPROVAL_MODES,
+  chatModeSelection,
+  type ChatModeSelection,
+  defaultsModeSelection,
+  type FeishuChatConfigMap,
+  INHERIT_MODE,
+  setConfigApprovalMode,
+  setDefaultsApprovalMode,
+  toggleConfigApprover,
+  toggleDefaultsApprover,
+  writeChatConfig,
+} from "./FeishuSettings.logic";
 import { SettingsPageContainer, SettingsSection } from "./settingsLayout";
 
 /**
- * Feishu bot binding + approval allowlist settings.
+ * Feishu bot binding + per-chat approval configuration.
  *
- * Bind the bot first (the QR-scan flow provisions the bot and auto-adds the
- * authorizing owner to the allowlist), then refine who else may approve.
+ * Bind the bot first (QR-scan flow), then configure who may approve — a default
+ * mode plus optional per-chat overrides. The binding owner is always allowed to
+ * approve regardless of these settings (owner-always overlay in the bot).
  */
 export function FeishuSettingsPanel() {
   return (
     <SettingsPageContainer>
       <FeishuBindingSection />
-      <FeishuAllowlistSection />
+      <FeishuChatConfigSection />
     </SettingsPageContainer>
   );
 }
@@ -97,7 +115,7 @@ function FeishuBindingSection() {
         ) : (
           <div className="space-y-3">
             <p className="text-xs text-muted-foreground/80">
-              尚未绑定飞书 Bot。绑定后即可在飞书中与本服务交互并审批;授权人会自动加入审批白名单。
+              尚未绑定飞书 Bot。绑定后即可在飞书中与本服务交互并审批;绑定的授权人始终可审批。
             </p>
             <div className="flex justify-end">
               <Button
@@ -125,62 +143,65 @@ function FeishuBindingSection() {
 }
 
 /**
- * Feishu approval allowlist editor.
+ * Feishu per-chat approval configuration editor.
  *
- * Manages the *web-configured* slice of the Feishu approval allowlist
- * (`ServerSettings.feishuApprovalAllowlist`). The feishu-bot unions this list
- * with the open_ids from its env `FEISHU_OWNER_OPEN_IDS` floor at read time —
- * env entries are an immovable floor that always applies and is neither shown
- * nor removable here. Effective allowlist = env floor ∪ this list.
+ * Edits two ServerSettings fields with whole-value replacement semantics:
+ * `feishuChatDefaults` (the default config every chat inherits) and
+ * `feishuChatConfigs` (a `Record<chatId, FeishuChatConfig>` of per-chat
+ * overrides). The bot resolves the effective approval mode per chat via
+ * field-level fallback (`effectiveChatConfig`): per-chat override → defaults →
+ * built-in `initiator`. The binding owner is always allowed (owner-always
+ * overlay), so they never need to be listed as an approver.
  *
- * The list is a flat string array, so this reuses the simpler shape of
- * `ProviderModelsSection`'s Input + Add + XIcon-remove pattern: local draft
- * state, trim + dedup on add, Enter-to-add, and per-row remove that writes the
- * whole replacement list back via `update`.
+ * Pure map/entry manipulation lives in `FeishuSettings.logic.ts`.
+ *
+ * The whole `feishuChatConfigs` map is edited by many independent per-chat cards
+ * yet persisted as one wholesale-replaced value with no optimistic server echo.
+ * To stop a card from clobbering a sibling it wrote moments ago (the atom
+ * snapshot stays stale for the write round-trip), this section owns the draft map
+ * and mutates a ref synchronously on every commit, so each edit derives the next
+ * whole map from the freshest accumulated draft rather than a render snapshot.
  */
-function FeishuAllowlistSection() {
-  const allowlist = usePrimarySettings((s) => s.feishuApprovalAllowlist);
+function FeishuChatConfigSection() {
+  const environmentId = usePrimaryEnvironment()?.environmentId ?? null;
+  const { data, error, isPending } = useEnvironmentQuery(
+    environmentId === null ? null : serverEnvironment.feishuListChats({ environmentId, input: {} }),
+  );
+
+  const serverConfigs = usePrimarySettings((s) => s.feishuChatConfigs) as FeishuChatConfigMap;
   const update = useUpdatePrimarySettings();
-  const [input, setInput] = useState("");
-  const [error, setError] = useState<string | null>(null);
+  // Seed-once draft of the whole per-chat map; `draftRef` mirrors it and is
+  // updated synchronously inside `commitChat` so back-to-back edits (same card or
+  // different cards) accumulate instead of racing the settings-write round trip.
+  const [draftConfigs, setDraftConfigs] = useState<FeishuChatConfigMap>(() => serverConfigs);
+  const draftRef = useRef(draftConfigs);
+  const commitChat = useCallback(
+    (chatId: string, updater: (config: FeishuChatConfig) => FeishuChatConfig) => {
+      const nextConfig = updater(draftRef.current[chatId] ?? {});
+      const nextConfigs = writeChatConfig(draftRef.current, chatId, nextConfig);
+      draftRef.current = nextConfigs;
+      setDraftConfigs(nextConfigs);
+      update({ feishuChatConfigs: nextConfigs });
+    },
+    [update],
+  );
 
-  const handleAdd = () => {
-    const openId = input.trim();
-    if (!openId) {
-      setError("请输入 open_id。");
-      return;
-    }
-    if (allowlist.includes(openId)) {
-      setError("该 open_id 已在白名单中。");
-      return;
-    }
-    update({ feishuApprovalAllowlist: [...allowlist, openId] });
-    setInput("");
-    setError(null);
-  };
-
-  const handleRemove = (openId: string) => {
-    update({ feishuApprovalAllowlist: allowlist.filter((id) => id !== openId) });
-    setError(null);
-  };
+  // Group/topic chats only — p2p (single-user) chats have no approval roster and
+  // always fall back to the initiator/owner path, so there is nothing to configure.
+  const chats = (data?.chats ?? []).filter((chat) => chat.chatMode !== "p2p");
 
   return (
-    <SettingsSection title="飞书审批白名单">
+    <SettingsSection title="飞书审批配置" icon={<UsersIcon className="size-3" />}>
       <div className="space-y-2 px-4 py-3 text-xs text-muted-foreground/80 sm:px-5">
-        <p>此列表为 web 配置的飞书审批白名单,列出的 open_id 可在需审批的群聊里操作审批卡片。</p>
         <p>
-          飞书 bot 另有环境变量{" "}
-          <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px] text-foreground">
-            FEISHU_OWNER_OPEN_IDS
-          </code>{" "}
-          配置的 open_id 作为逃生口 / 默认地板:始终生效,既不在此显示、也无法在此删除。
-          <strong className="font-medium text-foreground/90">
-            实际生效白名单 = env 地板 ∪ 本列表
-          </strong>
-          。
+          控制飞书审批卡片可由谁点击审批。审批模式分三档:
+          <strong className="font-medium text-foreground/90">仅发起人</strong>(默认)、
+          <strong className="font-medium text-foreground/90">指定审批人</strong>、
+          <strong className="font-medium text-foreground/90">任意群成员</strong>。绑定飞书 Bot
+          的授权人始终可审批,无需在此列出。
         </p>
         <p>
-          在飞书群里发{" "}
+          先设默认,再按需为单个群覆盖。在群里发{" "}
           <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px] text-foreground">
             /whoami
           </code>{" "}
@@ -189,64 +210,286 @@ function FeishuAllowlistSection() {
       </div>
 
       <div className="border-t border-border/60 px-4 py-3 sm:px-5">
-        {allowlist.length === 0 ? (
-          <p className="text-xs text-muted-foreground">白名单为空。</p>
+        <FeishuDefaultsEditor />
+      </div>
+
+      <div className="border-t border-border/60 px-4 py-3 sm:px-5">
+        <h4 className="mb-2 font-medium text-foreground/90 text-xs">分群覆盖</h4>
+        {environmentId === null ? (
+          <p className="text-xs text-muted-foreground">未连接环境。</p>
+        ) : isPending ? (
+          <p className="text-xs text-muted-foreground">加载群列表…</p>
+        ) : error ? (
+          <p className="text-xs text-destructive">群列表加载失败:{error}</p>
+        ) : chats.length === 0 ? (
+          <p className="text-xs text-muted-foreground">
+            暂无群聊。Bot 加入群聊后会自动同步到这里。
+          </p>
         ) : (
-          <div className="space-y-1">
-            {allowlist.map((openId) => (
-              <div
-                key={openId}
-                className="grid min-h-7 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 py-1"
-              >
-                <span className="min-w-0 truncate font-mono text-xs text-foreground/90">
-                  {openId}
-                </span>
-                <Tooltip>
-                  <TooltipTrigger
-                    render={
-                      <Button
-                        size="icon-xs"
-                        variant="ghost"
-                        className="size-5 rounded-sm p-0 text-muted-foreground hover:text-foreground"
-                        aria-label={`移除 ${openId}`}
-                        onClick={() => handleRemove(openId)}
-                      />
-                    }
-                  >
-                    <XIcon className="size-3" />
-                  </TooltipTrigger>
-                  <TooltipPopup side="top">移除</TooltipPopup>
-                </Tooltip>
-              </div>
+          <div className="space-y-3">
+            {chats.map((chat) => (
+              <FeishuChatConfigCard
+                key={chat.chatId}
+                chat={chat}
+                config={draftConfigs[chat.chatId]}
+                onCommit={commitChat}
+              />
             ))}
           </div>
         )}
-
-        <div className="mt-3 flex flex-col gap-2 sm:flex-row">
-          <Input
-            id="feishu-approval-allowlist-input"
-            value={input}
-            onChange={(event) => {
-              setInput(event.target.value);
-              if (error) setError(null);
-            }}
-            onKeyDown={(event) => {
-              if (event.key !== "Enter") return;
-              event.preventDefault();
-              handleAdd();
-            }}
-            placeholder="ou_xxxxxxxxxxxxxxxx"
-            spellCheck={false}
-            aria-label="飞书审批白名单 open_id"
-          />
-          <Button className="shrink-0" variant="outline" onClick={handleAdd}>
-            <PlusIcon className="size-3.5" />
-            添加
-          </Button>
-        </div>
-
-        {error ? <p className="mt-2 text-xs text-destructive">{error}</p> : null}
       </div>
     </SettingsSection>
+  );
+}
+
+/** Default-mode editor (`feishuChatDefaults`); always shows an explicit mode. */
+function FeishuDefaultsEditor() {
+  const serverDefaults = usePrimarySettings((s) => s.feishuChatDefaults);
+  const update = useUpdatePrimarySettings();
+  // Local draft is the source of truth while editing so a rapid sequence of
+  // approver toggles accumulates instead of each racing the settings-write round
+  // trip — settings writes are fire-and-forget with no optimistic echo, so a
+  // handler that recomputed from the atom snapshot would clobber prior clicks.
+  // `draftRef` is read (freshest) on commit; `draft` state drives the render.
+  const [draft, setDraft] = useState<FeishuChatConfig>(() => serverDefaults);
+  const draftRef = useRef(draft);
+  const commit = useCallback(
+    (updater: (config: FeishuChatConfig) => FeishuChatConfig) => {
+      const next = updater(draftRef.current);
+      draftRef.current = next;
+      setDraft(next);
+      update({ feishuChatDefaults: next });
+    },
+    [update],
+  );
+  const mode = defaultsModeSelection(draft);
+
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
+          <p className="font-medium text-foreground/90 text-xs">默认审批模式</p>
+          <p className="text-[11px] text-muted-foreground/80">未单独配置的群聊都用这个模式。</p>
+        </div>
+        <ModeSelect
+          value={mode}
+          includeInherit={false}
+          ariaLabel="默认审批模式"
+          onChange={(selection) => {
+            if (selection === INHERIT_MODE) return;
+            commit((current) => setDefaultsApprovalMode(current, selection));
+          }}
+        />
+      </div>
+      {mode === "designated" ? (
+        <ApproversEditor
+          approvers={draft.approvers ?? []}
+          idPrefix="feishu-default-approvers"
+          onToggle={(openId) => commit((current) => toggleDefaultsApprover(current, openId))}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * One group's override card — fully controlled by `FeishuChatConfigSection`,
+ * which owns the draft map. `onCommit` takes an updater over THIS chat's current
+ * config so the section can apply it against the freshest accumulated draft.
+ */
+function FeishuChatConfigCard({
+  chat,
+  config,
+  onCommit,
+}: {
+  chat: FeishuChatDirectoryEntry;
+  config: FeishuChatConfig | undefined;
+  onCommit: (chatId: string, updater: (config: FeishuChatConfig) => FeishuChatConfig) => void;
+}) {
+  const mode = chatModeSelection(config);
+  const memberCount = chat.memberCount ?? chat.memberOpenIds.length;
+
+  return (
+    <div className="rounded-lg border border-border/60 p-3">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0">
+          <p className="truncate font-medium text-foreground/90 text-sm">
+            {chat.name || chat.chatId}
+          </p>
+          <p className="truncate text-[11px] text-muted-foreground/80">
+            {memberCount} 名成员 · <span className="font-mono">{chat.chatId}</span>
+          </p>
+        </div>
+        <ModeSelect
+          value={mode}
+          includeInherit
+          ariaLabel={`${chat.name || chat.chatId} 审批模式`}
+          onChange={(selection) =>
+            onCommit(chat.chatId, (current) => setConfigApprovalMode(current, selection))
+          }
+        />
+      </div>
+      {mode === "designated" ? (
+        <ApproversEditor
+          approvers={config?.approvers ?? []}
+          members={chat.memberOpenIds}
+          idPrefix={`feishu-chat-${chat.chatId}`}
+          onToggle={(openId) =>
+            onCommit(chat.chatId, (current) => toggleConfigApprover(current, openId))
+          }
+        />
+      ) : null}
+    </div>
+  );
+}
+
+/** Approval-mode select. `includeInherit` adds an "inherit default" sentinel row. */
+function ModeSelect({
+  value,
+  onChange,
+  includeInherit,
+  ariaLabel,
+}: {
+  value: ChatModeSelection;
+  onChange: (selection: ChatModeSelection) => void;
+  includeInherit: boolean;
+  ariaLabel: string;
+}) {
+  const label = value === INHERIT_MODE ? "继承默认" : APPROVAL_MODE_LABELS[value];
+  return (
+    <Select value={value} onValueChange={(next) => onChange(next as ChatModeSelection)}>
+      <SelectTrigger size="sm" className="w-full sm:w-40" aria-label={ariaLabel}>
+        <SelectValue>{label}</SelectValue>
+      </SelectTrigger>
+      <SelectPopup align="end" alignItemWithTrigger={false}>
+        {includeInherit ? (
+          <SelectItem hideIndicator value={INHERIT_MODE}>
+            继承默认
+          </SelectItem>
+        ) : null}
+        {APPROVAL_MODES.map((approvalMode) => (
+          <SelectItem hideIndicator key={approvalMode} value={approvalMode}>
+            {APPROVAL_MODE_LABELS[approvalMode]}
+          </SelectItem>
+        ))}
+      </SelectPopup>
+    </Select>
+  );
+}
+
+/**
+ * Designated-approver picker. When a group roster (`members`) is available, it
+ * shows member checkboxes; any approver open_id not on the roster (or when no
+ * roster exists — e.g. the defaults editor) is shown as a removable chip, and a
+ * free-text input adds off-roster open_ids. Emits per-open_id toggles; the caller
+ * owns the map write.
+ */
+function ApproversEditor({
+  approvers,
+  onToggle,
+  idPrefix,
+  members,
+}: {
+  approvers: ReadonlyArray<string>;
+  onToggle: (openId: string) => void;
+  idPrefix: string;
+  members?: ReadonlyArray<string>;
+}) {
+  const [input, setInput] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const selected = new Set(approvers);
+  const roster = members ?? [];
+  const extras = approvers.filter((openId) => !roster.includes(openId));
+
+  const handleAdd = () => {
+    const openId = input.trim();
+    if (!openId) {
+      setError("请输入 open_id。");
+      return;
+    }
+    if (selected.has(openId)) {
+      setError("该 open_id 已是审批人。");
+      return;
+    }
+    onToggle(openId);
+    setInput("");
+    setError(null);
+  };
+
+  return (
+    <div className="mt-2 space-y-2 rounded-md border border-border/60 bg-muted/20 p-2.5">
+      <p className="text-[11px] text-muted-foreground/80">
+        指定群内可审批的成员(可多选)。留空表示群内无人可审批;绑定的授权人凭 owner-always
+        始终可审批,无需勾选。
+      </p>
+      {roster.length > 0 ? (
+        <div className="grid gap-1 sm:grid-cols-2">
+          {roster.map((openId) => (
+            <label
+              key={openId}
+              className="flex min-w-0 cursor-pointer items-center gap-2 rounded-sm px-1 py-1 hover:bg-accent/50"
+            >
+              <Checkbox
+                checked={selected.has(openId)}
+                onCheckedChange={() => onToggle(openId)}
+                aria-label={`审批人 ${openId}`}
+              />
+              <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-foreground/90">
+                {openId}
+              </span>
+            </label>
+          ))}
+        </div>
+      ) : null}
+      {extras.length > 0 ? (
+        <div className="space-y-1">
+          {roster.length > 0 ? (
+            <p className="text-[11px] text-muted-foreground/70">群成员名录外的 open_id:</p>
+          ) : null}
+          {extras.map((openId) => (
+            <div
+              key={openId}
+              className="grid min-h-7 grid-cols-[minmax(0,1fr)_auto] items-center gap-2"
+            >
+              <span className="min-w-0 truncate font-mono text-[11px] text-foreground/90">
+                {openId}
+              </span>
+              <Button
+                size="icon-xs"
+                variant="ghost"
+                className="size-5 rounded-sm p-0 text-muted-foreground hover:text-foreground"
+                aria-label={`移除 ${openId}`}
+                onClick={() => onToggle(openId)}
+              >
+                <XIcon className="size-3" />
+              </Button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      <div className="flex flex-col gap-2 sm:flex-row">
+        <Input
+          id={`${idPrefix}-input`}
+          value={input}
+          onChange={(event) => {
+            setInput(event.target.value);
+            if (error) setError(null);
+          }}
+          onKeyDown={(event) => {
+            if (event.key !== "Enter") return;
+            event.preventDefault();
+            handleAdd();
+          }}
+          placeholder="ou_xxxxxxxxxxxxxxxx"
+          spellCheck={false}
+          aria-label="审批人 open_id"
+        />
+        <Button className="shrink-0" variant="outline" onClick={handleAdd}>
+          <PlusIcon className="size-3.5" />
+          添加
+        </Button>
+      </div>
+      {error ? <p className="text-xs text-destructive">{error}</p> : null}
+    </div>
   );
 }

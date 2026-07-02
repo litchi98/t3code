@@ -139,7 +139,7 @@ export function FeishuBindingDialog({
           <DialogTitle>绑定飞书 Bot</DialogTitle>
           <DialogDescription>
             用飞书扫描二维码并在手机上确认授权,即可为本服务绑定一个飞书
-            Bot。绑定成功后,授权人会自动加入审批白名单。
+            Bot。授权人始终可审批,无需额外配置。
           </DialogDescription>
         </DialogHeader>
         <DialogPanel className="flex flex-col items-center gap-4 py-2">
@@ -152,8 +152,7 @@ export function FeishuBindingDialog({
                   {TENANT_LABELS[bound.tenant] ?? bound.tenant} · {bound.appId}
                 </p>
                 <p className="text-xs text-muted-foreground/80">
-                  授权人 <span className="font-mono">{bound.ownerOpenId}</span>{" "}
-                  已自动加入审批白名单。
+                  授权人 <span className="font-mono">{bound.ownerOpenId}</span> 始终可审批。
                 </p>
               </div>
             </div>
