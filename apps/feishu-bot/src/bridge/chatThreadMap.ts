@@ -83,6 +83,22 @@ export const runtimeModeForChatType = (chatType: string): RuntimeMode =>
   chatType === "p2p" ? "full-access" : "approval-required";
 
 /**
+ * M3a Fix 2 (shared, M-1 review fix D): whether re-pointing a conversation
+ * whose required mode is `requiredMode` at a thread pinned to `threadMode`
+ * must be refused. A thread's `runtimeMode` is pinned at creation and every
+ * turn runs under it, so a group / topic chat (`approval-required`) taking
+ * over a `full-access` thread would run every subsequent turn unattended at
+ * full access — bypassing the group's approval-required safety. Consumed by
+ * BOTH re-point paths (`/resume` in `commands/handlers.ts` and the M-1
+ * adopt-if-exists re-bind in `bot.ts`) so the policy lives in one place. p2p
+ * (`requiredMode === "full-access"`) never trips it.
+ */
+export const refusesFullAccessTakeover = (
+  requiredMode: RuntimeMode,
+  threadMode: RuntimeMode,
+): boolean => requiredMode === "approval-required" && threadMode === "full-access";
+
+/**
  * M3a/M4-1: derive the open id stamped into the approval token's signed `payload.o`.
  * When an owner is configured AND the chat is approval-gated (group/topic) this
  * stamps `ownerOpenIds[0]`; p2p (full-access) and the unconfigured/empty case fall
