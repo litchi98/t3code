@@ -23,10 +23,10 @@ import {
   type EnvironmentId,
   isProviderAvailable,
   MessageId,
-  type ModelSelection,
+  ModelSelection,
   ORCHESTRATION_WS_METHODS,
   type OrchestrationMessage,
-  type OrchestrationShellStreamItem,
+  type OrchestrationProjectShell,
   type OrchestrationThread,
   type OrchestrationThreadActivity,
   type OrchestrationThreadStreamItem,
@@ -55,7 +55,6 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
-import * as Result from "effect/Result";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
@@ -99,6 +98,7 @@ import {
   densityForRuntime,
   deriveThreadId,
   ensureThreadForChat,
+  refusesFullAccessTakeover,
   resolveApprover,
   runtimeModeForChatType,
   splitChatKey,
@@ -109,10 +109,19 @@ import { observeThread, type ThreadObservation } from "./bridge/session.ts";
 import { type MergedDispatch, TurnQueue, turnQueueLayer } from "./bridge/turnQueue.ts";
 import { OutboundQueue, outboundQueueLayer } from "./bridge/outbound.ts";
 import { BindingState, bindingStateLayer } from "./bridge/bindingState.ts";
+import { WorkspaceState, workspaceStateLayer } from "./bridge/workspaceState.ts";
+import {
+  createRejectedNoticeText,
+  noProviderNoticeText,
+  OfflineRetry,
+  runOfflineCreateFlush,
+  turnRejectedNoticeText,
+  workspaceCollisionOutlet,
+} from "./bridge/createIntent.ts";
 import { runShellCacheFiber, shellStatus } from "./bridge/shellCache.ts";
 import { runShellWatcherFiber } from "./bridge/shellWatcher.ts";
 import { tryHandleCommand } from "./bridge/commands/registry.ts";
-import { buildCommandTable } from "./bridge/commands/handlers.ts";
+import { buildCommandTable, WorkspaceCommandError } from "./bridge/commands/handlers.ts";
 
 /**
  * How long to wait for the first shell snapshot (i.e. a healthy, authenticated
@@ -122,97 +131,17 @@ import { buildCommandTable } from "./bridge/commands/handlers.ts";
  */
 const DISCOVERY_TIMEOUT = Duration.seconds(30);
 
-/**
- * "Still offline — retry me" signal. A buffered turn raised by the outbound flush
- * fails with this when the environment dropped again mid-flush, so the outbound
- * queue keeps the intent (+ its ⏳) and retries on a later flush rather than
- * recording it as sent. Internal to the bridge; never escapes a handler.
- */
-class OfflineRetry extends Data.TaggedError("OfflineRetry") {}
-
-/** Picked project: its id plus the default model selection (if any). */
-interface PickedProject {
-  readonly projectId: ProjectId;
-  readonly defaultModelSelection: ModelSelection | null;
-}
-
-// ── Project / model discovery (reused verbatim from M0) ──────────────────────
-
-/**
- * Extract the first project from a shell stream item, if present, as a `Filter`
- * result (for `Stream.filterMap`).
- */
-function projectFromShellItem(
-  item: OrchestrationShellStreamItem,
-): Result.Result<PickedProject, void> {
-  if (item.kind === "snapshot") {
-    const first = item.snapshot.projects[0];
-    return first === undefined
-      ? Result.failVoid
-      : Result.succeed({ projectId: first.id, defaultModelSelection: first.defaultModelSelection });
-  }
-  if (item.kind === "project-upserted") {
-    return Result.succeed({
-      projectId: item.project.id,
-      defaultModelSelection: item.project.defaultModelSelection,
-    });
-  }
-  return Result.failVoid;
-}
-
-/** Discover the first project, creating one when the server has none. */
-const discoverProject = (
-  config: FeishuBotConfig,
-  environmentId: EnvironmentId,
-  registry: EnvironmentRegistry["Service"],
-  shellStream: Stream.Stream<OrchestrationShellStreamItem>,
-) =>
-  Effect.gen(function* () {
-    const projects = shellStream.pipe(Stream.filterMap(projectFromShellItem));
-
-    const firstFrame = yield* Stream.runHead(shellStream.pipe(Stream.take(1)));
-    const fromSnapshot = Option.flatMap(firstFrame, (item) =>
-      Result.getSuccess(projectFromShellItem(item)),
-    );
-    if (Option.isSome(fromSnapshot)) {
-      return fromSnapshot.value;
-    }
-
-    // Escape-hatch guard (M2b-2): `workspaceRoot` is now `string | null`. The
-    // happy path returns from the snapshot branch above and never reaches here.
-    // We only land here on a *bare* server (no project yet). Without an explicit
-    // `T3_WORKSPACE_ROOT` we must NOT invent one (the old `process.cwd()` default
-    // silently created a project at the bot's cwd) and must NOT pass `null` into
-    // `createProject` (whose `workspaceRoot: TrimmedNonEmptyString` schema would
-    // fail to decode at dispatch). Die with an actionable message instead.
-    if (config.workspaceRoot === null) {
-      return yield* Effect.die(
-        new Error(
-          "Server has no project and T3_WORKSPACE_ROOT is not set. " +
-            "Either configure a project on the server first, or set " +
-            "T3_WORKSPACE_ROOT to the path where the bot should create one.",
-        ),
-      );
-    }
-    yield* Console.log(`[feishu-bot] no project found; creating one at ${config.workspaceRoot}.`);
-    const projectId = yield* makeBrandedId(ProjectId);
-    yield* registry.run(
-      environmentId,
-      createProject({
-        projectId,
-        title: "feishu-bot",
-        workspaceRoot: config.workspaceRoot,
-        createWorkspaceRootIfMissing: true,
-      }),
-    );
-
-    const created = yield* Stream.runHead(projects);
-    return yield* Option.match(created, {
-      onNone: () =>
-        Effect.die(new Error("Project was created but never appeared in the shell stream.")),
-      onSome: Effect.succeed,
-    });
-  });
+// ── Model resolution (M-1: per-chat, no startup project) ─────────────────────
+//
+// M0's `discoverProject` (blind `projects[0]` pick + `T3_WORKSPACE_ROOT`
+// auto-create on a bare server) is GONE: the project is no longer fixed at
+// startup. Each conversation explicitly selects its workspace via `/workspace`
+// (persisted in `WorkspaceState`/`ChatWorkspaceStore`), and thread creation
+// resolves the project — and its model selection — per chat at dispatch time.
+// A bot connected to a zero-project server boots normally; users must
+// `/workspace add`/`switch` before the first prompt. The `workspaceRoot`
+// config field (and the server-managed `T3_WORKSPACE_ROOT` injection) is kept
+// for compatibility but is no longer consumed here.
 
 /**
  * Whether `selection` still names a model on a currently-ready provider. Used to
@@ -241,15 +170,20 @@ const isSelectionRoutable = (
  *     `opus` → the canonical slug and name matches), preferring an exact/alias
  *     hit. Die — listing the available slugs across *every* ready provider — if
  *     nothing matches.
- *  2. The project's **`defaultModelSelection`**, but only if it still names a
- *     model on a ready provider; otherwise fall back (with a warning).
+ *  2. The selected project's **`defaultModelSelection`** (passed by the
+ *     caller; M-1 resolves this per chat from the chat's selected workspace),
+ *     but only if it still names a model on a ready provider; otherwise fall
+ *     back (with a warning).
  *  3. The **first ready provider's first model**.
  *
  * "Ready" mirrors the web client: `enabled && isProviderAvailable && status ===
  * "ready"`. Dies with a clear message when no ready provider (or no model on
  * one) is available.
  */
-const resolveModelSelection = (project: PickedProject, modelOverride: string | null) =>
+const resolveModelSelection = (
+  defaultModelSelection: ModelSelection | null,
+  modelOverride: string | null,
+) =>
   Effect.gen(function* () {
     const serverConfig = yield* EnvironmentRpc.request(WS_METHODS.serverGetConfig, {});
     const readyProviders = serverConfig.providers.filter(
@@ -297,13 +231,13 @@ const resolveModelSelection = (project: PickedProject, modelOverride: string | n
 
     // 2. No override: prefer the project's persisted default, but only if it is
     //    still routable on a ready provider; otherwise fall back with a warning.
-    if (project.defaultModelSelection !== null) {
-      if (isSelectionRoutable(project.defaultModelSelection, readyProviders)) {
-        return project.defaultModelSelection;
+    if (defaultModelSelection !== null) {
+      if (isSelectionRoutable(defaultModelSelection, readyProviders)) {
+        return defaultModelSelection;
       }
       yield* Console.warn(
-        `[feishu-bot] project default model ${project.defaultModelSelection.instanceId}/` +
-          `${project.defaultModelSelection.model} is no longer on a ready provider; ` +
+        `[feishu-bot] project default model ${defaultModelSelection.instanceId}/` +
+          `${defaultModelSelection.model} is no longer on a ready provider; ` +
           "falling back to the first ready provider's first model.",
       );
     }
@@ -331,6 +265,14 @@ const makeBrandedId = <A>(brand: { readonly make: (value: string) => A }) =>
  * statically-valid placeholder title, so callers `Effect.orDie` the result.
  */
 const decodeTrimmedNonEmpty = Schema.decodeEffect(TrimmedNonEmptyString);
+
+/**
+ * Decode a {@link ModelSelection} from a plain literal. Compiled once at module
+ * scope. Used only for the statically-valid placeholder selection (M-1: the
+ * placeholder thread no longer inherits a startup project/model), so callers
+ * `Effect.orDie` the result.
+ */
+const decodeModelSelection = Schema.decodeUnknownEffect(ModelSelection);
 
 /**
  * The set of request ids whose pending approval/user-input was force-resolved by
@@ -458,6 +400,10 @@ const runBoundSession = (
     // `ChatThreadMapStore` remains the backend behind it (`bindings.bind`/`unbind`
     // mirror writes through), provided to `bindingStateLayer` in `program`.
     const bindings = yield* BindingState;
+    // M-1: the per-chat workspace selection authority (in-memory, mirrored to
+    // the durable `ChatWorkspaceStore`). Read on every inbound message by the
+    // "no thread without a selected workspace" gate; written by `/workspace`.
+    const workspace = yield* WorkspaceState;
     const environmentId = resolved.target.environmentId;
 
     // M2b-3: the bridge's own (root) scope. PR2: this is now the *per-binding*
@@ -475,16 +421,20 @@ const runBoundSession = (
     const rootScope = yield* Effect.scope;
 
     yield* Console.log(`[feishu-bot] connected to ${resolved.target.label} (${environmentId}).`);
-    yield* Console.log("[feishu-bot] discovering project...");
+    yield* Console.log("[feishu-bot] waiting for the first shell snapshot...");
 
+    // Startup health gate (M-1: replaces `discoverProject`): wait for the first
+    // shell frame so a wrong `wsBaseUrl` / failed ws-ticket exchange still fails
+    // fast with an actionable message. The frame's *content* no longer matters —
+    // a zero-project server is a normal boot state now; each conversation picks
+    // its workspace via `/workspace` before its first thread is created.
     const shellStream = registry
       .followStream(
         environmentId,
         EnvironmentRpc.subscribe(ORCHESTRATION_WS_METHODS.subscribeShell, {}),
       )
       .pipe(Stream.orDie);
-
-    const project = yield* discoverProject(config, environmentId, registry, shellStream).pipe(
+    yield* Stream.runHead(shellStream.pipe(Stream.take(1))).pipe(
       Effect.timeoutOrElse({
         duration: DISCOVERY_TIMEOUT,
         orElse: () =>
@@ -497,15 +447,6 @@ const runBoundSession = (
           ),
       }),
     );
-    yield* Console.log(`[feishu-bot] using project ${project.projectId}.`);
-
-    const modelSelection = yield* registry.run(
-      environmentId,
-      resolveModelSelection(project, config.modelOverride),
-    );
-    yield* Console.log(
-      `[feishu-bot] model: ${modelSelection.instanceId} / ${modelSelection.model}.`,
-    );
 
     // Per-turn model selection (M2 cross-end safety). Only an *explicit*
     // `T3_MODEL` override pins the model on every turn; without one we omit
@@ -516,9 +457,22 @@ const runBoundSession = (
     // next turn for `requiresNewThreadForModelChange` providers like Grok),
     // and the server does not per-turn-switch an existing thread anyway, so it
     // would be useless and harmful. (`createThread` still always carries
-    // `modelSelection` — it is required to build the thread.)
+    // `modelSelection` — it is required to build the thread; M-1 resolves that
+    // one per chat, from the selected project's default, at create time.)
+    //
+    // M-1: the override is project-independent (priority 1 in
+    // `resolveModelSelection` never consults the project default), so it is
+    // still resolved ONCE at session start; without an override nothing is
+    // resolved here.
     const perTurnModelSelection: ModelSelection | null =
-      config.modelOverride === null ? null : modelSelection;
+      config.modelOverride === null
+        ? null
+        : yield* registry.run(environmentId, resolveModelSelection(null, config.modelOverride));
+    if (perTurnModelSelection !== null) {
+      yield* Console.log(
+        `[feishu-bot] model override: ${perTurnModelSelection.instanceId} / ${perTurnModelSelection.model}.`,
+      );
+    }
 
     // Capture the platform crypto service so environment-scoped command
     // operations (which need `Crypto` for any auto-generated ids) can have that
@@ -665,11 +619,22 @@ const runBoundSession = (
     const placeholderTimestamp = "1970-01-01T00:00:00.000Z";
     const placeholderThreadId = yield* genId(ThreadId);
     const placeholderMessageId = yield* genId(MessageId);
+    // M-1: with no startup project the placeholder carries *synthetic* ids. It
+    // is a local render seed only — `renderThreadCard` reads
+    // `messages`/`activities`/`session` and never the project/model fields, and
+    // the workspace gate guarantees a real selected project exists before any
+    // real thread render replaces this seed. The decode is statically valid, so
+    // a failure is a programmer error (defect), same as `placeholderTitle`.
+    const placeholderProjectId = yield* genId(ProjectId);
+    const placeholderModelSelection = yield* decodeModelSelection({
+      instanceId: "feishu-bot",
+      model: "placeholder",
+    }).pipe(Effect.orDie);
     const placeholderThread: OrchestrationThread = {
       id: placeholderThreadId,
-      projectId: project.projectId,
+      projectId: placeholderProjectId,
       title: placeholderTitle,
-      modelSelection,
+      modelSelection: placeholderModelSelection,
       // Safe default for the first streaming frame: driveTurn / runObserveFiber
       // render this placeholder before the real snapshot arrives, and
       // approval-required carries no header badge — so the card never flashes a
@@ -766,6 +731,43 @@ const runBoundSession = (
       )
       .pipe(Stream.orDie);
     const shellCache = yield* runShellCacheFiber({ shellStream: shellSubscription });
+
+    // ── M-1: per-chat selected workspace resolution ──────────────────────────
+    //
+    // The three-way status of a conversation's `/workspace` selection, resolved
+    // against the *current* shell snapshot at the moment of use (so a project
+    // deleted after selection is caught at dispatch time, not trusted forever):
+    //   - "none":        the chat never selected a workspace.
+    //   - "unavailable": a selection exists but its project is not in the
+    //     current snapshot (deleted elsewhere, or the snapshot has not been
+    //     seeded yet). The selection is intentionally KEPT (not auto-cleared):
+    //     the snapshot can be transiently stale around reconnects, and a
+    //     `/workspace` re-select overwrites it anyway.
+    //   - "ok":          the selection names a live project (carried along).
+    type SelectedWorkspace =
+      | { readonly kind: "none" }
+      | { readonly kind: "unavailable"; readonly projectId: ProjectId }
+      | { readonly kind: "ok"; readonly project: OrchestrationProjectShell };
+
+    const selectedWorkspaceFor = (chatKey: string): Effect.Effect<SelectedWorkspace> =>
+      Effect.gen(function* () {
+        const projectId = yield* workspace.get(chatKey);
+        if (projectId === null) {
+          return { kind: "none" } satisfies SelectedWorkspace;
+        }
+        const snapshot = yield* shellCache.current;
+        const project = snapshot?.projects.find((candidate) => candidate.id === projectId);
+        return project === undefined
+          ? ({ kind: "unavailable", projectId } satisfies SelectedWorkspace)
+          : ({ kind: "ok", project } satisfies SelectedWorkspace);
+      });
+
+    // User-facing gate text for a not-"ok" selection (the workspace gate and
+    // the `ensureThread` dispatch-time re-check share this wording).
+    const workspaceGateText = (selected: SelectedWorkspace): string =>
+      selected.kind === "none"
+        ? "请先用 /workspace 选择工作区(发送 /workspace 查看可选项)。"
+        : "当前选中的工作区已不可用(项目可能已被删除或服务器尚未同步),请用 /workspace 重新选择。";
 
     // PR2: the M4-2 approval-allowlist live-refresh fiber is hoisted OUT of this
     // per-binding session into the resident loop's OUTER scope (see
@@ -1573,9 +1575,100 @@ const runBoundSession = (
       noticeMemoryStore,
     });
 
-    // The slash-command table (`/help`, `/status`, `/resume`, `/release`). All
-    // deps are already-total effects (captured service values + the mirror hooks
-    // above), so every handler slots into the table as `Effect.Effect<void>`.
+    // ── M-1: `/workspace add` backends ───────────────────────────────────────
+
+    // Best-effort human-readable description of a typed RPC/registry failure,
+    // for the user-facing WorkspaceCommandError messages below.
+    const describeError = (error: unknown): string =>
+      error instanceof Error
+        ? error.message
+        : typeof error === "object" && error !== null && "message" in error
+          ? String((error as { message: unknown }).message)
+          : String(error);
+
+    // After a `createProject` dispatch, wait for the project to surface in the
+    // shell snapshot (the projection round-trip is normally instant; 10s is the
+    // generous bound). `null` on timeout — the caller reports it rather than
+    // guessing at a shell it cannot see.
+    const AWAIT_PROJECT_TRIES = 40;
+    const AWAIT_PROJECT_INTERVAL = Duration.millis(250);
+    const awaitProjectVisible = (
+      projectId: ProjectId,
+    ): Effect.Effect<OrchestrationProjectShell | null> =>
+      Effect.gen(function* () {
+        for (let attempt = 0; attempt < AWAIT_PROJECT_TRIES; attempt += 1) {
+          const snapshot = yield* shellCache.current;
+          const found = snapshot?.projects.find((project) => project.id === projectId);
+          if (found !== undefined) {
+            return found;
+          }
+          yield* Effect.sleep(AWAIT_PROJECT_INTERVAL);
+        }
+        return null;
+      });
+
+    // `/workspace add <local path>` backend: dispatch `createProject`
+    // (creating the directory when missing — the M0 escape-hatch template) and
+    // resolve once the shell snapshot carries the new project.
+    const createWorkspaceProject = (
+      workspaceRoot: string,
+    ): Effect.Effect<OrchestrationProjectShell, WorkspaceCommandError> =>
+      Effect.gen(function* () {
+        const projectId = yield* genId(ProjectId);
+        const title = workspaceRoot.replace(/\/+$/, "").split("/").pop() ?? "workspace";
+        yield* registry
+          .run(
+            environmentId,
+            createProject({
+              projectId,
+              title: title.length > 0 ? title : "workspace",
+              workspaceRoot,
+              createWorkspaceRootIfMissing: true,
+            }),
+          )
+          .pipe(
+            Effect.provideService(Crypto.Crypto, crypto),
+            Effect.mapError(
+              (error) =>
+                new WorkspaceCommandError({ message: `创建工作区失败: ${describeError(error)}` }),
+            ),
+          );
+        const visible = yield* awaitProjectVisible(projectId);
+        if (visible === null) {
+          return yield* new WorkspaceCommandError({
+            message: "工作区创建已提交,但尚未出现在项目列表;稍后发送 /workspace 查看并切换。",
+          });
+        }
+        return visible;
+      });
+
+    // `/workspace add <git url>` backend: server-side clone via the
+    // `sourceControl.cloneRepository` RPC (the server expands `~`/relative
+    // destination paths against its own filesystem), returning the checkout cwd.
+    const cloneWorkspaceRepository = (
+      remoteUrl: string,
+      destinationPath: string,
+    ): Effect.Effect<string, WorkspaceCommandError> =>
+      registry
+        .run(
+          environmentId,
+          EnvironmentRpc.request(WS_METHODS.sourceControlCloneRepository, {
+            remoteUrl,
+            destinationPath,
+          }),
+        )
+        .pipe(
+          Effect.map((result) => result.cwd),
+          Effect.mapError(
+            (error) => new WorkspaceCommandError({ message: `克隆失败: ${describeError(error)}` }),
+          ),
+        );
+
+    // The slash-command table (`/help`, `/status`, `/workspace`, `/resume`,
+    // `/release`, `/whoami`). All deps are already-total effects (captured
+    // service values + the mirror hooks above) or typed-error backends the
+    // handlers catch themselves, so every handler slots into the table as
+    // `Effect.Effect<void>`.
     const commandTable = buildCommandTable({
       sendNotice,
       bindings,
@@ -1587,6 +1680,16 @@ const runBoundSession = (
       // the same chat does not inherit stale "✅ 已由 …" greyed-out controls.
       clearResolvedNotices: clearChatResolvedNotices,
       isChatBusy,
+      // M-1 (/workspace + /resume ownership): the selection authority and the
+      // add backends.
+      workspace: { get: workspace.get, select: workspace.select },
+      createWorkspaceProject,
+      cloneRepository: cloneWorkspaceRepository,
+      // Review fix C①: `/workspace switch` gate 3 — a buffered first-contact
+      // create captured its project at buffer time, so the selection must not
+      // change out from under it while it waits for the reconnect flush.
+      hasPendingCreate: (chatKey) =>
+        Ref.get(pendingCreates).pipe(Effect.map((set) => set.has(chatKey))),
     });
 
     // ── M2b-3: pure render loop shared by `driveTurn` and `runObserveFiber` ──
@@ -2230,16 +2333,36 @@ const runBoundSession = (
             const triggerMessageId = dispatch.sources[0]?.message.messageId ?? dispatch.commandId;
             const dispatched = yield* registry.run(environmentId, turnStart).pipe(
               Effect.provideService(Crypto.Crypto, crypto),
-              Effect.as(true as const),
+              Effect.as("dispatched" as const),
               Effect.catchTags({
-                EnvironmentRpcUnavailableError: () => Effect.succeed(false as const),
-                EnvironmentNotRegisteredError: () => Effect.succeed(false as const),
+                EnvironmentRpcUnavailableError: () => Effect.succeed("offline" as const),
+                EnvironmentNotRegisteredError: () => Effect.succeed("offline" as const),
               }),
-              // Any other failure (validation/internal) is a genuine defect.
-              Effect.orDie,
+              // Review fix A③ / turn-intent backstop: any OTHER failure is the
+              // server actively rejecting this dispatch (thread missing after a
+              // dropped create, previously-rejected receipt, validation). It
+              // used to `orDie` — which silently LOST the message on the live
+              // path and carried the intent over FOREVER on the flush path
+              // (dispatchOne retries every failure). A rejection is terminal
+              // for this exact commandId: settle the intent (success → queue
+              // consumes it, ⏳ cleared) and tell the user visibly instead.
+              Effect.catchCause((cause) =>
+                Effect.logWarning(
+                  `[feishu-bot] turn dispatch rejected by the server for chat ${chatId}; dropping with a visible notice.`,
+                  cause,
+                ).pipe(Effect.as("rejected" as const)),
+              ),
             );
-            if (!dispatched) {
+            if (dispatched === "offline") {
               yield* onOffline({ chatId, dispatch, feishuMessageId: triggerMessageId });
+              return;
+            }
+            if (dispatched === "rejected") {
+              yield* sendNotice(
+                chatId,
+                turnRejectedNoticeText,
+                dispatch.sources[0]?.message.messageId,
+              );
               return;
             }
             // Record the dispatch as sent (M9) so a later replay/flush short-circuits.
@@ -2330,13 +2453,23 @@ const runBoundSession = (
      *
      * Outcomes:
      *  - already bound → the bound `threadId`.
+     *  - unbound + no valid workspace selection (M-1) → notice + `null` (the
+     *    handleInbound gate is the first line; this re-check is authoritative
+     *    at create time — the project may have been deleted in between).
+     *  - unbound + the deterministic threadId already EXISTS on the server
+     *    (M-1 adopt-if-exists): same project → re-bind to it (no create);
+     *    other project / archived → notice + `null` (the server rejects a
+     *    create for an existing id — `requireThreadAbsent` — and
+     *    `deriveThreadId` is intentionally project-agnostic, so the id cannot
+     *    be re-minted under the new workspace).
      *  - unbound + ready → online `createThread` + persist → the new `threadId`.
      *    A mid-create environment drop falls back to the offline buffer.
      *  - unbound + offline → ⏳/notice + buffered create intent (binding persisted
      *    on flush success) → the (deterministic) `threadId`. The turn is buffered
-     *    separately by `runTurn`'s offline branch.
+     *    separately by `runTurn`'s offline branch. The buffered create resolves
+     *    its model selection at FLUSH time (the resolve needs a live RPC).
      */
-    const ensureThread = (message: InboundMessage): Effect.Effect<ThreadId> =>
+    const ensureThread = (message: InboundMessage): Effect.Effect<ThreadId | null> =>
       Effect.gen(function* () {
         // M3a: a Feishu topic backs its own thread, so every binding op keys on the
         // composite `chatId[:larkThreadId]` (byte-identical to the bare chatId for
@@ -2355,11 +2488,94 @@ const runBoundSession = (
           return existing.threadId;
         }
 
+        // M-1 dispatch-time workspace re-check (second line; the handleInbound
+        // gate already screened, but the project can be deleted between the two).
+        const selected = yield* selectedWorkspaceFor(chatKey);
+        if (selected.kind !== "ok") {
+          yield* sendNotice(chatKey, workspaceGateText(selected), message.messageId);
+          return null;
+        }
+        const project = selected.project;
+
         // First contact. Derive the deterministic threadId up front so both the
         // online and offline create paths agree on it (and on the stable create
         // commandId), making re-delivery idempotent against the server. The topic
         // is folded into the derivation so a topic gets a distinct thread id.
         const threadId = deriveThreadId(message.chatId, larkThreadId);
+
+        // M-1 adopt-if-exists. The server REJECTS a create whose threadId
+        // already exists (`requireThreadAbsent`, commandInvariants.ts) — and a
+        // thread with this derived id can only have been self-created by an
+        // earlier epoch of this very conversation (before a `/release`). So:
+        //   - live + same project  → re-bind (adopt), no create dispatched;
+        //     this also heals the plain `/release` → next-message flow, which
+        //     would otherwise create-collide and wedge in the offline buffer.
+        //   - live + other project → refuse: the deterministic id is taken
+        //     (`deriveThreadId` stays project-agnostic by design — the M3a
+        //     zero-re-bind red line), so this conversation cannot self-create
+        //     under the newly selected workspace. `/resume` still works.
+        //   - archived             → refuse (the create would be rejected, and
+        //     an archived thread cannot run turns). NOTE: normally UNREACHABLE
+        //     — the shell snapshot does not carry archived/deleted threads —
+        //     kept as a defensive fast path; the authoritative backstop for
+        //     "id occupied by a thread the snapshot cannot see" is the
+        //     rejected-create disposition below (review fix B).
+        // Reads the last-known shell snapshot — present whenever the M-1 gate
+        // above passed (an "ok" selection implies a seeded snapshot).
+        const collided = yield* shellCache.threadById(threadId);
+        if (collided !== null) {
+          if (collided.archivedAt !== null) {
+            yield* sendNotice(
+              chatKey,
+              "此对话之前的会话已归档,无法在同一对话中自动重建(会话 ID 由对话唯一决定)。" +
+                workspaceCollisionOutlet(message.chatType),
+              message.messageId,
+            );
+            return null;
+          }
+          if (collided.projectId !== project.id) {
+            yield* sendNotice(
+              chatKey,
+              "此对话之前已在另一个工作区创建过会话,无法在当前工作区新建(会话 ID 由对话唯一决定)。" +
+                workspaceCollisionOutlet(message.chatType),
+              message.messageId,
+            );
+            return null;
+          }
+          // Review fix D: the adopt re-bind is a takeover like `/resume`, so it
+          // must honour the SAME M3a full-access gate (shared predicate) — a
+          // group/topic chat must not silently re-bind a full-access thread.
+          if (refusesFullAccessTakeover(runtimeMode, collided.runtimeMode)) {
+            yield* sendNotice(
+              chatKey,
+              "⚠️ 此对话的历史会话为 full-access(全权限)模式,群聊/话题不可重新绑定全权限会话,以免无人值守执行破坏性操作。请在 web 端处理该会话,或在新话题中开始。",
+              message.messageId,
+            );
+            return null;
+          }
+          yield* bindings.bind(chatKey, {
+            threadId,
+            origin: "self-created",
+            topicAnchorMessageId: message.messageId,
+            density: densityForRuntime(runtimeMode, groupChatDensity),
+          });
+          yield* Console.log(
+            `[feishu-bot] re-bound chat ${message.chatId} to its existing thread ${threadId}.`,
+          );
+          return threadId;
+        }
+
+        // Un-mark this chat's pending-create dedup (review fixes A/B/C: a
+        // DROPPED intent must release the dedup so the chat's next message can
+        // attempt a fresh create instead of being deduped against a corpse).
+        const clearPendingCreate = Ref.update(pendingCreates, (set) => {
+          if (!set.has(chatKey)) {
+            return set;
+          }
+          const next = new Set(set);
+          next.delete(chatKey);
+          return next;
+        });
 
         // Offline first contact (MEDIUM): visible ⏳ receipt + notice, then buffer
         // the `createThread` as an outbound intent that persists the binding *on
@@ -2398,44 +2614,57 @@ const runBoundSession = (
             commandId: createCommandId,
             feishuMessageId: message.messageId,
             // Create THEN persist the binding — only a created thread gets a
-            // binding, so a crash before the flush leaves no binding pointing at a
-            // missing thread. `runOnEnv` orDies an offline re-drop into a defect,
-            // which the outbound flush captures as a retry (keeps the intent + ⏳).
-            run: runOnEnv(
-              createThread({
-                commandId: createCommandId,
-                threadId,
-                projectId: project.projectId,
-                title: `Feishu · ${message.senderName ?? message.senderId} (${message.chatId.slice(0, 12)})`,
-                modelSelection,
-                // M3a: p2p stays full-access; group/topic creates an
-                // approval-required thread (matches the online create path).
-                runtimeMode,
-                interactionMode: "default",
-                branch: null,
-                worktreePath: null,
-              }),
-            ).pipe(
+            // binding, so a crash before the flush leaves no binding pointing at
+            // a missing thread. The flush flow lives in `bridge/createIntent.ts`
+            // (review fixes A/B/C②): the model selection is resolved at FLUSH
+            // time (needs a live RPC; T3_MODEL override still wins inside), the
+            // selection is re-validated against the CURRENT `/workspace` choice,
+            // and a failure while the environment is READY (provider-less
+            // server, `requireThreadAbsent` rejection) is a terminal, VISIBLE
+            // drop — never an eternal carry-over; only a genuine mid-flush
+            // env drop raises `OfflineRetry` (queue keeps the intent + ⏳).
+            run: runOfflineCreateFlush({
+              chatKey,
+              chatType: message.chatType,
+              replyToMessageId: message.messageId,
+              projectId: project.id,
+              getSelectedProject: workspace.get(chatKey),
+              resolveModel: runOnEnv(
+                resolveModelSelection(project.defaultModelSelection, config.modelOverride),
+              ),
+              dispatchCreate: (flushModelSelection) =>
+                runOnEnv(
+                  createThread({
+                    commandId: createCommandId,
+                    threadId,
+                    projectId: project.id,
+                    title: `Feishu · ${message.senderName ?? message.senderId} (${message.chatId.slice(0, 12)})`,
+                    modelSelection: flushModelSelection,
+                    // M3a: p2p stays full-access; group/topic creates an
+                    // approval-required thread (matches the online create path).
+                    runtimeMode,
+                    interactionMode: "default",
+                    branch: null,
+                    worktreePath: null,
+                  }),
+                ),
               // Bind through the in-memory authority (BindingState), which also
               // mirrors the write to the durable store and absorbs a persist
               // failure (logged, not propagated) — so the create flush stays
               // total and the next message resolves the binding from memory.
-              Effect.andThen(
-                bindings.bind(chatKey, {
-                  threadId,
-                  origin: "self-created",
-                  // M3b: store the trigger message id as the topic reply anchor (it
-                  // belongs to the target topic; `anchorOf` may return an `omt_…`
-                  // which Feishu rejects as a reply target) and the bind-time density
-                  // so later topic-anchored cards / placeholder frames are correct.
-                  // Both are always defined here, so no conditional spread is needed.
-                  // p2p stores them harmlessly (no `larkThreadId` → `topicSendOpts`
-                  // yields `undefined`, and density is `card` either way).
-                  topicAnchorMessageId: message.messageId,
-                  density: densityForRuntime(runtimeMode, groupChatDensity),
-                }),
-              ),
-            ),
+              // M3b: store the trigger message id as the topic reply anchor and
+              // the bind-time density (see `ensureThreadForChat` for the full
+              // rationale); p2p stores them harmlessly.
+              bindChat: bindings.bind(chatKey, {
+                threadId,
+                origin: "self-created",
+                topicAnchorMessageId: message.messageId,
+                density: densityForRuntime(runtimeMode, groupChatDensity),
+              }),
+              isEnvReady,
+              clearPendingCreate,
+              sendNotice,
+            }),
           });
           return threadId;
         });
@@ -2444,6 +2673,37 @@ const runBoundSession = (
         if (!ready) {
           return yield* bufferOfflineCreate;
         }
+
+        // M-1: resolve the model selection for THIS create from the selected
+        // project's default (T3_MODEL override wins inside). Captured as an
+        // exit; the disposition (review fix A) hinges on a READINESS RE-READ:
+        //  - env no longer ready → a genuine mid-resolve drop (TOCTOU with
+        //    `isEnvReady`) → offline buffer (the reconnect edge WILL flush it);
+        //  - env still ready → a provider-less server. Buffering would be a
+        //    LIE: the flush is edge-triggered on reconnect, and an environment
+        //    that never dropped never re-fires it — the intent (and its "queued"
+        //    receipt) would hang forever while the live turn dispatches against
+        //    a thread that was never created (defect → message lost). Fail
+        //    HONESTLY instead: notice + no thread, no queue, `null`.
+        const selectionExit = yield* runOnEnv(
+          resolveModelSelection(project.defaultModelSelection, config.modelOverride),
+        ).pipe(Effect.exit);
+        if (selectionExit._tag === "Failure") {
+          if (!(yield* isEnvReady)) {
+            yield* Effect.logWarning(
+              `[feishu-bot] environment dropped mid model-resolution for chat ${message.chatId}; falling back to offline buffer.`,
+              selectionExit.cause,
+            );
+            return yield* bufferOfflineCreate;
+          }
+          yield* Effect.logWarning(
+            `[feishu-bot] model resolution failed for chat ${message.chatId} while connected (no ready provider?); refusing the message visibly.`,
+            selectionExit.cause,
+          );
+          yield* sendNotice(chatKey, noProviderNoticeText, message.messageId);
+          return null;
+        }
+        const modelSelection = selectionExit.value;
 
         // Online first contact. Attempt `createThread` + persist now. Capture the
         // exit so a mid-create environment drop (a TOCTOU between `isEnvReady` and
@@ -2454,7 +2714,7 @@ const runBoundSession = (
           message,
           {
             environmentId,
-            projectId: project.projectId,
+            projectId: project.id,
             modelSelection,
             dispatch: runOnEnv,
             generateThreadId: genId(ThreadId),
@@ -2467,11 +2727,26 @@ const runBoundSession = (
         ).pipe(Effect.provideService(BindingState, bindings), Effect.exit);
 
         if (ensuredExit._tag === "Failure") {
+          // Same readiness-re-read disposition as the resolve above (review fix
+          // B backstop): a mid-create env drop buffers (the reconnect edge will
+          // replay it); a rejection while STILL CONNECTED is the server actively
+          // refusing the create (dominantly `requireThreadAbsent`: the
+          // deterministic id is occupied by an archived/deleted thread the
+          // shell snapshot cannot show) — retrying or buffering can never
+          // succeed, so fail visibly instead of wedging in the queue.
+          if (!(yield* isEnvReady)) {
+            yield* Effect.logWarning(
+              `[feishu-bot] online first-contact create failed for chat ${message.chatId} (environment dropped); falling back to offline buffer.`,
+              ensuredExit.cause,
+            );
+            return yield* bufferOfflineCreate;
+          }
           yield* Effect.logWarning(
-            `[feishu-bot] online first-contact create failed for chat ${message.chatId}; falling back to offline buffer.`,
+            `[feishu-bot] server rejected first-contact create for chat ${message.chatId}; refusing the message visibly.`,
             ensuredExit.cause,
           );
-          return yield* bufferOfflineCreate;
+          yield* sendNotice(chatKey, createRejectedNoticeText(message.chatType), message.messageId);
+          return null;
         }
         // M9: record the (stable) create commandId locally on a fresh create so a
         // crash-recovery replay short-circuits instead of re-dispatching (the
@@ -2555,15 +2830,37 @@ const runBoundSession = (
           return;
         }
 
+        // M-1 workspace gate: "no thread without a selected workspace". Only a
+        // NOT-yet-bound conversation needs a (valid) selection — an already
+        // bound chat has its thread and keeps the session regardless (pre-M-1
+        // bindings and `/resume` takeovers pass through untouched). Commands
+        // were routed above, so they are never gated. `ensureThread` re-checks
+        // authoritatively at create time; this early gate exists so a
+        // workspace-less chat is answered BEFORE the turn queue is touched.
+        if ((yield* bindings.get(chatKey)) === null) {
+          const selected = yield* selectedWorkspaceFor(chatKey);
+          if (selected.kind !== "ok") {
+            yield* sendNotice(chatKey, workspaceGateText(selected), message.messageId);
+            return;
+          }
+        }
+
         // Ensure the chat↔thread binding FIRST (serialised) so the queue resolves
         // the real threadId when it merges — the stable commandId triple includes
         // the threadId, so offering before binding would derive the wrong id.
-        // We run `ensureThread` purely for its build-thread side effect (first
+        // We run `ensureThread` for its build-thread side effect (first
         // contact: create + bind, or buffer offline); the turn's actual target is
         // NOT taken from here but from the merged dispatch's own resolution (B1),
         // so a concurrent `/resume` re-bind between here and the offer cannot make
-        // the dispatch target and its commandId disagree.
-        yield* ensureThread(message).pipe(ensureLock.withPermits(1));
+        // the dispatch target and its commandId disagree. M-1: a `null` result
+        // means the create was refused (workspace missing/stale at create time,
+        // or the deterministic threadId collided with another workspace's
+        // thread) — `ensureThread` already sent the notice, so just stop here
+        // (never offer a turn that has no thread to land on).
+        const ensured = yield* ensureThread(message).pipe(ensureLock.withPermits(1));
+        if (ensured === null) {
+          return;
+        }
 
         // `offer` blocks for the idle coalescing window; concurrent offers for
         // the same chat collapse via the generation-debounce into one dispatch.
@@ -3590,12 +3887,13 @@ export const program = (
     const environmentId = resolved.target.environmentId;
 
     // OUTER layer (long-lived, built once): the durable stores + the in-memory
-    // binding authority + the server connection. `bindingStateLayer` requires the
-    // `ChatThreadMapStore` that `fileStoresLayer` provides, so `provideMerge` it
-    // *with* the store set below it (the store is fed to it and both outputs are
-    // retained, so `ChatThreadMapStore` does not leak into the program's RIn). The
+    // binding/workspace authorities + the server connection. `bindingStateLayer`
+    // requires the `ChatThreadMapStore` — and `workspaceStateLayer` (M-1) the
+    // `ChatWorkspaceStore` — that `fileStoresLayer` provides, so `provideMerge`
+    // them *with* the store set below (the stores are fed to them and both
+    // outputs are retained, so neither store leaks into the program's RIn). The
     // Lark gateway is NO LONGER here — it is per-binding (see `boundLayer` below).
-    const outerLayer = bindingStateLayer.pipe(
+    const outerLayer = Layer.merge(bindingStateLayer, workspaceStateLayer).pipe(
       Layer.provideMerge(
         Layer.mergeAll(
           connectionLayer({ target: resolved.target, accessToken: resolved.accessToken }),

@@ -14,6 +14,7 @@ import type {
   EnvironmentId,
   OrchestrationShellSnapshot,
   OrchestrationThread,
+  ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as NodeOS from "node:os";
@@ -344,6 +345,44 @@ export class ChatThreadMapStore extends Context.Service<
 >()("@t3tools/feishu-bot/runtime/persistence/ChatThreadMapStore") {}
 
 /**
+ * Persistent map of a Feishu conversation key → the {@link ProjectId} the chat
+ * has explicitly selected via `/workspace` (M-1, per-chat-config milestone).
+ *
+ * This is the *selection state* behind the "no thread without a selected
+ * workspace" gate: a chat must pick a workspace before its first message may
+ * create a thread, and `/resume` only lists/accepts threads belonging to the
+ * chat's selected project. Deliberately a separate store from
+ * {@link ChatThreadMapStore} — a selection exists *before* any thread does
+ * (`ChatBinding.threadId` is required), and it survives `/release` (releasing a
+ * session does not un-choose the workspace).
+ *
+ * Key: the composite `chatId[:larkThreadId]` (`compositeChatKey`), NOT the bare
+ * chat id — each topic in a topic group selects its workspace independently
+ * (intentional; mirrors the binding-key granularity, see the kickoff §5A/§5B).
+ */
+export class ChatWorkspaceStore extends Context.Service<
+  ChatWorkspaceStore,
+  {
+    /** Resolve the selected project for `chatKey`, if any. */
+    readonly get: (
+      chatKey: string,
+    ) => Effect.Effect<Option.Option<ProjectId>, FeishuBotPersistenceError>;
+    /** Select `projectId` for `chatKey` (overwrites any existing selection). */
+    readonly put: (
+      chatKey: string,
+      projectId: ProjectId,
+    ) => Effect.Effect<void, FeishuBotPersistenceError>;
+    /** Drop the selection for `chatKey` (no-op if absent). */
+    readonly remove: (chatKey: string) => Effect.Effect<void, FeishuBotPersistenceError>;
+    /** Snapshot every `[chatKey, projectId]` pair (e.g. for warm-up logging). */
+    readonly entries: Effect.Effect<
+      ReadonlyArray<readonly [string, ProjectId]>,
+      FeishuBotPersistenceError
+    >;
+  }
+>()("@t3tools/feishu-bot/runtime/persistence/ChatWorkspaceStore") {}
+
+/**
  * Persistent set of already-dispatched `commandId`s, for local idempotency.
  *
  * Before dispatching a `ThreadTurnStart`/`createThread` the bridge derives a
@@ -454,6 +493,46 @@ export const chatThreadMapStoreLayer = (options: {
           }),
         entries: Effect.sync(
           () => Array.from(map.entries()) as ReadonlyArray<readonly [string, ChatBinding]>,
+        ),
+      });
+    }),
+  );
+
+/**
+ * {@link ChatWorkspaceStore} layer backed by a JSON file at
+ * `<stateDir>/chat-workspace.json` (override the full path via `filePath`).
+ *
+ * The JSON shape is `{ [chatKey]: projectId }` — a flat string map, so no
+ * migration/normalisation is needed (identity load).
+ */
+export const chatWorkspaceStoreLayer = (options: {
+  readonly stateDir: string;
+  readonly filePath?: string;
+}): Layer.Layer<ChatWorkspaceStore, FeishuBotPersistenceError, FileSystem.FileSystem | Path.Path> =>
+  Layer.effect(
+    ChatWorkspaceStore,
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const file = options.filePath ?? path.join(options.stateDir, "chat-workspace.json");
+      const backend = jsonFileBackend<ProjectId>(file, { fs, path });
+      const { map, persist } = yield* loadBackedMap(backend);
+      return ChatWorkspaceStore.of({
+        get: (chatKey) => Effect.sync(() => Option.fromUndefinedOr(map.get(chatKey))),
+        put: (chatKey, projectId) =>
+          Effect.suspend(() => {
+            map.set(chatKey, projectId);
+            return persist;
+          }),
+        remove: (chatKey) =>
+          Effect.suspend(() => {
+            if (!map.delete(chatKey)) {
+              return Effect.void;
+            }
+            return persist;
+          }),
+        entries: Effect.sync(
+          () => Array.from(map.entries()) as ReadonlyArray<readonly [string, ProjectId]>,
         ),
       });
     }),
@@ -864,6 +943,7 @@ export const fileStoresLayer = (options: {
   readonly stateDir: string;
 }): Layer.Layer<
   | ChatThreadMapStore
+  | ChatWorkspaceStore
   | SentCommandStore
   | CallbackNonceStore
   | AuditStore
@@ -874,6 +954,7 @@ export const fileStoresLayer = (options: {
 > =>
   Layer.mergeAll(
     chatThreadMapStoreLayer(options),
+    chatWorkspaceStoreLayer(options),
     sentCommandStoreLayer(options),
     callbackNonceStoreLayer(options),
     auditStoreLayer(options),
