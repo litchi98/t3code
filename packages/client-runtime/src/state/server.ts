@@ -248,6 +248,13 @@ export function createServerEnvironmentAtoms<R, E>(
       label: "environment-data:server:feishu-clear-binding",
       tag: WS_METHODS.feishuClearBinding,
     }),
+    // The bot-reported group roster (M-0), read by the feishu settings UI to
+    // list the bot's groups and pick designated approvers. Read-only query; the
+    // bot owns the write side via `feishu.reportChats`.
+    feishuListChats: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:server:feishu-list-chats",
+      tag: WS_METHODS.feishuListChats,
+    }),
     signalProcess: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:signal-process",
       tag: WS_METHODS.serverSignalProcess,

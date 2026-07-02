@@ -98,3 +98,50 @@ export const FeishuBotCredentials = Schema.Union([
   FeishuBotCredentialsBound,
 ]);
 export type FeishuBotCredentials = typeof FeishuBotCredentials.Type;
+
+// ── Chat directory (bot-reported group roster + members) ─────────────
+// The bot enumerates the group chats it belongs to via the Feishu IM API and
+// reports the roster to the server, which persists it in the server-side
+// `FeishuChatDirectory` store and serves it to the web settings UI (group list +
+// the "designated approver" member picker). Nothing secret crosses here — Feishu
+// open_ids are public within the tenant. The report is full-replace (first
+// version): the bot always sends its complete current roster.
+
+/** One group chat the bot belongs to, as reported by the bot. */
+export const FeishuChatDirectoryEntry = Schema.Struct({
+  chatId: TrimmedNonEmptyString,
+  /** Display name (`im.v1.chat.list` / `im.v1.chat.get`). May be empty. */
+  name: TrimmedString,
+  /**
+   * Raw Feishu `chat_mode` — known values are `"group"` / `"topic"` / `"p2p"`.
+   * Kept as an open string (not a literal union) so an unrecognised future mode
+   * never fails decoding of the whole roster.
+   */
+  chatMode: TrimmedString,
+  /**
+   * Human member open_ids (`im/v1/chats/:id/members`, `member_id_type=open_id`).
+   * Feishu never lists the bot's own membership here (expected).
+   */
+  memberOpenIds: Schema.Array(TrimmedNonEmptyString),
+  /** Chat owner's open_id, when the chat has one. */
+  ownerOpenId: Schema.optionalKey(TrimmedNonEmptyString),
+  /** Feishu-reported member count (may exceed `memberOpenIds.length`). */
+  memberCount: Schema.optionalKey(Schema.Int),
+});
+export type FeishuChatDirectoryEntry = typeof FeishuChatDirectoryEntry.Type;
+
+/**
+ * A full roster snapshot. `reportedAt` (ISO 8601, server-stamped on save) is
+ * absent until the bot has reported at least once. Returned by `feishu.listChats`.
+ */
+export const FeishuChatDirectorySnapshot = Schema.Struct({
+  chats: Schema.Array(FeishuChatDirectoryEntry),
+  reportedAt: Schema.optionalKey(Schema.String),
+});
+export type FeishuChatDirectorySnapshot = typeof FeishuChatDirectorySnapshot.Type;
+
+/** Payload of `feishu.reportChats` (bot → server): the full current roster. */
+export const FeishuReportChatsInput = Schema.Struct({
+  chats: Schema.Array(FeishuChatDirectoryEntry),
+});
+export type FeishuReportChatsInput = typeof FeishuReportChatsInput.Type;

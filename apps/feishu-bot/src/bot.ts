@@ -82,6 +82,7 @@ import {
 } from "./runtime/persistence.ts";
 import { LarkGateway, type StreamingCard } from "./lark/index.ts";
 import { larkGatewayLayer } from "./lark/channel.ts";
+import { reportFeishuChatDirectory } from "./chat-directory.ts";
 import type { BridgeHandlers, CardActionEvent, InboundMessage, SendOptions } from "./lark/types.ts";
 import { CallbackAuth, computePolicyFingerprint } from "./bridge/callbackAuth.ts";
 import {
@@ -3314,6 +3315,18 @@ const runBoundSession = (
     // a second card. (The handle / `clearNoticeMemory` was already available to the
     // command table from `runShellWatcherFiber` above; only the loop was deferred.)
     yield* shellWatcher.start;
+
+    // M-0: report the group roster (name / mode / owner / members) to the server
+    // so the web settings UI can list the bot's groups and pick approvers. Purely
+    // best-effort — forked onto this bound-session scope (torn down on re-bind)
+    // and self-contained fail-safe, so it never blocks or crashes the resident
+    // loop. First version fires once on connect; on-demand refresh comes later.
+    yield* reportFeishuChatDirectory({ source: gateway, registry, environmentId }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("[feishu-bot] feishu chat report failed.", cause),
+      ),
+      Effect.forkScoped,
+    );
 
     // Resident: keep the scope (connection, subscriptions, fibers) open forever.
     return yield* Effect.never;

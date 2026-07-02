@@ -131,7 +131,12 @@ import {
   ServerUpsertKeybindingResult,
 } from "./server.ts";
 import { ServerSettings, ServerSettingsError, ServerSettingsPatch } from "./settings.ts";
-import { FeishuBindingStreamEvent, FeishuBotCredentials } from "./feishu.ts";
+import {
+  FeishuBindingStreamEvent,
+  FeishuBotCredentials,
+  FeishuChatDirectorySnapshot,
+  FeishuReportChatsInput,
+} from "./feishu.ts";
 import {
   SourceControlCloneRepositoryInput,
   SourceControlCloneRepositoryResult,
@@ -227,6 +232,10 @@ export const WS_METHODS = {
   feishuStartBinding: "feishu.startBinding",
   feishuGetBotCredentials: "feishu.getBotCredentials",
   feishuClearBinding: "feishu.clearBinding",
+
+  // Feishu chat directory (bot-reported group roster; web reads for settings UI)
+  feishuReportChats: "feishu.reportChats",
+  feishuListChats: "feishu.listChats",
 
   // Streaming subscriptions
   subscribeVcsStatus: "subscribeVcsStatus",
@@ -704,6 +713,21 @@ export const WsFeishuClearBindingRpc = Rpc.make(WS_METHODS.feishuClearBinding, {
   error: Schema.Union([ServerSettingsError, EnvironmentAuthorizationError]),
 });
 
+// The chat-directory store is fail-safe (persist errors are logged and swallowed
+// server-side; reads fall back to an empty snapshot), so the only failure that
+// crosses the wire is the shared authorization check.
+export const WsFeishuReportChatsRpc = Rpc.make(WS_METHODS.feishuReportChats, {
+  payload: FeishuReportChatsInput,
+  success: Schema.Struct({}),
+  error: EnvironmentAuthorizationError,
+});
+
+export const WsFeishuListChatsRpc = Rpc.make(WS_METHODS.feishuListChats, {
+  payload: Schema.Struct({}),
+  success: FeishuChatDirectorySnapshot,
+  error: EnvironmentAuthorizationError,
+});
+
 export const WsRpcGroup = RpcGroup.make(
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,
@@ -769,6 +793,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsFeishuStartBindingRpc,
   WsFeishuGetBotCredentialsRpc,
   WsFeishuClearBindingRpc,
+  WsFeishuReportChatsRpc,
+  WsFeishuListChatsRpc,
   WsOrchestrationDispatchCommandRpc,
   WsOrchestrationGetTurnDiffRpc,
   WsOrchestrationGetFullThreadDiffRpc,

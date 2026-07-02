@@ -80,7 +80,13 @@ export const makeFeishuBindingStream = <E>(opts: {
             appPreset: { name: "t3code", desc: "t3code" },
             addons: {
               scopes: {
-                tenant: ["im:message.send_as_bot", "im:message.group_msg"],
+                // `im:chat:readonly` (M-0) covers the chat-directory reads the
+                // bot performs with its tenant token: GET /im/v1/chats (group
+                // list), GET /im/v1/chats/{id} (name / chat_mode / owner /
+                // member count), and GET /im/v1/chats/{id}/members (member
+                // open_ids). No finer-grained scope is required for
+                // `member_id_type=open_id`.
+                tenant: ["im:message.send_as_bot", "im:message.group_msg", "im:chat:readonly"],
               },
               events: {
                 items: {

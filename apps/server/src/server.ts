@@ -41,6 +41,7 @@ import * as PortScanner from "./preview/PortScanner.ts";
 import * as ProcessRunner from "./processRunner.ts";
 import * as GitManager from "./git/GitManager.ts";
 import * as FeishuBotManager from "./feishu/FeishuBotManager.ts";
+import * as FeishuChatDirectory from "./feishu/FeishuChatDirectory.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import { OrchestrationReactorLive } from "./orchestration/Layers/OrchestrationReactor.ts";
@@ -319,7 +320,12 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   Layer.provideMerge(RepositoryIdentityResolver.layer),
   Layer.provideMerge(ServerEnvironment.layer),
   Layer.provideMerge(AuthLayerLive),
-  Layer.provideMerge(ServerSecretStore.layer),
+  // Bundled with ServerSecretStore in one `provideMerge` so this pipe stays within
+  // Effect's 20-argument limit. The feishu chat directory store (M-0) is an
+  // independent JSON file in the state dir, kept out of ServerSettings so it never
+  // triggers the settings broadcast; it only needs ServerConfig + FileSystem/Path,
+  // all satisfied by the surrounding runtime context.
+  Layer.provideMerge(Layer.mergeAll(ServerSecretStore.layer, FeishuChatDirectory.layer)),
   Layer.provideMerge(
     Layer.mergeAll(
       CloudCliTokenManager.layer.pipe(Layer.provide(ServerSecretStore.layer)),
