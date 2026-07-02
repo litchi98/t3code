@@ -186,6 +186,16 @@ export const FEISHU_BOT_SCRUBBED_ENV_KEYS = [
  * scrubbing) also means `extendEnv` cannot leak the operator shell's value: the
  * bot's workspace is wholly manager-controlled = `serverConfig.cwd`.
  *
+ * `electronRunAsNode` covers the desktop three-tier process tree (electron →
+ * server → bot): there the server itself runs as electron-as-node, so
+ * `process.execPath` — reused as the bot's executable — is the electron binary.
+ * The bot must then also run under `ELECTRON_RUN_AS_NODE=1` for electron to
+ * execute `dist/main.mjs` as plain Node. `extendEnv: true` already inherits this
+ * (the key is not scrubbed); setting it explicitly self-documents the dependency
+ * and pins it even if the inherited value were ever cleared. Headless (node)
+ * servers pass `false` and the key is omitted entirely — never set to
+ * `undefined`, which would scrub an inherited value on a mixed setup.
+ *
  * Pure (no services) so the scrub/injection is unit-testable without a spawner.
  */
 export const buildChildEnv = (input: {
@@ -193,12 +203,14 @@ export const buildChildEnv = (input: {
   readonly httpBaseUrl: string;
   readonly stateDir: string;
   readonly workspaceRoot: string;
+  readonly electronRunAsNode: boolean;
 }): Record<string, string | undefined> => ({
   ...Object.fromEntries(FEISHU_BOT_SCRUBBED_ENV_KEYS.map((key) => [key, undefined])),
   T3_PAIRING_TOKEN: input.credential,
   T3_HTTP_BASE_URL: input.httpBaseUrl,
   T3_STATE_DIR: input.stateDir,
   T3_WORKSPACE_ROOT: input.workspaceRoot,
+  ...(input.electronRunAsNode ? { ELECTRON_RUN_AS_NODE: "1" } : {}),
 });
 
 interface BotProcessContext {
@@ -440,6 +452,10 @@ export const make = Effect.gen(function* () {
   // dev spawns the `.ts` source; a packed production server spawns the bot's own
   // `dist/main.mjs` bundle, degrading to source if that bundle is missing.
   const executablePath = process.execPath;
+  // When the server runs as electron-as-node (the desktop tree), executablePath
+  // is the electron binary and the bot must inherit ELECTRON_RUN_AS_NODE too.
+  // This holds for the whole process lifetime, so read it once alongside execPath.
+  const electronRunAsNode = process.env.ELECTRON_RUN_AS_NODE === "1";
   const packed = isPackedBuild();
   const devEntryPath = path.resolve(import.meta.dirname, BOT_ENTRY_RELATIVE_PATH_DEV);
   const prodEntryPath = path.resolve(import.meta.dirname, BOT_ENTRY_RELATIVE_PATH_PROD);
@@ -630,6 +646,7 @@ export const make = Effect.gen(function* () {
         httpBaseUrl,
         stateDir,
         workspaceRoot: serverConfig.cwd,
+        electronRunAsNode,
       }),
       readinessDelay: READY_LIVENESS_DELAY,
       onStarted: Effect.fn("feishu.botManager.onStarted")(function* (pid) {
