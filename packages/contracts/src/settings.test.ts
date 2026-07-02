@@ -129,6 +129,73 @@ describe("ServerSettingsPatch.providerInstances", () => {
   });
 });
 
+describe("ServerSettings.feishuChatConfigs / feishuChatDefaults (M-2/PR2a)", () => {
+  it("defaults both to empty for legacy configs without the keys", () => {
+    expect(DEFAULT_SERVER_SETTINGS.feishuChatConfigs).toEqual({});
+    expect(DEFAULT_SERVER_SETTINGS.feishuChatDefaults).toEqual({});
+    const decoded = decodeServerSettings({});
+    expect(decoded.feishuChatConfigs).toEqual({});
+    expect(decoded.feishuChatDefaults).toEqual({});
+  });
+
+  it("round-trips a fully-populated per-chat config keyed by bare chatId", () => {
+    const decoded = decodeServerSettings({
+      feishuChatConfigs: {
+        oc_group_a: {
+          approvalMode: "designated",
+          approvers: ["ou_a1", "ou_a2"],
+          workspaces: ["proj_1"],
+          commands: ["/status", "/workspace"],
+          toolPolicy: { mode: "denylist", tools: ["Write", "Bash"] },
+        },
+      },
+      feishuChatDefaults: { approvalMode: "initiator" },
+    });
+    expect(decoded.feishuChatConfigs.oc_group_a?.approvalMode).toBe("designated");
+    expect(decoded.feishuChatConfigs.oc_group_a?.approvers).toEqual(["ou_a1", "ou_a2"]);
+    expect(decoded.feishuChatConfigs.oc_group_a?.toolPolicy).toEqual({
+      mode: "denylist",
+      tools: ["Write", "Bash"],
+    });
+    expect(decoded.feishuChatDefaults.approvalMode).toBe("initiator");
+
+    const encoded = encodeServerSettings(decoded);
+    expect(encoded.feishuChatConfigs).toEqual(decoded.feishuChatConfigs);
+    expect(encoded.feishuChatDefaults).toEqual(decoded.feishuChatDefaults);
+  });
+
+  it("leaves absent inner fields absent (field-level fallback is a bot concern)", () => {
+    const decoded = decodeServerSettings({
+      feishuChatConfigs: { oc_group_b: { approvers: ["ou_b1"] } },
+    });
+    const entry = decoded.feishuChatConfigs.oc_group_b;
+    expect(entry?.approvers).toEqual(["ou_b1"]);
+    expect(entry).not.toHaveProperty("approvalMode");
+    expect(entry).not.toHaveProperty("commands");
+    expect(entry).not.toHaveProperty("toolPolicy");
+  });
+
+  it("rejects an unknown approvalMode literal", () => {
+    expect(() =>
+      decodeServerSettings({
+        feishuChatConfigs: { oc_group_c: { approvalMode: "nonsense" } },
+      }),
+    ).toThrow();
+  });
+
+  it("treats the patch fields as optional whole-value replacements", () => {
+    expect(decodeServerSettingsPatch({}).feishuChatConfigs).toBeUndefined();
+    expect(decodeServerSettingsPatch({}).feishuChatDefaults).toBeUndefined();
+
+    const patch = decodeServerSettingsPatch({
+      feishuChatConfigs: { oc_group_d: { approvalMode: "all" } },
+      feishuChatDefaults: { commands: ["/help"] },
+    });
+    expect(patch.feishuChatConfigs?.oc_group_d?.approvalMode).toBe("all");
+    expect(patch.feishuChatDefaults?.commands).toEqual(["/help"]);
+  });
+});
+
 describe("ServerSettingsPatch string normalization", () => {
   it("trims string settings while decoding patches", () => {
     const patch = decodeServerSettingsPatch({

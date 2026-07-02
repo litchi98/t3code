@@ -21,6 +21,7 @@ import {
   ApprovalRequestId,
   CommandId,
   type EnvironmentId,
+  type FeishuChatConfig,
   isProviderAvailable,
   MessageId,
   ModelSelection,
@@ -83,6 +84,7 @@ import { LarkGateway, type StreamingCard } from "./lark/index.ts";
 import { larkGatewayLayer } from "./lark/channel.ts";
 import { reportFeishuChatDirectory } from "./chat-directory.ts";
 import type { BridgeHandlers, CardActionEvent, InboundMessage, SendOptions } from "./lark/types.ts";
+import { authorizeApprovalClick } from "./bridge/authz.ts";
 import { CallbackAuth, computePolicyFingerprint } from "./bridge/callbackAuth.ts";
 import {
   actionToApprovalDecision,
@@ -364,13 +366,17 @@ const topicSendOpts = (
  * Runs inside the outer layer (so `EnvironmentRegistry` and the durable stores
  * are available) and the per-binding `boundLayer` (Lark gateway + queues). The
  * `creds` carry the resolved app id/secret/domain; `allowlistRef` is the shared
- * approval allowlist owned by the resident loop (live-refreshed across bindings).
+ * approval allowlist owned by the resident loop (live-refreshed across bindings);
+ * `ownerRef` is the shared binding owner (`feishuBinding.ownerOpenId`, or `null`
+ * when unbound), also live-refreshed by the resident watcher — the cardAction
+ * gate reads it for owner-always authorization (M-2/PR2a).
  */
 const runBoundSession = (
   config: FeishuBotConfig,
   resolved: ResolvedEnvironment,
   creds: FeishuCredentialOverride,
   allowlistRef: Ref.Ref<ReadonlyArray<string>>,
+  ownerRef: Ref.Ref<string | null>,
 ) =>
   Effect.gen(function* () {
     const registry = yield* EnvironmentRegistry;
@@ -3054,10 +3060,17 @@ const runBoundSession = (
         //     the real approver.
         const effectiveAllowlist = yield* effectiveAllowlistFor(shell.runtimeMode);
         const clicker = evt.operator.openId;
-        const authorized =
-          effectiveAllowlist.length > 0
-            ? effectiveAllowlist.includes(clicker)
-            : clicker.length > 0 && clicker === res.payload.o;
+        // M-2/PR2a: owner-always is prepended to the M4-1 base rule (allowlist
+        // membership when active, else signed-initiator fallback). The decision
+        // is delegated to the pure `authorizeApprovalClick` so the branches stay
+        // unit-testable and PR2b can layer the three-state mode logic there.
+        const owner = yield* Ref.get(ownerRef);
+        const authorized = authorizeApprovalClick({
+          owner,
+          effectiveAllowlist,
+          clicker,
+          initiator: res.payload.o,
+        });
         if (!authorized) {
           yield* preserveCardForBystander(chatKey, evt.messageId, clicker);
           return;
@@ -3796,19 +3809,25 @@ const acquireCredentials = (
 /**
  * Outer (binding-independent) watcher over `subscribeServerConfig`, hoisted from
  * the per-binding session (was the M4-2 fiber) so it survives every re-bind. It
- * carries DOUBLE duty on each `snapshot` / `settingsUpdated` event:
+ * carries several duties on each `snapshot` / `settingsUpdated` event, all
+ * reading the FULL `ServerSettings` (not a delta):
  *
  *  1. **Approval allowlist live-refresh — FIRST and fail-safe.** Fold web-configured
  *     `feishuApprovalAllowlist` into `allowlistRef` as `env ∪ store` (the env
  *     `FEISHU_OWNER_OPEN_IDS` floor is immovable — the store can only ADD — so a
  *     misconfigured/empty store can never lock the owner out). The Ref is never
- *     cleared on error → last-known-good. This MUST stay ahead of (2) and must not
- *     throw, preserving the M4-2 authz fail-safe.
+ *     cleared on error → last-known-good. This MUST stay ahead of (2)/(3) and must
+ *     not throw, preserving the M4-2 authz fail-safe.
  *  2. **Binding view.** Publish the public binding identity (no secret) to
- *     `bindingView` so the resident loop can re-bind on a change. `payload.settings`
- *     is the FULL `ServerSettings` (not a delta), so `feishuBinding` always reflects
- *     the current binding — an unrelated settings change re-publishes the SAME
- *     identity, which `bindingIdentityEq` filters out (no spurious re-bind).
+ *     `bindingView` so the resident loop can re-bind on a change. Because the
+ *     settings are the FULL snapshot, `feishuBinding` always reflects the current
+ *     binding — an unrelated settings change re-publishes the SAME identity,
+ *     which `bindingIdentityEq` filters out (no spurious re-bind).
+ *  3. **Owner + per-chat config live-refresh (M-2/PR2a).** Publish the binding
+ *     owner (`feishuBinding.ownerOpenId`, or `null`) to `ownerRef` for owner-always
+ *     authz, and the per-chat policy config (`feishuChatConfigs`/`feishuChatDefaults`)
+ *     to `chatConfigsRef`/`chatDefaultsRef` — the data channel PR2b/M-3 consume.
+ *     Pure extractions, never cleared on error → same last-known-good as (1).
  *
  * `Stream.orDie` mirrors the other forked subscriptions: `subscribeServerConfig`
  * self-heals transient WS drops, and the handler is pure computation that never
@@ -3821,6 +3840,9 @@ const runAllowlistAndBindingWatcher = (
   environmentId: EnvironmentId,
   allowlistRef: Ref.Ref<ReadonlyArray<string>>,
   bindingView: SubscriptionRef.SubscriptionRef<BindingIdentity | null>,
+  ownerRef: Ref.Ref<string | null>,
+  chatConfigsRef: Ref.Ref<{ readonly [chatId: string]: FeishuChatConfig }>,
+  chatDefaultsRef: Ref.Ref<FeishuChatConfig>,
 ): Effect.Effect<void, never, EnvironmentRegistry> =>
   Effect.gen(function* () {
     const registry = yield* EnvironmentRegistry;
@@ -3864,6 +3886,16 @@ const runAllowlistAndBindingWatcher = (
             }
             // (2) Binding view — drives re-bind. Pure extraction, never throws.
             yield* SubscriptionRef.set(bindingView, toBindingIdentity(settings.feishuBinding));
+            // (3) Owner + per-chat config live-refresh (M-2/PR2a). Pure
+            // extractions, never throw → same last-known-good fail-safe as (1)
+            // (never cleared on error). `ownerRef` is the binding owner — a
+            // PUBLIC field, distinct from the env `FEISHU_OWNER_OPEN_IDS` floor
+            // that seeds `allowlistRef` — read by the cardAction gate for
+            // owner-always authz. `chatConfigsRef`/`chatDefaultsRef` open the
+            // per-chat policy data channel; consumption lands in PR2b/M-3.
+            yield* Ref.set(ownerRef, settings.feishuBinding?.ownerOpenId ?? null);
+            yield* Ref.set(chatConfigsRef, settings.feishuChatConfigs);
+            yield* Ref.set(chatDefaultsRef, settings.feishuChatDefaults);
           }),
         ),
       );
@@ -3913,12 +3945,29 @@ export const program = (
       // The current bound identity as seen in server settings (null = unbound).
       // Drives re-bind; never carries the secret.
       const bindingView = yield* SubscriptionRef.make<BindingIdentity | null>(null);
+      // Shared binding owner (`feishuBinding.ownerOpenId`), live-refreshed by the
+      // outer watcher and read by every per-binding session's cardAction gate for
+      // owner-always authz (M-2/PR2a). Seeded `null` (unbound) until the first
+      // settings snapshot arrives. Distinct from `allowlistRef`'s env floor.
+      const ownerRef = yield* Ref.make<string | null>(null);
+      // Per-chat policy config channel (M-2/PR2a): live-refreshed here so it
+      // survives re-bind; consumption (threading into `runBoundSession` + reads)
+      // lands in PR2b/M-3. Seeded empty.
+      const chatConfigsRef = yield* Ref.make<{ readonly [chatId: string]: FeishuChatConfig }>({});
+      const chatDefaultsRef = yield* Ref.make<FeishuChatConfig>({});
 
-      // Outer watcher: allowlist live-refresh + binding view. Forked onto the
-      // OUTER (resident) scope so it outlives every per-binding session.
-      yield* runAllowlistAndBindingWatcher(config, environmentId, allowlistRef, bindingView).pipe(
-        Effect.forkScoped,
-      );
+      // Outer watcher: allowlist live-refresh + binding view + owner/per-chat
+      // config. Forked onto the OUTER (resident) scope so it outlives every
+      // per-binding session.
+      yield* runAllowlistAndBindingWatcher(
+        config,
+        environmentId,
+        allowlistRef,
+        bindingView,
+        ownerRef,
+        chatConfigsRef,
+        chatDefaultsRef,
+      ).pipe(Effect.forkScoped);
 
       // Re-bind loop. Each iteration: acquire credentials, then either wait for a
       // binding (Unbound) or run one bound session until the binding changes.
@@ -3967,7 +4016,9 @@ export const program = (
         // `Effect.interrupt` — NOT a typed failure, so `retry` lets it through and
         // re-bind always wins. Env-override credentials self-heal the same way.
         const boundSession = Effect.scoped(
-          runBoundSession(config, resolved, creds, allowlistRef).pipe(Effect.provide(boundLayer)),
+          runBoundSession(config, resolved, creds, allowlistRef, ownerRef).pipe(
+            Effect.provide(boundLayer),
+          ),
         ).pipe(
           Effect.catchCause((cause) =>
             // Interrupt (re-bind won by raceFirst): re-interrupt so this fiber
