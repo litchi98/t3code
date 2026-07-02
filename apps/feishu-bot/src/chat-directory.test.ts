@@ -40,7 +40,11 @@ describe("collectFeishuChatDirectory", () => {
             memberCount: 5,
           }),
         listChatMembers: (chatId) =>
-          Effect.succeed(chatId === "oc_1" ? ["ou_a", "ou_b"] : ["ou_c"]),
+          Effect.succeed(
+            chatId === "oc_1"
+              ? [{ openId: "ou_a", name: "Alice" }, { openId: "ou_b" }]
+              : [{ openId: "ou_c", name: "Carol" }],
+          ),
       };
 
       const entries = yield* collectFeishuChatDirectory(source);
@@ -50,7 +54,7 @@ describe("collectFeishuChatDirectory", () => {
           chatId: "oc_1",
           name: "Group One",
           chatMode: "group",
-          memberOpenIds: ["ou_a", "ou_b"],
+          members: [{ openId: "ou_a", name: "Alice" }, { openId: "ou_b" }],
           ownerOpenId: "ou_owner",
           memberCount: 5,
         },
@@ -58,7 +62,7 @@ describe("collectFeishuChatDirectory", () => {
           chatId: "oc_2",
           name: "Topic Two",
           chatMode: "topic",
-          memberOpenIds: ["ou_c"],
+          members: [{ openId: "ou_c", name: "Carol" }],
           ownerOpenId: "ou_owner",
           memberCount: 5,
         },
@@ -77,7 +81,7 @@ describe("collectFeishuChatDirectory", () => {
           chatId === "oc_bad"
             ? Effect.fail(larkError("chat.get failed"))
             : Effect.succeed({ chatMode: "group", memberCount: 1 }),
-        listChatMembers: () => Effect.succeed(["ou_x"]),
+        listChatMembers: () => Effect.succeed([{ openId: "ou_x" }]),
       };
 
       const entries = yield* collectFeishuChatDirectory(source);
@@ -85,8 +89,14 @@ describe("collectFeishuChatDirectory", () => {
       // Full-replace means a dropped chat = deleted from the directory, so the
       // failed chat is preserved with a sentinel "unknown" mode instead.
       assert.deepEqual(entries, [
-        { chatId: "oc_ok", name: "OK", chatMode: "group", memberOpenIds: ["ou_x"], memberCount: 1 },
-        { chatId: "oc_bad", name: "Bad", chatMode: "unknown", memberOpenIds: ["ou_x"] },
+        {
+          chatId: "oc_ok",
+          name: "OK",
+          chatMode: "group",
+          members: [{ openId: "ou_x" }],
+          memberCount: 1,
+        },
+        { chatId: "oc_bad", name: "Bad", chatMode: "unknown", members: [{ openId: "ou_x" }] },
       ]);
     }),
   );
@@ -107,7 +117,7 @@ describe("collectFeishuChatDirectory", () => {
           chatId: "oc_1",
           name: "One",
           chatMode: "group",
-          memberOpenIds: [],
+          members: [],
           ownerOpenId: "ou_o",
           memberCount: 3,
         },

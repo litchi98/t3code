@@ -107,6 +107,19 @@ export type FeishuBotCredentials = typeof FeishuBotCredentials.Type;
 // open_ids are public within the tenant. The report is full-replace (first
 // version): the bot always sends its complete current roster.
 
+/**
+ * One human member of a group chat (`im/v1/chats/:id/members`,
+ * `member_id_type=open_id`): open_id plus the member's display name from the same
+ * response (`items[].name`). The name lets the web approver picker show who an
+ * open_id is; it may be absent depending on the tenant's member-info visibility,
+ * so consumers fall back to the open_id.
+ */
+export const FeishuChatMember = Schema.Struct({
+  openId: TrimmedNonEmptyString,
+  name: Schema.optionalKey(TrimmedNonEmptyString),
+});
+export type FeishuChatMember = typeof FeishuChatMember.Type;
+
 /** One group chat the bot belongs to, as reported by the bot. */
 export const FeishuChatDirectoryEntry = Schema.Struct({
   chatId: TrimmedNonEmptyString,
@@ -119,13 +132,13 @@ export const FeishuChatDirectoryEntry = Schema.Struct({
    */
   chatMode: TrimmedString,
   /**
-   * Human member open_ids (`im/v1/chats/:id/members`, `member_id_type=open_id`).
-   * Feishu never lists the bot's own membership here (expected).
+   * Human members (open_id + display name). Feishu never lists the bot's own
+   * membership here (expected).
    */
-  memberOpenIds: Schema.Array(TrimmedNonEmptyString),
+  members: Schema.Array(FeishuChatMember),
   /** Chat owner's open_id, when the chat has one. */
   ownerOpenId: Schema.optionalKey(TrimmedNonEmptyString),
-  /** Feishu-reported member count (may exceed `memberOpenIds.length`). */
+  /** Feishu-reported member count (may exceed `members.length`). */
   memberCount: Schema.optionalKey(Schema.Int),
 });
 export type FeishuChatDirectoryEntry = typeof FeishuChatDirectoryEntry.Type;

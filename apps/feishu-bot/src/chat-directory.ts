@@ -24,7 +24,12 @@
  * @module chat-directory
  */
 import * as EnvironmentRpc from "@t3tools/client-runtime/rpc";
-import { type EnvironmentId, type FeishuChatDirectoryEntry, WS_METHODS } from "@t3tools/contracts";
+import {
+  type EnvironmentId,
+  type FeishuChatDirectoryEntry,
+  type FeishuChatMember,
+  WS_METHODS,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 
 import type { EnvironmentRegistry } from "@t3tools/client-runtime/connection";
@@ -83,20 +88,23 @@ const buildEntry = (
         ),
       ),
     );
-    const memberOpenIds = yield* source
+    const members = yield* source
       .listChatMembers(chat.chatId)
       .pipe(
         Effect.catch((error) =>
           Effect.logWarning(
             `[feishu-bot] feishu chat directory: chat ${chat.chatId} members unavailable; recording empty membership.`,
-          ).pipe(Effect.annotateLogs({ cause: error }), Effect.as([] as ReadonlyArray<string>)),
+          ).pipe(
+            Effect.annotateLogs({ cause: error }),
+            Effect.as([] as ReadonlyArray<FeishuChatMember>),
+          ),
         ),
       );
     return {
       chatId: chat.chatId,
       name: chat.name,
       chatMode: info.chatMode,
-      memberOpenIds,
+      members,
       ...(info.ownerOpenId !== undefined ? { ownerOpenId: info.ownerOpenId } : {}),
       ...(info.memberCount !== undefined ? { memberCount: info.memberCount } : {}),
     };
@@ -131,14 +139,14 @@ const capRoster = (
   let budget = MAX_TOTAL_MEMBER_ENTRIES;
   let truncated = false;
   const capped = chats.map((chat) => {
-    if (chat.memberOpenIds.length <= budget) {
-      budget -= chat.memberOpenIds.length;
+    if (chat.members.length <= budget) {
+      budget -= chat.members.length;
       return chat;
     }
     truncated = true;
-    const kept = chat.memberOpenIds.slice(0, budget);
+    const kept = chat.members.slice(0, budget);
     budget = 0;
-    return { ...chat, memberOpenIds: kept };
+    return { ...chat, members: kept };
   });
   return { chats: capped, truncated };
 };

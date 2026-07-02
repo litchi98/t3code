@@ -33,7 +33,7 @@ const SAMPLE_CHATS: ReadonlyArray<FeishuChatDirectoryEntry> = [
     chatId: "oc_group_a",
     name: "Group A",
     chatMode: "group",
-    memberOpenIds: ["ou_alice", "ou_bob"],
+    members: [{ openId: "ou_alice", name: "Alice" }, { openId: "ou_bob" }],
     ownerOpenId: "ou_alice",
     memberCount: 2,
   },
@@ -41,7 +41,7 @@ const SAMPLE_CHATS: ReadonlyArray<FeishuChatDirectoryEntry> = [
     chatId: "oc_topic_b",
     name: "Topic B",
     chatMode: "topic",
-    memberOpenIds: [],
+    members: [],
   },
 ];
 

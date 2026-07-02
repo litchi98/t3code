@@ -1,6 +1,10 @@
 "use client";
 
-import type { FeishuChatConfig, FeishuChatDirectoryEntry } from "@t3tools/contracts";
+import type {
+  FeishuChatConfig,
+  FeishuChatDirectoryEntry,
+  FeishuChatMember,
+} from "@t3tools/contracts";
 import { LinkIcon, PlusIcon, UsersIcon, XIcon } from "lucide-react";
 import { useCallback, useRef, useState } from "react";
 
@@ -307,7 +311,7 @@ function FeishuChatConfigCard({
   onCommit: (chatId: string, updater: (config: FeishuChatConfig) => FeishuChatConfig) => void;
 }) {
   const mode = chatModeSelection(config);
-  const memberCount = chat.memberCount ?? chat.memberOpenIds.length;
+  const memberCount = chat.memberCount ?? chat.members.length;
 
   return (
     <div className="rounded-lg border border-border/60 p-3">
@@ -332,7 +336,7 @@ function FeishuChatConfigCard({
       {mode === "designated" ? (
         <ApproversEditor
           approvers={config?.approvers ?? []}
-          members={chat.memberOpenIds}
+          members={chat.members}
           idPrefix={`feishu-chat-${chat.chatId}`}
           onToggle={(openId) =>
             onCommit(chat.chatId, (current) => toggleConfigApprover(current, openId))
@@ -379,10 +383,11 @@ function ModeSelect({
 
 /**
  * Designated-approver picker. When a group roster (`members`) is available, it
- * shows member checkboxes; any approver open_id not on the roster (or when no
- * roster exists — e.g. the defaults editor) is shown as a removable chip, and a
- * free-text input adds off-roster open_ids. Emits per-open_id toggles; the caller
- * owns the map write.
+ * shows a checkbox per member labelled by display name (open_id on hover, or as
+ * the label when the name is absent). Any approver open_id not on the roster (or
+ * when no roster exists — e.g. the defaults editor) is shown as a removable chip,
+ * and a free-text input adds off-roster open_ids. Emits per-open_id toggles; the
+ * caller owns the map write.
  */
 function ApproversEditor({
   approvers,
@@ -393,13 +398,14 @@ function ApproversEditor({
   approvers: ReadonlyArray<string>;
   onToggle: (openId: string) => void;
   idPrefix: string;
-  members?: ReadonlyArray<string>;
+  members?: ReadonlyArray<FeishuChatMember>;
 }) {
   const [input, setInput] = useState("");
   const [error, setError] = useState<string | null>(null);
   const selected = new Set(approvers);
   const roster = members ?? [];
-  const extras = approvers.filter((openId) => !roster.includes(openId));
+  const rosterOpenIds = new Set(roster.map((member) => member.openId));
+  const extras = approvers.filter((openId) => !rosterOpenIds.has(openId));
 
   const handleAdd = () => {
     const openId = input.trim();
@@ -424,18 +430,25 @@ function ApproversEditor({
       </p>
       {roster.length > 0 ? (
         <div className="grid gap-1 sm:grid-cols-2">
-          {roster.map((openId) => (
+          {roster.map((member) => (
             <label
-              key={openId}
+              key={member.openId}
+              title={member.openId}
               className="flex min-w-0 cursor-pointer items-center gap-2 rounded-sm px-1 py-1 hover:bg-accent/50"
             >
               <Checkbox
-                checked={selected.has(openId)}
-                onCheckedChange={() => onToggle(openId)}
-                aria-label={`审批人 ${openId}`}
+                checked={selected.has(member.openId)}
+                onCheckedChange={() => onToggle(member.openId)}
+                aria-label={`审批人 ${member.name ?? member.openId}`}
               />
-              <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-foreground/90">
-                {openId}
+              <span
+                className={
+                  member.name
+                    ? "min-w-0 flex-1 truncate text-[11px] text-foreground/90"
+                    : "min-w-0 flex-1 truncate font-mono text-[11px] text-foreground/90"
+                }
+              >
+                {member.name ?? member.openId}
               </span>
             </label>
           ))}

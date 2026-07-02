@@ -119,7 +119,10 @@ interface RawChatMembersClient {
         };
       }) => Promise<{
         readonly data?: {
-          readonly items?: ReadonlyArray<{ readonly member_id?: string }>;
+          readonly items?: ReadonlyArray<{
+            readonly member_id?: string;
+            readonly name?: string;
+          }>;
           readonly page_token?: string;
           readonly has_more?: boolean;
         };
@@ -454,9 +457,12 @@ export const larkGatewayLayer = (config: FeishuCredentials): Layer.Layer<LarkGat
 
       const listChatMembers = (
         chatId: string,
-      ): Effect.Effect<ReadonlyArray<string>, LarkGatewayError> =>
+      ): Effect.Effect<
+        ReadonlyArray<{ readonly openId: string; readonly name?: string }>,
+        LarkGatewayError
+      > =>
         Effect.gen(function* () {
-          const openIds: string[] = [];
+          const members: Array<{ readonly openId: string; readonly name?: string }> = [];
           let pageToken: string | undefined;
           let truncated = false;
           let page = 0;
@@ -482,7 +488,11 @@ export const larkGatewayLayer = (config: FeishuCredentials): Layer.Layer<LarkGat
             const data = response.data;
             for (const item of data?.items ?? []) {
               if (item.member_id !== undefined) {
-                openIds.push(item.member_id);
+                const name = item.name?.trim();
+                members.push({
+                  openId: item.member_id,
+                  ...(name !== undefined && name.length > 0 ? { name } : {}),
+                });
               }
             }
             if (data?.has_more !== true) {
@@ -500,7 +510,7 @@ export const larkGatewayLayer = (config: FeishuCredentials): Layer.Layer<LarkGat
               }-member cap; membership may be incomplete.`,
             );
           }
-          return openIds;
+          return members;
         });
 
       const addReaction = (messageId: string, emojiType: string) =>

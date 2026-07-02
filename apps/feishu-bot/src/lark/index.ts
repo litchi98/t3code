@@ -178,8 +178,10 @@ export class LarkGateway extends Context.Service<
       LarkGatewayError
     >;
     /**
-     * List a chat's human member open_ids (`GET im/v1/chats/:chat_id/members`,
+     * List a chat's human members (`GET im/v1/chats/:chat_id/members`,
      * `member_id_type=open_id`), following `has_more`/`page_token` pagination.
+     * Each item is `{ openId, name? }` — the display name comes from the same
+     * response (`items[].name`) and may be absent (tenant member-info visibility).
      *
      * NB: Feishu never returns the bot's own membership here (expected — it does
      * not affect human-approval gating). Not wrapped by `@larksuite/channel`, so
@@ -188,6 +190,9 @@ export class LarkGateway extends Context.Service<
      */
     readonly listChatMembers: (
       chatId: string,
-    ) => Effect.Effect<ReadonlyArray<string>, LarkGatewayError>;
+    ) => Effect.Effect<
+      ReadonlyArray<{ readonly openId: string; readonly name?: string }>,
+      LarkGatewayError
+    >;
   }
 >()("@t3tools/feishu-bot/lark/LarkGateway") {}
