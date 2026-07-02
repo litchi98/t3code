@@ -173,6 +173,9 @@ function FeishuChatConfigSection() {
   );
 
   const serverConfigs = usePrimarySettings((s) => s.feishuChatConfigs) as FeishuChatConfigMap;
+  // The binding owner is always allowed to approve (owner-always overlay), so
+  // their roster checkbox is shown pre-checked and locked, not toggleable.
+  const bindingOwnerOpenId = usePrimarySettings((s) => s.feishuBinding?.ownerOpenId);
   const update = useUpdatePrimarySettings();
   // Seed-once draft of the whole per-chat map; `draftRef` mirrors it and is
   // updated synchronously inside `commitChat` so back-to-back edits (same card or
@@ -236,6 +239,7 @@ function FeishuChatConfigSection() {
                 key={chat.chatId}
                 chat={chat}
                 config={draftConfigs[chat.chatId]}
+                bindingOwnerOpenId={bindingOwnerOpenId}
                 onCommit={commitChat}
               />
             ))}
@@ -304,10 +308,12 @@ function FeishuDefaultsEditor() {
 function FeishuChatConfigCard({
   chat,
   config,
+  bindingOwnerOpenId,
   onCommit,
 }: {
   chat: FeishuChatDirectoryEntry;
   config: FeishuChatConfig | undefined;
+  bindingOwnerOpenId?: string | undefined;
   onCommit: (chatId: string, updater: (config: FeishuChatConfig) => FeishuChatConfig) => void;
 }) {
   const mode = chatModeSelection(config);
@@ -337,6 +343,7 @@ function FeishuChatConfigCard({
         <ApproversEditor
           approvers={config?.approvers ?? []}
           members={chat.members}
+          bindingOwnerOpenId={bindingOwnerOpenId}
           idPrefix={`feishu-chat-${chat.chatId}`}
           onToggle={(openId) =>
             onCommit(chat.chatId, (current) => toggleConfigApprover(current, openId))
@@ -384,21 +391,26 @@ function ModeSelect({
 /**
  * Designated-approver picker. When a group roster (`members`) is available, it
  * shows a checkbox per member labelled by display name (open_id on hover, or as
- * the label when the name is absent). Any approver open_id not on the roster (or
- * when no roster exists — e.g. the defaults editor) is shown as a removable chip,
- * and a free-text input adds off-roster open_ids. Emits per-open_id toggles; the
- * caller owns the map write.
+ * the label when the name is absent). The binding owner (`bindingOwnerOpenId`),
+ * if on the roster, is shown pre-checked and LOCKED — they always approve via the
+ * owner-always overlay, so unchecking them would be a no-op; they are not written
+ * into `approvers`. Any approver open_id not on the roster (or when no roster
+ * exists — e.g. the defaults editor) is shown as a removable chip, and a free-text
+ * input adds off-roster open_ids. Emits per-open_id toggles; the caller owns the
+ * map write.
  */
 function ApproversEditor({
   approvers,
   onToggle,
   idPrefix,
   members,
+  bindingOwnerOpenId,
 }: {
   approvers: ReadonlyArray<string>;
   onToggle: (openId: string) => void;
   idPrefix: string;
   members?: ReadonlyArray<FeishuChatMember>;
+  bindingOwnerOpenId?: string | undefined;
 }) {
   const [input, setInput] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -425,33 +437,48 @@ function ApproversEditor({
   return (
     <div className="mt-2 space-y-2 rounded-md border border-border/60 bg-muted/20 p-2.5">
       <p className="text-[11px] text-muted-foreground/80">
-        指定群内可审批的成员(可多选)。留空表示群内无人可审批;绑定的授权人凭 owner-always
-        始终可审批,无需勾选。
+        指定群内可审批的成员(可多选)。未额外勾选时仅绑定的授权人可审批;授权人凭 owner-always
+        始终可审批,已默认勾选且不可取消。
       </p>
       {roster.length > 0 ? (
         <div className="grid gap-1 sm:grid-cols-2">
-          {roster.map((member) => (
-            <label
-              key={member.openId}
-              title={member.openId}
-              className="flex min-w-0 cursor-pointer items-center gap-2 rounded-sm px-1 py-1 hover:bg-accent/50"
-            >
-              <Checkbox
-                checked={selected.has(member.openId)}
-                onCheckedChange={() => onToggle(member.openId)}
-                aria-label={`审批人 ${member.name ?? member.openId}`}
-              />
-              <span
+          {roster.map((member) => {
+            const isOwner = member.openId === bindingOwnerOpenId;
+            return (
+              <label
+                key={member.openId}
+                title={member.openId}
                 className={
-                  member.name
-                    ? "min-w-0 flex-1 truncate text-[11px] text-foreground/90"
-                    : "min-w-0 flex-1 truncate font-mono text-[11px] text-foreground/90"
+                  isOwner
+                    ? "flex min-w-0 items-center gap-2 rounded-sm px-1 py-1"
+                    : "flex min-w-0 cursor-pointer items-center gap-2 rounded-sm px-1 py-1 hover:bg-accent/50"
                 }
               >
-                {member.name ?? member.openId}
-              </span>
-            </label>
-          ))}
+                <Checkbox
+                  checked={isOwner || selected.has(member.openId)}
+                  disabled={isOwner}
+                  onCheckedChange={() => {
+                    if (!isOwner) onToggle(member.openId);
+                  }}
+                  aria-label={`审批人 ${member.name ?? member.openId}${isOwner ? "(授权人)" : ""}`}
+                />
+                <span
+                  className={
+                    member.name
+                      ? "min-w-0 flex-1 truncate text-[11px] text-foreground/90"
+                      : "min-w-0 flex-1 truncate font-mono text-[11px] text-foreground/90"
+                  }
+                >
+                  {member.name ?? member.openId}
+                </span>
+                {isOwner ? (
+                  <span className="shrink-0 rounded bg-primary/12 px-1 py-0.5 text-[10px] text-primary">
+                    授权人
+                  </span>
+                ) : null}
+              </label>
+            );
+          })}
         </div>
       ) : null}
       {extras.length > 0 ? (
