@@ -194,4 +194,44 @@ describe("serverSettings helpers", () => {
       config: { homePath: "~/.codex" },
     });
   });
+
+  it("replaces feishuChatConfigs maps so an omitted chat entry is deleted (not deep-merged)", () => {
+    const current = {
+      ...DEFAULT_SERVER_SETTINGS,
+      feishuChatConfigs: {
+        oc_a: { approvalMode: "designated" as const, approvers: ["ou_a1"] },
+        oc_b: { approvalMode: "all" as const },
+      },
+    };
+
+    // Patch sends only chat A → chat B must be gone (wholesale-replace), and the
+    // per-chat entry itself is replaced (omitted `approvers` cleared).
+    const next = applyServerSettingsPatch(current, {
+      feishuChatConfigs: { oc_a: { approvalMode: "initiator" as const } },
+    });
+    expect(next.feishuChatConfigs).toEqual({ oc_a: { approvalMode: "initiator" } });
+    expect(next.feishuChatConfigs).not.toHaveProperty("oc_b");
+  });
+
+  it("leaves feishuChatConfigs untouched when the patch omits it", () => {
+    const current = {
+      ...DEFAULT_SERVER_SETTINGS,
+      feishuChatConfigs: { oc_a: { approvalMode: "all" as const } },
+    };
+    const next = applyServerSettingsPatch(current, { enableAssistantStreaming: true });
+    expect(next.feishuChatConfigs).toEqual({ oc_a: { approvalMode: "all" } });
+    expect(next.enableAssistantStreaming).toBe(true);
+  });
+
+  it("replaces feishuChatDefaults so an omitted field is cleared (not deep-merged)", () => {
+    const current = {
+      ...DEFAULT_SERVER_SETTINGS,
+      feishuChatDefaults: { approvalMode: "all" as const, commands: ["/help"] },
+    };
+    const next = applyServerSettingsPatch(current, {
+      feishuChatDefaults: { approvalMode: "initiator" as const },
+    });
+    expect(next.feishuChatDefaults).toEqual({ approvalMode: "initiator" });
+    expect(next.feishuChatDefaults).not.toHaveProperty("commands");
+  });
 });

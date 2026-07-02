@@ -83,6 +83,17 @@ export function applyServerSettingsPatch(
     ...(patch.providerInstances !== undefined
       ? { providerInstances: patch.providerInstances }
       : {}),
+    // Feishu per-chat config is a Record / nested object, so `deepMerge` would
+    // recurse per-key and never drop a chat entry (or clear a field) the patch
+    // omits. Wholesale-replace it like `providerInstances` so the web editor can
+    // delete a chat's config / clear a default by sending the full value — the
+    // contract documented on these fields in settings.ts.
+    ...(patch.feishuChatConfigs !== undefined
+      ? { feishuChatConfigs: patch.feishuChatConfigs }
+      : {}),
+    ...(patch.feishuChatDefaults !== undefined
+      ? { feishuChatDefaults: patch.feishuChatDefaults }
+      : {}),
     ...(automaticGitFetchInterval !== undefined ? { automaticGitFetchInterval } : {}),
   };
   if (!selectionPatch) {

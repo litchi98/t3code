@@ -363,6 +363,37 @@ export type ObservabilitySettings = typeof ObservabilitySettings.Type;
 
 export const DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL = Duration.seconds(30);
 
+// ── Feishu/Lark per-chat configuration (M-2/M-3) ──────────────────────────────
+// Policy config keyed by BARE chatId (the authz gate matches on `evt.chatId`) —
+// note this is a DIFFERENT key grain from the `/workspace` *selection* state,
+// which is keyed by composite chatKey. The distinction is intentional: policy is
+// per-chat, workspace selection is per-topic. Every inner field is
+// `Schema.optional` (absent, not defaulted) so the bot can apply FIELD-LEVEL
+// fallback at read time: `configs[chatId]?.X ?? defaults.X ?? built-in`.
+// Consumption lands later (approvalMode/approvers in PR2b; workspaces/commands/
+// toolPolicy in M-3); this struct only opens the data channel.
+export const FeishuChatConfig = Schema.Struct({
+  // Approval-gate mode. `all` = any chat member, `designated` = the `approvers`
+  // set, `initiator` = the turn initiator only. Absent → per-chat-type fallback
+  // (resolved by the bot in PR2b), never a hard default baked in here.
+  approvalMode: Schema.optional(Schema.Literals(["all", "designated", "initiator"])),
+  // open_ids allowed to approve when `approvalMode === "designated"`.
+  approvers: Schema.optional(Schema.Array(Schema.String)),
+  // projectId allowlist this chat may `/workspace` into (M-3 consumes).
+  workspaces: Schema.optional(Schema.Array(Schema.String)),
+  // slash-command allowlist (M-3 consumes; absent → all commands allowed).
+  commands: Schema.optional(Schema.Array(Schema.String)),
+  // per-chat tool policy (M-3 consumes). This is a CONFIGURATION layer, NOT a
+  // security boundary — it is mirrored onto the provider tool pipeline.
+  toolPolicy: Schema.optional(
+    Schema.Struct({
+      mode: Schema.Literals(["allowlist", "denylist"]),
+      tools: Schema.Array(Schema.String),
+    }),
+  ),
+});
+export type FeishuChatConfig = typeof FeishuChatConfig.Type;
+
 export const ServerSettings = Schema.Struct({
   enableAssistantStreaming: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   enableProviderUpdateChecks: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
@@ -432,6 +463,17 @@ export const ServerSettings = Schema.Struct({
       ownerOpenId: TrimmedNonEmptyString,
     }),
   ),
+  // Feishu/Lark per-chat policy config, keyed by BARE chatId. Web-configured,
+  // server-persisted, sent to the feishu-bot verbatim (NOT redacted — see
+  // `redactServerSettingsForClient`). Missing decodes to `{}` (backward
+  // compatible with older servers/configs). The bot applies field-level fallback
+  // against `feishuChatDefaults` at read time (PR2b/M-3).
+  feishuChatConfigs: Schema.Record(Schema.String, FeishuChatConfig).pipe(
+    Schema.withDecodingDefault(Effect.succeed({})),
+  ),
+  // Fallback config applied when a chat has no per-chat entry (or when a field
+  // is absent on the per-chat entry). Missing decodes to an empty config.
+  feishuChatDefaults: FeishuChatConfig.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
 });
 export type ServerSettings = typeof ServerSettings.Type;
 
@@ -564,6 +606,14 @@ export const ServerSettingsPatch = Schema.Struct({
       ownerOpenId: TrimmedNonEmptyString,
     }),
   ),
+  // Whole-map / whole-object replacement. These are Records / nested objects, so
+  // the default `deepMerge` would recurse per-key and never drop an omitted chat
+  // entry or clear an omitted field; `applyServerSettingsPatch` therefore
+  // special-cases both to wholesale-replace (like `providerInstances`). The web
+  // UI must send the full value on every edit — omitting a chat entry deletes it,
+  // omitting a field clears it.
+  feishuChatConfigs: Schema.optionalKey(Schema.Record(Schema.String, FeishuChatConfig)),
+  feishuChatDefaults: Schema.optionalKey(FeishuChatConfig),
 });
 export type ServerSettingsPatch = typeof ServerSettingsPatch.Type;
 
