@@ -42,6 +42,30 @@ export const APPROVAL_MODE_LABELS: Record<ApprovalMode, string> = {
 export const INHERIT_MODE = "inherit" as const;
 export type ChatModeSelection = ApprovalMode | typeof INHERIT_MODE;
 
+/**
+ * Structural deep-equality for plain JSON values (objects key-order-independent,
+ * arrays order-sensitive). Used to settle the optimistic settings overlay when
+ * the server echoes back exactly what we last wrote. Kept here (pure) rather than
+ * pulling an undeclared transitive dependency.
+ */
+export const deepEqual = (a: unknown, b: unknown): boolean => {
+  if (a === b) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  const aIsArray = Array.isArray(a);
+  if (aIsArray || Array.isArray(b)) {
+    if (!aIsArray || !Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((item, index) => deepEqual(item, b[index]));
+  }
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+  return aKeys.every(
+    (key) =>
+      Object.hasOwn(b, key) &&
+      deepEqual((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key]),
+  );
+};
+
 /** Toggle an open_id in an approver list (add if absent, remove if present). */
 export const toggleApprover = (
   approvers: ReadonlyArray<string>,

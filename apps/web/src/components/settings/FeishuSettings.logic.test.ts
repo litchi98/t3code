@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   chatModeSelection,
+  deepEqual,
   defaultsModeSelection,
   isChatConfigEmpty,
   setConfigApprovalMode,
@@ -146,6 +147,26 @@ describe("defaults setters", () => {
     expect(
       toggleDefaultsApprover({ approvalMode: "designated", approvers: ["ou_a"] }, "ou_a"),
     ).toEqual({ approvalMode: "designated", approvers: [] });
+  });
+});
+
+describe("deepEqual", () => {
+  it("compares nested config maps regardless of object key order", () => {
+    expect(
+      deepEqual(
+        { oc_a: { approvalMode: "designated", approvers: ["ou_x"] } },
+        { oc_a: { approvers: ["ou_x"], approvalMode: "designated" } },
+      ),
+    ).toBe(true);
+  });
+
+  it("is order-sensitive for arrays and detects differing values/keys", () => {
+    expect(deepEqual(["ou_x", "ou_y"], ["ou_y", "ou_x"])).toBe(false);
+    expect(
+      deepEqual({ oc_a: { approvalMode: "all" } }, { oc_a: { approvalMode: "initiator" } }),
+    ).toBe(false);
+    expect(deepEqual({ oc_a: {} }, {})).toBe(false);
+    expect(deepEqual({}, {})).toBe(true);
   });
 });
 

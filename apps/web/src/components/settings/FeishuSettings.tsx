@@ -23,6 +23,7 @@ import {
   APPROVAL_MODES,
   chatModeSelection,
   type ChatModeSelection,
+  deepEqual,
   defaultsModeSelection,
   type FeishuChatConfigMap,
   INHERIT_MODE,
@@ -166,6 +167,56 @@ function FeishuBindingSection() {
  * and mutates a ref synchronously on every commit, so each edit derives the next
  * whole map from the freshest accumulated draft rather than a render snapshot.
  */
+/**
+ * Optimistic overlay over a server-backed setting value.
+ *
+ * The settings write path is fire-and-forget with no local echo — the atom value
+ * only advances when the server re-emits the config over the ws (which is also
+ * how live-refresh + first-load HYDRATION arrive). So rendering from a seed-once
+ * local copy is wrong: it freezes whatever the atom held at mount (often the
+ * pre-hydration empty default), and a page refresh then shows stale/empty.
+ *
+ * Instead render the SERVER value by default, and hold a local `pending` value
+ * ONLY while our own write is in flight so a rapid sequence of edits accumulates
+ * (instead of each recomputing from a snapshot the round-trip hasn't updated yet).
+ * The overlay settles back to the server value once the server catches up to our
+ * latest write (deepEqual echo) or moves to something we didn't write (external
+ * change / hydration) — both cases follow the server.
+ */
+function useOptimisticSetting<T>(
+  serverValue: T,
+  write: (next: T) => void,
+): readonly [T, (updater: (current: T) => T) => void] {
+  const [pending, setPending] = useState<T | null>(null);
+  const pendingRef = useRef<T | null>(null);
+  const lastWrittenRef = useRef<T | null>(null);
+  const prevServerRef = useRef(serverValue);
+  const serverRef = useRef(serverValue);
+  serverRef.current = serverValue;
+
+  if (prevServerRef.current !== serverValue) {
+    prevServerRef.current = serverValue;
+    if (lastWrittenRef.current === null || deepEqual(serverValue, lastWrittenRef.current)) {
+      lastWrittenRef.current = null;
+      pendingRef.current = null;
+      if (pending !== null) setPending(null);
+    }
+  }
+
+  const commit = useCallback(
+    (updater: (current: T) => T) => {
+      const next = updater(pendingRef.current ?? serverRef.current);
+      pendingRef.current = next;
+      lastWrittenRef.current = next;
+      setPending(next);
+      write(next);
+    },
+    [write],
+  );
+
+  return [pending ?? serverValue, commit];
+}
+
 function FeishuChatConfigSection() {
   const environmentId = usePrimaryEnvironment()?.environmentId ?? null;
   const { data, error, isPending } = useEnvironmentQuery(
@@ -177,20 +228,16 @@ function FeishuChatConfigSection() {
   // their roster checkbox is shown pre-checked and locked, not toggleable.
   const bindingOwnerOpenId = usePrimarySettings((s) => s.feishuBinding?.ownerOpenId);
   const update = useUpdatePrimarySettings();
-  // Seed-once draft of the whole per-chat map; `draftRef` mirrors it and is
-  // updated synchronously inside `commitChat` so back-to-back edits (same card or
-  // different cards) accumulate instead of racing the settings-write round trip.
-  const [draftConfigs, setDraftConfigs] = useState<FeishuChatConfigMap>(() => serverConfigs);
-  const draftRef = useRef(draftConfigs);
+  const writeConfigs = useCallback(
+    (next: FeishuChatConfigMap) => update({ feishuChatConfigs: next }),
+    [update],
+  );
+  const [configs, commitConfigs] = useOptimisticSetting(serverConfigs, writeConfigs);
   const commitChat = useCallback(
     (chatId: string, updater: (config: FeishuChatConfig) => FeishuChatConfig) => {
-      const nextConfig = updater(draftRef.current[chatId] ?? {});
-      const nextConfigs = writeChatConfig(draftRef.current, chatId, nextConfig);
-      draftRef.current = nextConfigs;
-      setDraftConfigs(nextConfigs);
-      update({ feishuChatConfigs: nextConfigs });
+      commitConfigs((current) => writeChatConfig(current, chatId, updater(current[chatId] ?? {})));
     },
-    [update],
+    [commitConfigs],
   );
 
   // Group/topic chats only — p2p (single-user) chats have no approval roster and
@@ -238,7 +285,7 @@ function FeishuChatConfigSection() {
               <FeishuChatConfigCard
                 key={chat.chatId}
                 chat={chat}
-                config={draftConfigs[chat.chatId]}
+                config={configs[chat.chatId]}
                 bindingOwnerOpenId={bindingOwnerOpenId}
                 onCommit={commitChat}
               />
@@ -254,22 +301,11 @@ function FeishuChatConfigSection() {
 function FeishuDefaultsEditor() {
   const serverDefaults = usePrimarySettings((s) => s.feishuChatDefaults);
   const update = useUpdatePrimarySettings();
-  // Local draft is the source of truth while editing so a rapid sequence of
-  // approver toggles accumulates instead of each racing the settings-write round
-  // trip — settings writes are fire-and-forget with no optimistic echo, so a
-  // handler that recomputed from the atom snapshot would clobber prior clicks.
-  // `draftRef` is read (freshest) on commit; `draft` state drives the render.
-  const [draft, setDraft] = useState<FeishuChatConfig>(() => serverDefaults);
-  const draftRef = useRef(draft);
-  const commit = useCallback(
-    (updater: (config: FeishuChatConfig) => FeishuChatConfig) => {
-      const next = updater(draftRef.current);
-      draftRef.current = next;
-      setDraft(next);
-      update({ feishuChatDefaults: next });
-    },
+  const writeDefaults = useCallback(
+    (next: FeishuChatConfig) => update({ feishuChatDefaults: next }),
     [update],
   );
+  const [draft, commit] = useOptimisticSetting(serverDefaults, writeDefaults);
   const mode = defaultsModeSelection(draft);
 
   return (
