@@ -99,6 +99,77 @@ interface RawContactClient {
 }
 
 /**
+ * Narrow structural view of `channel.rawClient.im.chatMembers.get` — the group
+ * member list (`GET im/v1/chats/:chat_id/members`). Same rationale as
+ * {@link RawContactClient}: name only the request/response slice we use rather
+ * than lean on the node-sdk's generated overloads. The runtime path
+ * (`im.chatMembers.get`) is the flat alias the node-sdk exposes alongside the
+ * `im.v1.*` chain (verified against `@larksuiteoapi/node-sdk`), matching the
+ * flat `contact.user.get` used by {@link RawContactClient}.
+ */
+interface RawChatMembersClient {
+  readonly im: {
+    readonly chatMembers: {
+      readonly get: (payload: {
+        readonly path: { readonly chat_id: string };
+        readonly params: {
+          readonly member_id_type: "open_id";
+          readonly page_size: number;
+          readonly page_token?: string;
+        };
+      }) => Promise<{
+        readonly data?: {
+          readonly items?: ReadonlyArray<{ readonly member_id?: string }>;
+          readonly page_token?: string;
+          readonly has_more?: boolean;
+        };
+      }>;
+    };
+  };
+}
+
+/** Feishu caps chat-member pages at 100 rows. */
+const MEMBER_PAGE_SIZE = 100;
+
+/**
+ * Hard cap on member pages fetched per chat (100 rows × 50 pages = 5000
+ * members). Mirrors the SDK's own `maxPages` guard on `listChats`: a runaway
+ * `has_more` (or a page_token that never clears) can't spin the report loop
+ * forever.
+ */
+const MAX_MEMBER_PAGES = 50;
+
+/** Feishu caps chat-list pages at 100 rows. */
+const CHATS_PAGE_SIZE = 100;
+
+/**
+ * Page cap for `listChats` (100 rows × 100 pages = 10 000 chats). The SDK
+ * defaults `maxPages` to 10 (≈1000 chats) and silently truncates past it; we
+ * raise the ceiling and log if a bot ever brushes it so a truncated roster is
+ * never mistaken for the full one.
+ */
+const CHATS_MAX_PAGES = 100;
+
+/**
+ * Coerce the SDK's chat `memberCount` into a safe integer.
+ *
+ * Feishu's `im.v1.chat.get` returns `user_count` as a JSON **string** (e.g.
+ * `"5"`), and `@larksuite/channel` passes it straight through while its `.d.ts`
+ * mislabels the field `number` — the same lie as `chatType`, one field over.
+ * Left untouched it would be a string at runtime and blow up the `Schema.Int`
+ * encoding of the whole `reportChats` payload (one bad field → the entire
+ * full-replace roster is lost). Coerce to an integer, dropping non-integral or
+ * missing values.
+ */
+export const coerceChatMemberCount = (value: unknown): number | undefined => {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+  const parsed = Number(value);
+  return Number.isInteger(parsed) ? parsed : undefined;
+};
+
+/**
  * Project a raw {@link NormalizedMessage} into the bridge-facing
  * {@link InboundMessage}. Only image resources survive (M1 surfaces images;
  * other resource kinds are dropped — the bridge replies with a "text/image
@@ -343,6 +414,95 @@ export const larkGatewayLayer = (config: FeishuCredentials): Layer.Layer<LarkGat
           }),
         );
 
+      // Chat-directory reads (M-0). `listChats` and `getChatInfo` use the
+      // channel's own wrappers; `listChatMembers` has no wrapper, so it goes
+      // through the same `rawClient` escape hatch as `getUser`.
+      const rawChatMembers = channel.rawClient as unknown as RawChatMembersClient;
+
+      const listChats = sdkCall("list chats", () =>
+        channel.listChats({ pageSize: CHATS_PAGE_SIZE, maxPages: CHATS_MAX_PAGES }),
+      ).pipe(
+        Effect.tap((chats) =>
+          chats.length >= CHATS_PAGE_SIZE * CHATS_MAX_PAGES
+            ? Effect.logWarning(
+                `[feishu-bot] feishu chat directory: listChats hit the ${
+                  CHATS_PAGE_SIZE * CHATS_MAX_PAGES
+                }-chat ceiling; the roster may be truncated.`,
+              )
+            : Effect.void,
+        ),
+        Effect.map((chats) => chats.map((chat) => ({ chatId: chat.id, name: chat.name }))),
+      );
+
+      const getChatInfo = (chatId: string) =>
+        sdkCall("get chat info", () => channel.getChatInfo(chatId)).pipe(
+          Effect.map((info) => {
+            // `getChatInfo` maps the raw `chat_mode` onto `chatType` (typed
+            // "p2p"|"group" but carrying "topic" at runtime), so read it as an
+            // opaque string. `memberCount` is a JSON string at runtime despite
+            // its `number` type (see coerceChatMemberCount). Optional fields are
+            // spread conditionally for `exactOptionalPropertyTypes`.
+            const memberCount = coerceChatMemberCount(info.memberCount);
+            return {
+              chatMode: String(info.chatType),
+              ...(info.name !== undefined ? { name: info.name } : {}),
+              ...(info.ownerId !== undefined ? { ownerOpenId: info.ownerId } : {}),
+              ...(memberCount !== undefined ? { memberCount } : {}),
+            };
+          }),
+        );
+
+      const listChatMembers = (
+        chatId: string,
+      ): Effect.Effect<ReadonlyArray<string>, LarkGatewayError> =>
+        Effect.gen(function* () {
+          const openIds: string[] = [];
+          let pageToken: string | undefined;
+          let truncated = false;
+          let page = 0;
+          while (true) {
+            if (page >= MAX_MEMBER_PAGES) {
+              // Loop still had `has_more` when it hit the page cap → the member
+              // list is incomplete. Surface it so a partial roster isn't taken
+              // as the full membership (M-2 approval gates read this list).
+              truncated = true;
+              break;
+            }
+            const response = yield* sdkCall("list chat members", () =>
+              rawChatMembers.im.chatMembers.get({
+                path: { chat_id: chatId },
+                params: {
+                  member_id_type: "open_id",
+                  page_size: MEMBER_PAGE_SIZE,
+                  ...(pageToken !== undefined ? { page_token: pageToken } : {}),
+                },
+              }),
+            );
+            page += 1;
+            const data = response.data;
+            for (const item of data?.items ?? []) {
+              if (item.member_id !== undefined) {
+                openIds.push(item.member_id);
+              }
+            }
+            if (data?.has_more !== true) {
+              break;
+            }
+            pageToken = data.page_token;
+            if (pageToken === undefined || pageToken.length === 0) {
+              break;
+            }
+          }
+          if (truncated) {
+            yield* Effect.logWarning(
+              `[feishu-bot] feishu chat directory: chat ${chatId} member list hit the ${
+                MEMBER_PAGE_SIZE * MAX_MEMBER_PAGES
+              }-member cap; membership may be incomplete.`,
+            );
+          }
+          return openIds;
+        });
+
       const addReaction = (messageId: string, emojiType: string) =>
         sdkCall("add reaction", () => channel.addReaction(messageId, emojiType));
 
@@ -361,6 +521,9 @@ export const larkGatewayLayer = (config: FeishuCredentials): Layer.Layer<LarkGat
         downloadImage,
         updateCard,
         getUser,
+        listChats,
+        getChatInfo,
+        listChatMembers,
       });
     }),
   );

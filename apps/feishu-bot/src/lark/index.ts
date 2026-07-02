@@ -145,5 +145,49 @@ export class LarkGateway extends Context.Service<
     readonly getUser: (
       openId: string,
     ) => Effect.Effect<{ readonly name?: string }, LarkGatewayError>;
+    /**
+     * List the group chats this bot is a member of (`im.v1.chat.list`, paged
+     * automatically by the SDK). Returns `{ chatId, name }` per chat. Excludes
+     * p2p private chats and does not carry the topic flag — the per-chat mode is
+     * resolved via {@link getChatInfo}. Requires the
+     * `im:chat:readonly` tenant scope (M-0). Used by the chat-directory report
+     * loop to enumerate the bot's groups.
+     */
+    readonly listChats: Effect.Effect<
+      ReadonlyArray<{ readonly chatId: string; readonly name: string }>,
+      LarkGatewayError
+    >;
+    /**
+     * Fetch a chat's metadata via a single `im.v1.chat.get` (through the SDK's
+     * `getChatInfo`). Returns the chat mode, the owner's open_id, and the member
+     * count.
+     *
+     * NB: the SDK types the mode field as `chatType: "p2p" | "group"` but
+     * populates it from the raw `chat_mode`, so a topic group surfaces as
+     * `"topic"` at runtime; {@link chatMode} is therefore read as an opaque
+     * string (known values: `"group"` / `"topic"` / `"p2p"`). One call yields
+     * everything the directory records — no separate `getChatMode` needed.
+     */
+    readonly getChatInfo: (chatId: string) => Effect.Effect<
+      {
+        readonly name?: string;
+        readonly chatMode: string;
+        readonly ownerOpenId?: string;
+        readonly memberCount?: number;
+      },
+      LarkGatewayError
+    >;
+    /**
+     * List a chat's human member open_ids (`GET im/v1/chats/:chat_id/members`,
+     * `member_id_type=open_id`), following `has_more`/`page_token` pagination.
+     *
+     * NB: Feishu never returns the bot's own membership here (expected — it does
+     * not affect human-approval gating). Not wrapped by `@larksuite/channel`, so
+     * this goes through the `rawClient` escape hatch (see {@link getUser}). Used
+     * by the report loop to record group membership for the approval gates.
+     */
+    readonly listChatMembers: (
+      chatId: string,
+    ) => Effect.Effect<ReadonlyArray<string>, LarkGatewayError>;
   }
 >()("@t3tools/feishu-bot/lark/LarkGateway") {}

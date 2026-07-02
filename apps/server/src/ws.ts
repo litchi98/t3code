@@ -79,6 +79,7 @@ import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import { makeFeishuBindingStream } from "./feishu/binding.ts";
+import * as FeishuChatDirectory from "./feishu/FeishuChatDirectory.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as PreviewManager from "./preview/Manager.ts";
@@ -347,6 +348,9 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [WS_METHODS.feishuStartBinding, AuthOrchestrationOperateScope],
   [WS_METHODS.feishuGetBotCredentials, AuthOrchestrationOperateScope],
   [WS_METHODS.feishuClearBinding, AuthOrchestrationOperateScope],
+  // Bot writes the roster (operate); web reads it for the settings UI (read).
+  [WS_METHODS.feishuReportChats, AuthOrchestrationOperateScope],
+  [WS_METHODS.feishuListChats, AuthOrchestrationReadScope],
 ]);
 
 function toAuthAccessStreamEvent(
@@ -412,6 +416,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
       const config = yield* ServerConfig.ServerConfig;
       const lifecycleEvents = yield* ServerLifecycleEvents.ServerLifecycleEvents;
       const serverSettings = yield* ServerSettings.ServerSettingsService;
+      const feishuChatDirectory = yield* FeishuChatDirectory.FeishuChatDirectory;
       const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
       const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
@@ -1252,6 +1257,28 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
             serverSettings.clearFeishuBinding.pipe(Effect.as({})),
             { "rpc.aggregate": "server" },
           ),
+        // Bot → server: persist the full group roster (full-replace). The store
+        // is fail-safe; a persist error is logged and swallowed here so the bot's
+        // best-effort report always gets an ack (the wire never carries it).
+        [WS_METHODS.feishuReportChats]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.feishuReportChats,
+            feishuChatDirectory.save(input.chats).pipe(
+              Effect.catch((error) =>
+                Effect.logWarning("Failed to persist feishu chat directory report.").pipe(
+                  Effect.annotateLogs({ cause: error }),
+                ),
+              ),
+              Effect.as({}),
+            ),
+            { "rpc.aggregate": "server" },
+          ),
+        // Web → server: read the roster for the settings UI (group list + the
+        // designated-approver member picker). `read` is boot-tolerant, never fails.
+        [WS_METHODS.feishuListChats]: (_input) =>
+          observeRpcEffect(WS_METHODS.feishuListChats, feishuChatDirectory.read, {
+            "rpc.aggregate": "server",
+          }),
         [WS_METHODS.serverDiscoverSourceControl]: (_input) =>
           observeRpcEffect(
             WS_METHODS.serverDiscoverSourceControl,
