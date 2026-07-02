@@ -32,7 +32,6 @@ import {
   type OrchestrationThreadActivity,
   type OrchestrationThreadStreamItem,
   ProjectId,
-  type RuntimeMode,
   type ServerProvider,
   ThreadId,
   type TurnId,
@@ -85,6 +84,7 @@ import { larkGatewayLayer } from "./lark/channel.ts";
 import { reportFeishuChatDirectory } from "./chat-directory.ts";
 import type { BridgeHandlers, CardActionEvent, InboundMessage, SendOptions } from "./lark/types.ts";
 import { authorizeApprovalClick } from "./bridge/authz.ts";
+import { effectiveChatConfig } from "./bridge/chatConfig.ts";
 import { CallbackAuth, computePolicyFingerprint } from "./bridge/callbackAuth.ts";
 import {
   actionToApprovalDecision,
@@ -101,7 +101,6 @@ import {
   deriveThreadId,
   ensureThreadForChat,
   refusesFullAccessTakeover,
-  resolveApprover,
   runtimeModeForChatType,
   splitChatKey,
 } from "./bridge/chatThreadMap.ts";
@@ -365,18 +364,19 @@ const topicSendOpts = (
  *
  * Runs inside the outer layer (so `EnvironmentRegistry` and the durable stores
  * are available) and the per-binding `boundLayer` (Lark gateway + queues). The
- * `creds` carry the resolved app id/secret/domain; `allowlistRef` is the shared
- * approval allowlist owned by the resident loop (live-refreshed across bindings);
- * `ownerRef` is the shared binding owner (`feishuBinding.ownerOpenId`, or `null`
- * when unbound), also live-refreshed by the resident watcher — the cardAction
- * gate reads it for owner-always authorization (M-2/PR2a).
+ * `creds` carry the resolved app id/secret/domain. `ownerRef` is the shared
+ * binding owner (`feishuBinding.ownerOpenId`, or `null` when unbound) and
+ * `chatConfigsRef`/`chatDefaultsRef` the per-chat approval config — all owned by
+ * the resident loop and live-refreshed across re-binds by the outer watcher. The
+ * cardAction gate reads them for owner-always + three-state authorization (M-2).
  */
 const runBoundSession = (
   config: FeishuBotConfig,
   resolved: ResolvedEnvironment,
   creds: FeishuCredentialOverride,
-  allowlistRef: Ref.Ref<ReadonlyArray<string>>,
   ownerRef: Ref.Ref<string | null>,
+  chatConfigsRef: Ref.Ref<{ readonly [chatId: string]: FeishuChatConfig }>,
+  chatDefaultsRef: Ref.Ref<FeishuChatConfig>,
 ) =>
   Effect.gen(function* () {
     const registry = yield* EnvironmentRegistry;
@@ -496,28 +496,8 @@ const runBoundSession = (
       nonces: nonceProbe,
     });
 
-    // M3a/M4-1/M4-2: the approval allowlist for group/topic chats, read as an N-of
-    // allowlist (any listed member may approve), not a single-owner binding. PR2:
-    // the Ref is now owned by the resident loop and passed in, so its `env ∪ store`
-    // live-refresh (the M4-2 fiber, now hoisted to the OUTER scope) survives a
-    // re-bind — the durable allowlist is binding-independent. It is still seeded
-    // from the env `FEISHU_OWNER_OPEN_IDS` floor and the store can only ADD, so a
-    // missing / failed refresh keeps the owner floor as last-known-good rather than
-    // locking everyone out.
-
-    // M4-1: the effective approval allowlist that gates a cardAction click, by
-    // runtime mode. Only approval-gated chats consult the configured owners; a p2p
-    // (`full-access`) chat — or an unconfigured/empty allowlist — keeps the pre-M4
-    // "initiator only" rule (the gate then falls back to the signed `payload.o`).
-    // Shared by the cardAction authz gate and the M18 empty-operator recovery guard
-    // so both derive "is the allowlist active here?" from one place.
-    const effectiveAllowlistFor = (
-      runtimeMode: RuntimeMode,
-    ): Effect.Effect<ReadonlyArray<string>> =>
-      runtimeMode === "approval-required" ? Ref.get(allowlistRef) : Effect.succeed([]);
-
     // M3b: render density for group / topic chats, captured once from config
-    // (bot-side, like the approval allowlist floor) so every `renderThreadCard` call site below
+    // (bot-side) so every `renderThreadCard` call site below
     // derives its layout from one place via `densityForRuntime(runtimeMode, …)`.
     // p2p (`full-access`) is always `card`; only an explicit
     // `FEISHU_GROUP_CHAT_DENSITY` lowers a group/topic below `card`.
@@ -775,12 +755,12 @@ const runBoundSession = (
         ? "请先用 /workspace 选择工作区(发送 /workspace 查看可选项)。"
         : "当前选中的工作区已不可用(项目可能已被删除或服务器尚未同步),请用 /workspace 重新选择。";
 
-    // PR2: the M4-2 approval-allowlist live-refresh fiber is hoisted OUT of this
-    // per-binding session into the resident loop's OUTER scope (see
-    // `runApprovalAllowlistAndBindingFiber`). It must outlive any single binding —
-    // the durable `env ∪ store` allowlist is binding-independent — and it doubles
-    // as the binding-change watcher that drives re-bind. Here we only consume the
-    // shared `allowlistRef` it maintains.
+    // PR2: the binding + owner + per-chat config live-refresh fiber is hoisted OUT
+    // of this per-binding session into the resident loop's OUTER scope (see
+    // `runBindingAndConfigWatcher`). It must outlive any single binding — the owner
+    // / per-chat config it publishes are binding-independent — and it doubles as the
+    // binding-change watcher that drives re-bind. Here we only consume the shared
+    // `ownerRef` / `chatConfigsRef` / `chatDefaultsRef` it maintains.
 
     // Render the last few messages of a takeover snapshot into a compact
     // markdown transcript (M2b-2). One line per message: `🧑 …` (user) / `🤖 …`
@@ -1336,14 +1316,13 @@ const runBoundSession = (
           operatorOverride !== undefined && operatorOverride.length > 0
             ? operatorOverride
             : (operators.get(chatKey) ?? "");
-        // M3a: for approval-required chats, bind the primary owner (if configured)
-        // as the approval operator so only the owner can click approve. p2p /
-        // unconfigured owner falls back to the turn initiator (no regression).
-        const operatorOpenId = resolveApprover(
-          thread.runtimeMode,
-          yield* Ref.get(allowlistRef),
-          rawInitiator,
-        );
+        // M-2/PR2b: the token's signed `payload.o` is the true turn initiator
+        // (initiator-only). WHO may approve is decided by the cardAction gate's
+        // three-state mode, NOT here; `payload.o` is only consulted in `initiator`
+        // mode, where it must equal the real initiator. The per-turn operator pin
+        // (idle-guarded `chatOperators` + `driveTurn`'s `operatorOverride`) keeps
+        // `rawInitiator` un-flippable by a mid-turn bystander.
+        const operatorOpenId = rawInitiator;
         const staleSet = staleRequestIdsOf(thread.activities);
         // M3a: recover the real Feishu chatId (for the token's `c`/`scope`, matched
         // at verify against `evt.chatId`) and the topic id (signed into the token's
@@ -1489,15 +1468,13 @@ const runBoundSession = (
         // (in a p2p private chat the takeover operator is the same person, so the
         // persisted open id is valid for the new request too). Reuse the handle read
         // above for the dedup so we don't fetch it twice. If BOTH are empty we still
-        // surface the card so the user *sees* a request is pending. M4-1: whether its
-        // buttons are actionable now depends on the authz gate, not on this operator:
-        // for an approval-gated chat with a configured allowlist, `buildInteraction`
-        // resolves the operator via `resolveApprover` (→ the allowlist's primary entry) and the gate
-        // authorises by allowlist membership, so the card is approvable by any listed
-        // member regardless of the empty operator here. Only in the empty-allowlist
-        // fallback (p2p / unconfigured) does an empty operator yield a readable-but-
-        // not-clickable card (gate falls back to the signed `payload.o`; no wildcard /
-        // auth bypass), prompting a resend — mirroring M18's graceful fallback.
+        // surface the card so the user *sees* a request is pending. M-2: whether its
+        // buttons are actionable now depends on the authz gate's per-chat mode, not on
+        // this operator: with a bound owner (owner-always) or a `designated`/`all`
+        // chat, the card is approvable regardless of the empty operator here. Only in
+        // `initiator` mode with no owner does an empty operator yield a readable-but-
+        // not-clickable card (the gate then needs `payload.o` = the initiator; no
+        // wildcard / auth bypass), prompting a resend — mirroring M18's graceful fallback.
         const operators = yield* Ref.get(chatOperators);
         const operatorOpenId =
           // #5: the trailing `?? ""` was unreachable — the conditional's else branch
@@ -3049,25 +3026,26 @@ const runBoundSession = (
           return;
         }
 
-        // 6b. Authz (M4-1): verify proved integrity (this IS the live card for this
-        //     chat/thread/policy); now decide WHO may act. The effective allowlist is
-        //     the configured owners, but only for approval-gated chats; a p2p
-        //     (`full-access`) chat or an unconfigured/empty allowlist keeps the pre-M4
-        //     "initiator only" rule by matching the signed `payload.o`. A non-listed
-        //     clicker is a bystander: no-op the card (preserve it for the real
-        //     approver) + neutral @notice. MUST run BEFORE the nonce consume (step 8)
-        //     so a bystander click never burns the single-use nonce out from under
-        //     the real approver.
-        const effectiveAllowlist = yield* effectiveAllowlistFor(shell.runtimeMode);
+        // 6b. Authz (M-2): verify proved integrity (this IS the live card for this
+        //     chat/thread/policy); now decide WHO may act. Owner-always (the bound
+        //     owner) overlays the per-chat three-state mode: `initiator` matches the
+        //     signed `payload.o` (the true turn initiator), `designated` the
+        //     configured approvers, `all` any chat member (any clicker of an in-chat
+        //     card is a member — no roster fetch). A non-authorised clicker is a
+        //     bystander: no-op the card (preserve it for the real approver) + neutral
+        //     @notice. MUST run BEFORE the nonce consume (step 8) so a bystander click
+        //     never burns the single-use nonce out from under the real approver.
         const clicker = evt.operator.openId;
-        // M-2/PR2a: owner-always is prepended to the M4-1 base rule (allowlist
-        // membership when active, else signed-initiator fallback). The decision
-        // is delegated to the pure `authorizeApprovalClick` so the branches stay
-        // unit-testable and PR2b can layer the three-state mode logic there.
         const owner = yield* Ref.get(ownerRef);
+        const chatConfig = effectiveChatConfig(
+          evt.chatId,
+          yield* Ref.get(chatConfigsRef),
+          yield* Ref.get(chatDefaultsRef),
+        );
         const authorized = authorizeApprovalClick({
           owner,
-          effectiveAllowlist,
+          mode: chatConfig.approvalMode,
+          approvers: chatConfig.approvers,
           clicker,
           initiator: res.payload.o,
         });
@@ -3418,42 +3396,47 @@ const runBoundSession = (
 
           // #0/#1(c): graceful fallback when the persisted handle has no captured
           // operator (pre-M2b-2 data, or the card was rendered before any inbound
-          // message identified the chat's operator). M4-1: the "empty open id →
-          // dead button" premise only holds where the authz gate falls back to the
-          // signed `payload.o` (p2p / unconfigured allowlist). When an approval
-          // allowlist is ACTIVE for this chat (approval-required + a configured
-          // allowlist), the gate authorises by allowlist MEMBERSHIP and ignores
-          // `payload.o`, so the card is fully approvable by any listed member even
-          // with no captured operator — recover it as usual (the deadlock M4 roots
-          // out). Determine "allowlist active?" from the thread's current runtimeMode
-          // (same source the cardAction gate uses); a cold cache (null) is treated as
-          // not-active → the safe nudge fallback, preserving the prior invariant.
+          // message identified the chat's operator). M-2/PR2b: the "empty open id →
+          // dead button" premise only holds when the gate's authority DEPENDS on the
+          // (missing) initiator — i.e. `initiator` mode with no bound owner. If an
+          // owner is bound (owner-always) OR the chat's mode is `designated`/`all`
+          // (initiator-independent), the card is approvable with no captured operator,
+          // so recover it. Resolve the mode from the thread's current per-chat config
+          // (same source the cardAction gate uses); a cold shell cache (null) is
+          // treated as not-recoverable → the safe nudge fallback.
           if (handle.operatorOpenId.length === 0) {
             const recoveryShell = yield* shellCache.threadById(threadId);
-            const allowlistActive =
-              recoveryShell !== null &&
-              (yield* effectiveAllowlistFor(recoveryShell.runtimeMode)).length > 0;
-            if (!allowlistActive) {
-              // Empty-allowlist fallback (p2p / unconfigured / cold cache): re-signing
-              // with an empty open id would dead-end at verify time, so drop the stale
-              // handle and nudge the user to send a message — which re-drives the turn
-              // and produces a fresh, correctly-signed card. No wildcard / auth bypass.
+            const owner = yield* Ref.get(ownerRef);
+            const mode =
+              recoveryShell === null
+                ? null
+                : effectiveChatConfig(
+                    chatId,
+                    yield* Ref.get(chatConfigsRef),
+                    yield* Ref.get(chatDefaultsRef),
+                  ).approvalMode;
+            const recoverable = mode !== null && (owner !== null || mode !== "initiator");
+            if (!recoverable) {
+              // initiator-only with no owner (or cold cache): re-signing with an empty
+              // open id would dead-end at verify time, so drop the stale handle and
+              // nudge the user to send a message — which re-drives the turn and produces
+              // a fresh, correctly-signed card. No wildcard / auth bypass.
               yield* cardHandles.remove(chatId).pipe(Effect.ignore);
               yield* sendNotice(
                 chatId,
                 "⚠️ 有待批准的操作,请发送一条消息以继续(将刷新可操作的卡片)。",
               );
               yield* Console.log(
-                `[feishu-bot] skipping approval-card recovery for chat ${chatId} (no captured operator, no active allowlist); nudged user to resend.`,
+                `[feishu-bot] skipping approval-card recovery for chat ${chatId} (no captured operator, initiator-only mode); nudged user to resend.`,
               );
               return;
             }
-            // Allowlist active: fall through and recover. `buildInteraction` resolves
-            // the approval operator via `resolveApprover` (→ the allowlist's primary entry for an
-            // approval-gated chat), so the recovered buttons are signed to a real
-            // owner and approvable by any listed member regardless of the empty handle.
+            // Recoverable (owner bound or non-initiator mode): fall through. The
+            // recovered buttons sign the (empty) initiator into `payload.o`, but the
+            // owner / a designated approver / any member can still approve them — the
+            // gate does not consult `payload.o` in those cases.
             yield* Console.log(
-              `[feishu-bot] recovering approval card for chat ${chatId} with no captured operator (allowlist active; any listed member may approve).`,
+              `[feishu-bot] recovering approval card for chat ${chatId} with no captured operator (owner bound or non-initiator mode; approvable without the initiator).`,
             );
           }
 
@@ -3812,33 +3795,27 @@ const acquireCredentials = (
  * carries several duties on each `snapshot` / `settingsUpdated` event, all
  * reading the FULL `ServerSettings` (not a delta):
  *
- *  1. **Approval allowlist live-refresh — FIRST and fail-safe.** Fold web-configured
- *     `feishuApprovalAllowlist` into `allowlistRef` as `env ∪ store` (the env
- *     `FEISHU_OWNER_OPEN_IDS` floor is immovable — the store can only ADD — so a
- *     misconfigured/empty store can never lock the owner out). The Ref is never
- *     cleared on error → last-known-good. This MUST stay ahead of (2)/(3) and must
- *     not throw, preserving the M4-2 authz fail-safe.
- *  2. **Binding view.** Publish the public binding identity (no secret) to
+ *  1. **Binding view.** Publish the public binding identity (no secret) to
  *     `bindingView` so the resident loop can re-bind on a change. Because the
  *     settings are the FULL snapshot, `feishuBinding` always reflects the current
  *     binding — an unrelated settings change re-publishes the SAME identity,
  *     which `bindingIdentityEq` filters out (no spurious re-bind).
- *  3. **Owner + per-chat config live-refresh (M-2/PR2a).** Publish the binding
- *     owner (`feishuBinding.ownerOpenId`, or `null`) to `ownerRef` for owner-always
- *     authz, and the per-chat policy config (`feishuChatConfigs`/`feishuChatDefaults`)
- *     to `chatConfigsRef`/`chatDefaultsRef` — the data channel PR2b/M-3 consume.
- *     Pure extractions, never cleared on error → same last-known-good as (1).
+ *  2. **Owner + per-chat config live-refresh (M-2).** Publish the binding owner
+ *     (`feishuBinding.ownerOpenId`, or `null`) to `ownerRef` for owner-always
+ *     authz, and the per-chat approval config (`feishuChatConfigs`/
+ *     `feishuChatDefaults`) to `chatConfigsRef`/`chatDefaultsRef` for the gate's
+ *     three-state decision. Pure extractions, never cleared on error →
+ *     last-known-good (a schema defect keeps the last good config rather than
+ *     locking approvals out), preserving the authz fail-safe.
  *
  * `Stream.orDie` mirrors the other forked subscriptions: `subscribeServerConfig`
  * self-heals transient WS drops, and the handler is pure computation that never
  * throws, so `orDie` fires only on a schema defect / unhandled typed failure —
- * rare, and even then fail-safe (the Ref keeps last-known-good). Forked onto the
+ * rare, and even then fail-safe (the Refs keep last-known-good). Forked onto the
  * OUTER scope by the caller.
  */
-const runAllowlistAndBindingWatcher = (
-  config: FeishuBotConfig,
+const runBindingAndConfigWatcher = (
   environmentId: EnvironmentId,
-  allowlistRef: Ref.Ref<ReadonlyArray<string>>,
   bindingView: SubscriptionRef.SubscriptionRef<BindingIdentity | null>,
   ownerRef: Ref.Ref<string | null>,
   chatConfigsRef: Ref.Ref<{ readonly [chatId: string]: FeishuChatConfig }>,
@@ -3864,35 +3841,15 @@ const runAllowlistAndBindingWatcher = (
             if (settings === null) {
               return;
             }
-            // (1) Approval allowlist — env ∪ store, FIRST and fail-safe.
-            // Defence in depth: same trim + drop-blank as the env parse, so a
-            // hand-edited settings.json can never inject blank ids.
-            const storeIds = settings.feishuApprovalAllowlist
-              .map((s) => s.trim())
-              .filter((s) => s.length > 0);
-            const envIds = config.feishu.ownerOpenIds; // immovable floor, unioned first
-            const merged = [...new Set([...envIds, ...storeIds])];
-            const previous = yield* Ref.get(allowlistRef);
-            yield* Ref.set(allowlistRef, merged);
-            const added = merged.filter((id) => !previous.includes(id));
-            const removed = previous.filter((id) => !merged.includes(id));
-            if (added.length > 0 || removed.length > 0) {
-              yield* Effect.logInfo("[feishu-bot] approval allowlist updated", {
-                added,
-                removed,
-                effective: merged.length,
-                source: event.type,
-              });
-            }
-            // (2) Binding view — drives re-bind. Pure extraction, never throws.
+            // (1) Binding view — drives re-bind. Pure extraction, never throws.
             yield* SubscriptionRef.set(bindingView, toBindingIdentity(settings.feishuBinding));
-            // (3) Owner + per-chat config live-refresh (M-2/PR2a). Pure
-            // extractions, never throw → same last-known-good fail-safe as (1)
-            // (never cleared on error). `ownerRef` is the binding owner — a
-            // PUBLIC field, distinct from the env `FEISHU_OWNER_OPEN_IDS` floor
-            // that seeds `allowlistRef` — read by the cardAction gate for
-            // owner-always authz. `chatConfigsRef`/`chatDefaultsRef` open the
-            // per-chat policy data channel; consumption lands in PR2b/M-3.
+            // (2) Owner + per-chat config live-refresh (M-2). Pure extractions,
+            // never throw → last-known-good fail-safe (never cleared on error, so a
+            // schema defect keeps the last good config rather than locking approvals
+            // out). `ownerRef` is the binding owner (a PUBLIC field) read by the
+            // cardAction gate for owner-always authz; `chatConfigsRef` /
+            // `chatDefaultsRef` carry the per-chat approval config the gate reads for
+            // its three-state (initiator/designated/all) decision.
             yield* Ref.set(ownerRef, settings.feishuBinding?.ownerOpenId ?? null);
             yield* Ref.set(chatConfigsRef, settings.feishuChatConfigs);
             yield* Ref.set(chatDefaultsRef, settings.feishuChatDefaults);
@@ -3934,35 +3891,29 @@ export const program = (
       ),
     );
 
-    // Resident loop: maintain the binding-independent allowlist + binding view in
-    // the OUTER scope, then (re)build a per-binding session as the binding comes
-    // and goes. Provided the OUTER layer once and wrapped in `Effect.scoped`.
+    // Resident loop: maintain the binding-independent binding view + owner +
+    // per-chat config in the OUTER scope, then (re)build a per-binding session as
+    // the binding comes and goes. Provided the OUTER layer once, wrapped in
+    // `Effect.scoped`.
     const resident = Effect.gen(function* () {
-      // Shared, binding-independent approval allowlist. Seeded from the env
-      // `FEISHU_OWNER_OPEN_IDS` floor; live-refreshed as `env ∪ store` by the outer
-      // watcher below and read by every per-binding session via `allowlistRef`.
-      const allowlistRef = yield* Ref.make<ReadonlyArray<string>>(config.feishu.ownerOpenIds);
       // The current bound identity as seen in server settings (null = unbound).
       // Drives re-bind; never carries the secret.
       const bindingView = yield* SubscriptionRef.make<BindingIdentity | null>(null);
       // Shared binding owner (`feishuBinding.ownerOpenId`), live-refreshed by the
       // outer watcher and read by every per-binding session's cardAction gate for
-      // owner-always authz (M-2/PR2a). Seeded `null` (unbound) until the first
-      // settings snapshot arrives. Distinct from `allowlistRef`'s env floor.
+      // owner-always authz (M-2). Seeded `null` (unbound) until the first settings
+      // snapshot arrives.
       const ownerRef = yield* Ref.make<string | null>(null);
-      // Per-chat policy config channel (M-2/PR2a): live-refreshed here so it
-      // survives re-bind; consumption (threading into `runBoundSession` + reads)
-      // lands in PR2b/M-3. Seeded empty.
+      // Per-chat approval config (M-2): live-refreshed here so it survives re-bind;
+      // read by the gate (three-state mode) and the M18 recovery guard via
+      // `runBoundSession`. Seeded empty.
       const chatConfigsRef = yield* Ref.make<{ readonly [chatId: string]: FeishuChatConfig }>({});
       const chatDefaultsRef = yield* Ref.make<FeishuChatConfig>({});
 
-      // Outer watcher: allowlist live-refresh + binding view + owner/per-chat
-      // config. Forked onto the OUTER (resident) scope so it outlives every
-      // per-binding session.
-      yield* runAllowlistAndBindingWatcher(
-        config,
+      // Outer watcher: binding view + owner/per-chat config. Forked onto the OUTER
+      // (resident) scope so it outlives every per-binding session.
+      yield* runBindingAndConfigWatcher(
         environmentId,
-        allowlistRef,
         bindingView,
         ownerRef,
         chatConfigsRef,
@@ -4016,7 +3967,7 @@ export const program = (
         // `Effect.interrupt` — NOT a typed failure, so `retry` lets it through and
         // re-bind always wins. Env-override credentials self-heal the same way.
         const boundSession = Effect.scoped(
-          runBoundSession(config, resolved, creds, allowlistRef, ownerRef).pipe(
+          runBoundSession(config, resolved, creds, ownerRef, chatConfigsRef, chatDefaultsRef).pipe(
             Effect.provide(boundLayer),
           ),
         ).pipe(

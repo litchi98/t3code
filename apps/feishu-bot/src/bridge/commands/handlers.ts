@@ -288,7 +288,7 @@ export const buildCommandTable = (deps: CommandDeps): ReadonlyMap<string, Comman
         "• /resume <序号|threadId> — 接管指定会话(须属于当前工作区)",
         "• /status — 查看当前绑定与会话状态",
         "• /release — 退出当前会话",
-        "• /whoami — 查看你的飞书 openId(用于配置 FEISHU_OWNER_OPEN_IDS)",
+        "• /whoami — 查看你的飞书 openId(用于在 web 配置审批人 / owner)",
       ].join("\n"),
       ctx.message.messageId,
     );

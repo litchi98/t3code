@@ -239,7 +239,7 @@ const normalizeInbound = (message: NormalizedMessage): InboundMessage => {
  * gateway layer's input to this triple (down from the whole bot Feishu config)
  * so the credentials can be resolved at runtime — from the server's bot binding
  * or the `.env` dev override — and passed in per binding without dragging the
- * bot-own knobs (`ownerOpenIds`/`groupChatDensity`) through this layer.
+ * bot-own knobs (`groupChatDensity`) through this layer.
  */
 export interface FeishuCredentials {
   readonly appId: string;

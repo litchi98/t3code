@@ -300,22 +300,16 @@ function makeMutableServerSettingsService(
         return Stream.fromPubSub(changes);
       },
       persistFeishuBinding: (input) =>
+        // M-2/PR2b: no owner→allowlist seeding (owner authority is the binding +
+        // per-chat config now). Mirrors the real/test impls in serverSettings.ts.
         Ref.set(feishuSecretRef, input.appSecret).pipe(
-          Effect.andThen(Ref.get(settingsRef)),
-          Effect.flatMap((current) =>
+          Effect.andThen(
             updateSettings({
               feishuBinding: {
                 appId: input.appId,
                 tenant: input.tenant,
                 ownerOpenId: input.ownerOpenId,
               },
-              feishuApprovalAllowlist: Array.from(
-                new Set(
-                  [...current.feishuApprovalAllowlist, input.ownerOpenId]
-                    .map((entry) => entry.trim())
-                    .filter((entry) => entry.length > 0),
-                ),
-              ),
             }),
           ),
         ),

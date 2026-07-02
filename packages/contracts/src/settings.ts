@@ -440,14 +440,14 @@ export const ServerSettings = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed({})),
   ),
   observability: ObservabilitySettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
-  // Feishu/Lark approval allowlist: open_ids permitted to act on approval cards
-  // in approval-required group chats. Web-configured, server-persisted. The
-  // feishu-bot unions this with its env `FEISHU_OWNER_OPEN_IDS` floor at read
-  // time — env is an immovable floor, the store can only add. Element type is
-  // intentionally permissive (`Schema.String`, not non-empty): the bot trims
-  // and drops blank entries on read, so a hand-edited settings.json can never
-  // break decoding of the rest of the settings. Missing field decodes to `[]`
-  // (backward compatible with older servers/configs).
+  // Feishu/Lark approval allowlist. DEPRECATED (M-2/PR2b): approval authority is
+  // now the binding owner (`feishuBinding.ownerOpenId`, owner-always) + the
+  // per-chat three-state `feishuChatConfigs` (initiator/designated/all). The
+  // feishu-bot NO LONGER reads or unions this field, and provisioning no longer
+  // seeds the owner into it; it is retained only so older settings.json still
+  // decodes (missing → `[]`) and is otherwise inert. The web editor that wrote it
+  // is replaced by the per-chat config editor in PR2c. Element type is permissive
+  // (`Schema.String`) so a hand-edited value can never break decoding.
   feishuApprovalAllowlist: Schema.Array(Schema.String).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
