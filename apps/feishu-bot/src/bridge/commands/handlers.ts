@@ -34,7 +34,9 @@ import * as Ref from "effect/Ref";
 
 import * as NodeOS from "node:os";
 
+import { authorizeCommand, COMMAND_FLOOR, isOwnerExempt, isWorkspaceAuthorized } from "../authz.ts";
 import type { BindingState } from "../bindingState.ts";
+import type { EffectiveChatConfig } from "../chatConfig.ts";
 import {
   anchorOf,
   compositeChatKey,
@@ -46,6 +48,41 @@ import type { CommandContext, CommandHandler } from "./registry.ts";
 
 /** Maximum number of candidate threads `/resume` lists at once. */
 const MAX_CANDIDATES = 5;
+
+/**
+ * `/help` content grouped by its top-level command token, so `/help` lists only
+ * the commands the chat's allowlist permits (M-3) — advertising a blocked command
+ * would be misleading. The owner and the `/help`+`/whoami` floor are always shown
+ * (via `authorizeCommand`). `/help` is filtered on the same predicate as the gate,
+ * so what it shows == what actually runs.
+ */
+const HELP_SECTIONS: ReadonlyArray<{
+  readonly command: string;
+  readonly lines: ReadonlyArray<string>;
+}> = [
+  {
+    command: "/workspace",
+    lines: [
+      "• /workspace — 列出可选工作区(标记当前选中)",
+      "• /workspace <序号|projectId|名称> — 切换工作区(已绑定会话需先 /release)",
+      "• /workspace add <本地绝对路径|git URL> [克隆目标目录] — 添加工作区并切换",
+    ],
+  },
+  {
+    command: "/resume",
+    lines: [
+      "• /resume — 列出当前工作区可接管的会话",
+      "• /resume <序号|threadId> — 接管指定会话(须属于当前工作区)",
+    ],
+  },
+  { command: "/status", lines: ["• /status — 查看当前绑定与会话状态"] },
+  { command: "/release", lines: ["• /release — 退出当前会话"] },
+  {
+    command: "/whoami",
+    lines: ["• /whoami — 查看你的飞书 openId(用于在 web 配置审批人 / owner)"],
+  },
+  { command: "/help", lines: ["• /help — 查看本群可用命令"] },
+];
 
 /**
  * M3a: the composite conversation key (`chatId[:anchor]`) for a command's
@@ -146,6 +183,18 @@ export interface CommandDeps {
    * re-validates the selection too — fix C②, `bridge/createIntent.ts`.)
    */
   readonly hasPendingCreate: (chatKey: string) => Effect.Effect<boolean>;
+  /**
+   * Per-chat authorization inputs (M-3), shared by the command-allowlist gate
+   * (in `bot.ts`, before dispatch) and the workspace-authorization gates here.
+   * `owner` reads the live binding owner open_id (`ownerRef`); `config` resolves
+   * the effective per-chat config by **bare chatId** (NOTE: not the composite
+   * chat key the selection state uses). The binding owner is exempt from both
+   * gates (owner-always overlay; see `authz.isOwnerExempt`).
+   */
+  readonly authz: {
+    readonly owner: Effect.Effect<string | null>;
+    readonly config: (chatId: string) => Effect.Effect<EffectiveChatConfig>;
+  };
 }
 
 /**
@@ -276,22 +325,45 @@ export const buildCommandTable = (deps: CommandDeps): ReadonlyMap<string, Comman
     new Map(),
   );
 
+  // M-3: whether `ctx`'s sender may select/act on `projectId` in `ctx`'s chat
+  // right now — the owner-always overlay + the per-chat workspace allowlist
+  // (`effectiveChatConfig(bareChatId).workspaces`; `undefined` = all allowed).
+  // Resolved fresh each call so a live config change takes effect immediately.
+  const senderMayUseProject = (ctx: CommandContext, projectId: ProjectId): Effect.Effect<boolean> =>
+    Effect.gen(function* () {
+      const owner = yield* deps.authz.owner;
+      const config = yield* deps.authz.config(ctx.message.chatId);
+      return isWorkspaceAuthorized({
+        owner,
+        sender: ctx.message.senderId,
+        projectId,
+        authorized: config.workspaces,
+      });
+    });
+
   const help: CommandHandler = (ctx) =>
-    deps.sendNotice(
-      chatKeyOf(ctx),
-      [
-        "可用命令:",
-        "• /workspace — 列出可选工作区(标记当前选中)",
-        "• /workspace <序号|projectId|名称> — 切换工作区(已绑定会话需先 /release)",
-        "• /workspace add <本地绝对路径|git URL> [克隆目标目录] — 添加工作区并切换",
-        "• /resume — 列出当前工作区可接管的会话",
-        "• /resume <序号|threadId> — 接管指定会话(须属于当前工作区)",
-        "• /status — 查看当前绑定与会话状态",
-        "• /release — 退出当前会话",
-        "• /whoami — 查看你的飞书 openId(用于在 web 配置审批人 / owner)",
-      ].join("\n"),
-      ctx.message.messageId,
-    );
+    Effect.gen(function* () {
+      // M-3: list only the commands this chat's allowlist permits (owner + the
+      // /help+/whoami floor always shown, via `authorizeCommand`) — same predicate
+      // as the gate, so `/help` reflects what actually works here.
+      const owner = yield* deps.authz.owner;
+      const config = yield* deps.authz.config(ctx.message.chatId);
+      const sender = ctx.message.senderId;
+      const visible = HELP_SECTIONS.filter((section) =>
+        authorizeCommand({
+          owner,
+          sender,
+          command: section.command,
+          allowlist: config.commands,
+          floor: COMMAND_FLOOR,
+        }),
+      ).flatMap((section) => section.lines);
+      yield* deps.sendNotice(
+        chatKeyOf(ctx),
+        ["可用命令:", ...visible].join("\n"),
+        ctx.message.messageId,
+      );
+    });
 
   const status: CommandHandler = (ctx) =>
     Effect.gen(function* () {
@@ -343,11 +415,27 @@ export const buildCommandTable = (deps: CommandDeps): ReadonlyMap<string, Comman
         );
         return;
       }
-      const projects = snapshot.projects;
+      // M-3: filter to the chat's authorized workspaces so the list, the
+      // ordinals cache, and thus `/workspace <n>` only ever reference authorized
+      // projects. Owner exempt; `undefined` allowlist = all visible.
+      const owner = yield* deps.authz.owner;
+      const config = yield* deps.authz.config(ctx.message.chatId);
+      const sender = ctx.message.senderId;
+      const allProjects = snapshot.projects;
+      const projects = allProjects.filter((project) =>
+        isWorkspaceAuthorized({
+          owner,
+          sender,
+          projectId: project.id,
+          authorized: config.workspaces,
+        }),
+      );
       if (projects.length === 0) {
         yield* deps.sendNotice(
           chatKey,
-          "当前没有工作区。用 /workspace add <本地绝对路径|git URL> [克隆目标目录] 添加一个。",
+          allProjects.length === 0
+            ? "当前没有工作区。用 /workspace add <本地绝对路径|git URL> [克隆目标目录] 添加一个。"
+            : "本群未授权任何工作区,请联系 bot 管理员在配置中开放。",
           ctx.message.messageId,
         );
         return;
@@ -476,6 +564,18 @@ export const buildCommandTable = (deps: CommandDeps): ReadonlyMap<string, Comman
         }
       }
 
+      // M-3: workspace authorization — refuse a switch to a project outside the
+      // chat's authorized set. Owner exempt. Placed after target resolution so an
+      // unauthorized target is named-then-refused, not silently unresolved.
+      if (!(yield* senderMayUseProject(ctx, target.id))) {
+        yield* deps.sendNotice(
+          chatKey,
+          "该工作区未在本群授权范围,无法切换。如需使用,请联系 bot 管理员。",
+          ctx.message.messageId,
+        );
+        return;
+      }
+
       const current = yield* deps.workspace.get(chatKey);
       if (current === target.id) {
         yield* deps.sendNotice(chatKey, `当前已是工作区: ${target.title}`, ctx.message.messageId);
@@ -502,6 +602,22 @@ export const buildCommandTable = (deps: CommandDeps): ReadonlyMap<string, Comman
       const usage = "用法: /workspace add <本地绝对路径|git URL> [克隆目标目录]";
       if (target === undefined || ctx.argv.length > 3) {
         yield* deps.sendNotice(chatKey, usage, ctx.message.messageId);
+        return;
+      }
+
+      // M-3: creating a project is a management action — only the binding owner
+      // may `/workspace add`, regardless of any allowlist. In groups this stops a
+      // non-owner from adding a workspace (which would strand an unauthorized
+      // project or bypass the allowlist via its auto-switch); in p2p the inbound
+      // owner-only gate already ensures only the owner is here, so this is
+      // defence-in-depth. `owner===null` (unbound) → nobody owns the bot → refuse.
+      const addOwner = yield* deps.authz.owner;
+      if (!isOwnerExempt(addOwner, ctx.message.senderId)) {
+        yield* deps.sendNotice(
+          chatKey,
+          "仅 bot 管理员可新增工作区。请联系 bot 管理员。",
+          ctx.message.messageId,
+        );
         return;
       }
 
@@ -649,6 +765,17 @@ export const buildCommandTable = (deps: CommandDeps): ReadonlyMap<string, Comman
         );
         return;
       }
+      // M-3: resume ∩ authorized workspaces. `/resume` routes BEFORE the dispatch
+      // workspace gate, so a narrowed allowlist could otherwise be bypassed by
+      // resuming the now-unauthorized selected workspace. Owner exempt.
+      if (!(yield* senderMayUseProject(ctx, selectedProject))) {
+        yield* deps.sendNotice(
+          chatKey,
+          "当前选中的工作区已不在本群授权范围,请用 /workspace 重新选择授权内的工作区。",
+          ctx.message.messageId,
+        );
+        return;
+      }
       const active = (yield* deps.shellCache.activeThreads).filter(
         (shell) => shell.projectId === selectedProject,
       );
@@ -693,6 +820,18 @@ export const buildCommandTable = (deps: CommandDeps): ReadonlyMap<string, Comman
         yield* deps.sendNotice(
           chatKey,
           "请先用 /workspace 选择工作区,再接管该工作区的会话。",
+          ctx.message.messageId,
+        );
+        return;
+      }
+
+      // M-3: resume ∩ authorized (same as listCandidates; owner exempt). The
+      // ownership check below (target ∈ selectedProject) then transitively
+      // guarantees the resumed target is authorized too.
+      if (!(yield* senderMayUseProject(ctx, selectedProject))) {
+        yield* deps.sendNotice(
+          chatKey,
+          "当前选中的工作区已不在本群授权范围,请用 /workspace 重新选择授权内的工作区。",
           ctx.message.messageId,
         );
         return;

@@ -1,5 +1,12 @@
 /**
- * Approval-card authorization (M4-1 authz decoupling, M-2 owner-always + three-state).
+ * Per-chat authorization primitives (M4-1 decoupling, M-2 owner-always +
+ * three-state approval, M-3 command allowlist + workspace authorization).
+ *
+ * `authorizeApprovalClick` decides WHO may act on an approval card. M-3 adds two
+ * sibling gates — `authorizeCommand` (per-chat slash-command allowlist) and
+ * `isWorkspaceAuthorized` (per-chat workspace allowlist) — that reuse the SAME
+ * owner-always overlay (`isOwnerExempt`): the configured binding owner bypasses
+ * every per-chat restriction, in any gate. All three are pure + IO-free.
  *
  * Decides WHO may act on a verified approval card, after `CallbackAuth.verify`
  * has already proved the card's INTEGRITY (right chat/thread/policy, untampered
@@ -62,4 +69,95 @@ export const authorizeApprovalClick = (input: ApprovalClickAuthzInput): boolean 
       // Any chat member; a clicker of an in-chat card is a member by construction.
       return true;
   }
+};
+
+// ── M-3: command allowlist + workspace authorization (shared owner overlay) ──
+
+/**
+ * The command tokens ALWAYS allowed, bypassing the per-chat command allowlist —
+ * a self-lock floor (M-3, user-confirmed). Both are side-effect-free
+ * introspection commands: `/help` is the sole discovery surface for a chat's
+ * available commands and `/whoami` echoes the caller's own open_id, so a
+ * mis-configured allowlist can never lock a chat out of discovering how to fix
+ * itself. Tokens are normalised (lowercase, leading `/`) to match the registry.
+ */
+export const COMMAND_FLOOR: ReadonlyArray<string> = ["/help", "/whoami"];
+
+/**
+ * The owner-always overlay, shared by every per-chat gate: the configured
+ * binding owner (`ownerRef`'s open_id) bypasses ALL per-chat restrictions.
+ * Same authority source and comparison as `authorizeApprovalClick`'s owner
+ * branch; an empty `sender` never matches (guards an unresolved open_id).
+ */
+export const isOwnerExempt = (owner: string | null, sender: string): boolean =>
+  owner !== null && sender.length > 0 && sender === owner;
+
+/** Inputs to the per-chat command-allowlist decision. All identities are open_ids. */
+export interface CommandAuthzInput {
+  /** The configured binding owner, or `null` when unbound. Owner is exempt. */
+  readonly owner: string | null;
+  /** The open_id of whoever sent the command (`message.senderId`). */
+  readonly sender: string;
+  /** The normalised command token, including its leading `/` (e.g. `/workspace`). */
+  readonly command: string;
+  /**
+   * The per-chat command allowlist (`effectiveChatConfig(chatId).commands`).
+   * `undefined` = "not configured" → every command allowed; an empty list =
+   * "only the floor" (owner + {@link COMMAND_FLOOR}).
+   */
+  readonly allowlist: ReadonlyArray<string> | undefined;
+  /** Commands always allowed regardless of the allowlist (self-lock floor). */
+  readonly floor: ReadonlyArray<string>;
+}
+
+/**
+ * Whether `sender` may run `command` in a chat with this allowlist. Pure.
+ * Owner-exempt → always; floor command → always; no allowlist → always; else
+ * membership in the allowlist.
+ */
+export const authorizeCommand = (input: CommandAuthzInput): boolean => {
+  if (isOwnerExempt(input.owner, input.sender)) {
+    return true;
+  }
+  if (input.floor.includes(input.command)) {
+    return true;
+  }
+  if (input.allowlist === undefined) {
+    return true;
+  }
+  // Config values may be hand-authored (settings.json), so normalise their case
+  // to the already-lowercased command token — `/Workspace` must not silently
+  // never-match. (The registry lowercases the incoming token; the floor is
+  // lowercase too.)
+  return input.allowlist.some((entry) => entry.toLowerCase() === input.command);
+};
+
+/** Inputs to the per-chat workspace-authorization decision. */
+export interface WorkspaceAuthzInput {
+  /** The configured binding owner, or `null` when unbound. Owner is exempt. */
+  readonly owner: string | null;
+  /** The open_id of whoever sent the message/command (`message.senderId`). */
+  readonly sender: string;
+  /** The `ProjectId` (as a bare string) being checked. */
+  readonly projectId: string;
+  /**
+   * The per-chat workspace allowlist (`effectiveChatConfig(chatId).workspaces`).
+   * `undefined` = "not configured" → every project authorized.
+   */
+  readonly authorized: ReadonlyArray<string> | undefined;
+}
+
+/**
+ * Whether `sender` may select/act on `projectId` in this chat. Pure.
+ * Owner-exempt → always; no allowlist → always; else membership. This is a
+ * selection/authorization layer, NOT a runtime path guard (M-3 red line).
+ */
+export const isWorkspaceAuthorized = (input: WorkspaceAuthzInput): boolean => {
+  if (isOwnerExempt(input.owner, input.sender)) {
+    return true;
+  }
+  if (input.authorized === undefined) {
+    return true;
+  }
+  return input.authorized.includes(input.projectId);
 };

@@ -83,7 +83,13 @@ import { LarkGateway, type StreamingCard } from "./lark/index.ts";
 import { larkGatewayLayer } from "./lark/channel.ts";
 import { reportFeishuChatDirectory } from "./chat-directory.ts";
 import type { BridgeHandlers, CardActionEvent, InboundMessage, SendOptions } from "./lark/types.ts";
-import { authorizeApprovalClick } from "./bridge/authz.ts";
+import {
+  authorizeApprovalClick,
+  authorizeCommand,
+  COMMAND_FLOOR,
+  isOwnerExempt,
+  isWorkspaceAuthorized,
+} from "./bridge/authz.ts";
 import { effectiveChatConfig } from "./bridge/chatConfig.ts";
 import { CallbackAuth, computePolicyFingerprint } from "./bridge/callbackAuth.ts";
 import {
@@ -754,6 +760,35 @@ const runBoundSession = (
       selected.kind === "none"
         ? "请先用 /workspace 选择工作区(发送 /workspace 查看可选项)。"
         : "当前选中的工作区已不可用(项目可能已被删除或服务器尚未同步),请用 /workspace 重新选择。";
+
+    // M-3: a live "ok" selection that a per-chat config change has since NARROWED
+    // out of the chat's authorized set. Distinct wording from the none/unavailable
+    // gate text so the user re-selects rather than thinking the project vanished.
+    const workspaceRevokedText =
+      "当前选中的工作区已不在本群授权范围,请用 /workspace 重新选择授权内的工作区。";
+
+    // M-3 dispatch-time workspace authorization: whether `message`'s sender may
+    // use `projectId` in this chat right now (owner exempt; `undefined` allowlist
+    // = all authorized). Mirrors the approval gate's owner + effectiveChatConfig
+    // resolve on the bare chatId.
+    const senderMayUseProjectAtDispatch = (
+      message: InboundMessage,
+      projectId: ProjectId,
+    ): Effect.Effect<boolean> =>
+      Effect.gen(function* () {
+        const owner = yield* Ref.get(ownerRef);
+        const config = effectiveChatConfig(
+          message.chatId,
+          yield* Ref.get(chatConfigsRef),
+          yield* Ref.get(chatDefaultsRef),
+        );
+        return isWorkspaceAuthorized({
+          owner,
+          sender: message.senderId,
+          projectId,
+          authorized: config.workspaces,
+        });
+      });
 
     // PR2: the binding + owner + per-chat config live-refresh fiber is hoisted OUT
     // of this per-binding session into the resident loop's OUTER scope (see
@@ -1673,6 +1708,21 @@ const runBoundSession = (
       // change out from under it while it waits for the reconnect flush.
       hasPendingCreate: (chatKey) =>
         Ref.get(pendingCreates).pipe(Effect.map((set) => set.has(chatKey))),
+      // M-3: per-chat authz inputs — the live owner open_id + the effective
+      // per-chat config resolver (bare chatId grain, mirroring the approval gate
+      // at ~3040). The `/workspace` + `/resume` authorization gates read these;
+      // the binding owner is exempt from both (owner-always overlay).
+      authz: {
+        owner: Ref.get(ownerRef),
+        config: (chatId) =>
+          Effect.gen(function* () {
+            return effectiveChatConfig(
+              chatId,
+              yield* Ref.get(chatConfigsRef),
+              yield* Ref.get(chatDefaultsRef),
+            );
+          }),
+      },
     });
 
     // ── M2b-3: pure render loop shared by `driveTurn` and `runObserveFiber` ──
@@ -2478,6 +2528,13 @@ const runBoundSession = (
           yield* sendNotice(chatKey, workspaceGateText(selected), message.messageId);
           return null;
         }
+        // M-3: even a live "ok" selection may have been narrowed out of the chat's
+        // authorized set since it was chosen (a config change). Refuse rather than
+        // create a thread on a now-unauthorized workspace. Owner exempt.
+        if (!(yield* senderMayUseProjectAtDispatch(message, selected.project.id))) {
+          yield* sendNotice(chatKey, workspaceRevokedText, message.messageId);
+          return null;
+        }
         const project = selected.project;
 
         // First contact. Derive the deterministic threadId up front so both the
@@ -2763,6 +2820,27 @@ const runBoundSession = (
         const larkThreadId = anchorOf(message);
         const chatKey = compositeChatKey(message.chatId, larkThreadId);
 
+        // M-3: a p2p private chat is owner-only. p2p is 1:1, so a non-owner DMing
+        // the bot must not be able to drive a session (create a global project, run
+        // a full-access turn). Judge on the authoritative `chatType === "p2p"`
+        // (`chatMode` may be undefined); groups (`chatType === "group"`) are NOT
+        // gated here — they still admit non-owners under the command allowlist /
+        // workspace-authorization gates. Placed before the operator pin so a
+        // non-owner touches no conversation state. `owner === null` (unbound) does
+        // NOT gate — with no configured owner we keep the chat open (e.g. a binding
+        // flow); only once an owner is set do we refuse non-owners.
+        if (message.chatType === "p2p") {
+          const p2pOwner = yield* Ref.get(ownerRef);
+          if (p2pOwner !== null && !isOwnerExempt(p2pOwner, message.senderId)) {
+            yield* sendNotice(
+              chatKey,
+              "私聊仅限 bot 管理员使用。如需协作,请在群聊中 @机器人。",
+              message.messageId,
+            );
+            return;
+          }
+        }
+
         // E④: remember who this conversation's operator is (per topic). The
         // interaction card binds its buttons to this open id at render time; the
         // cardAction verify re-checks the actual clicker against the token's `o`.
@@ -2804,11 +2882,44 @@ const runBoundSession = (
         // (`/help`, `/resume` listing candidates) without auto-creating a thread.
         // A known command is fully handled; a `/`-prefixed miss gets a help hint;
         // a non-command falls through to the normal turn path.
-        const outcome = yield* tryHandleCommand(message, commandTable);
+        // M-3: per-chat command allowlist. Resolve owner + effective config (bare
+        // chatId, like the approval gate) ONLY for `/…` messages; the predicate is
+        // pure and the registry calls it only on a table hit. The binding owner and
+        // the /help+/whoami floor bypass the allowlist (in `authorizeCommand`).
+        let isCommandAllowed: (command: string) => boolean = () => true;
+        if (message.text.trimStart().startsWith("/")) {
+          const cmdOwner = yield* Ref.get(ownerRef);
+          const cmdConfig = effectiveChatConfig(
+            message.chatId,
+            yield* Ref.get(chatConfigsRef),
+            yield* Ref.get(chatDefaultsRef),
+          );
+          isCommandAllowed = (command) =>
+            authorizeCommand({
+              owner: cmdOwner,
+              sender: message.senderId,
+              command,
+              allowlist: cmdConfig.commands,
+              floor: COMMAND_FLOOR,
+            });
+        }
+        const outcome = yield* tryHandleCommand(message, commandTable, isCommandAllowed);
         if (outcome.handled) {
           if (outcome.unknownCommand !== undefined) {
             // Fix 5: anchor the "unknown command" reply into the triggering topic.
             yield* sendNotice(chatKey, "未知命令,/help 查看可用命令。", message.messageId);
+          } else if (outcome.deniedCommand !== undefined) {
+            // M-3: the command exists but this chat's allowlist denies it —
+            // explicit refusal (never silent), symmetric with unknownCommand.
+            // `/workspace` gets a tailored hint (承主 §4.1: don't clash with the
+            // "no workspace selected" guidance) so its denial reads as intended.
+            yield* sendNotice(
+              chatKey,
+              outcome.deniedCommand === "/workspace"
+                ? "本群未开放 /workspace(无法在此群选择工作区或发起任务)。如需在此群跑任务,请联系 bot 管理员调整配置。发送 /help 查看本群可用命令。"
+                : `命令 ${outcome.deniedCommand} 在本群未开放。发送 /help 查看本群可用命令。`,
+              message.messageId,
+            );
           }
           return;
         }
@@ -2824,6 +2935,12 @@ const runBoundSession = (
           const selected = yield* selectedWorkspaceFor(chatKey);
           if (selected.kind !== "ok") {
             yield* sendNotice(chatKey, workspaceGateText(selected), message.messageId);
+            return;
+          }
+          // M-3: refuse a selection narrowed out of the authorized set before the
+          // turn queue is touched (owner exempt); `ensureThread` re-checks too.
+          if (!(yield* senderMayUseProjectAtDispatch(message, selected.project.id))) {
+            yield* sendNotice(chatKey, workspaceRevokedText, message.messageId);
             return;
           }
         }
