@@ -87,6 +87,7 @@ import {
   authorizeApprovalClick,
   authorizeCommand,
   COMMAND_FLOOR,
+  isOwnerExempt,
   isWorkspaceAuthorized,
 } from "./bridge/authz.ts";
 import { effectiveChatConfig } from "./bridge/chatConfig.ts";
@@ -2819,6 +2820,27 @@ const runBoundSession = (
         const larkThreadId = anchorOf(message);
         const chatKey = compositeChatKey(message.chatId, larkThreadId);
 
+        // M-3: a p2p private chat is owner-only. p2p is 1:1, so a non-owner DMing
+        // the bot must not be able to drive a session (create a global project, run
+        // a full-access turn). Judge on the authoritative `chatType === "p2p"`
+        // (`chatMode` may be undefined); groups (`chatType === "group"`) are NOT
+        // gated here — they still admit non-owners under the command allowlist /
+        // workspace-authorization gates. Placed before the operator pin so a
+        // non-owner touches no conversation state. `owner === null` (unbound) does
+        // NOT gate — with no configured owner we keep the chat open (e.g. a binding
+        // flow); only once an owner is set do we refuse non-owners.
+        if (message.chatType === "p2p") {
+          const p2pOwner = yield* Ref.get(ownerRef);
+          if (p2pOwner !== null && !isOwnerExempt(p2pOwner, message.senderId)) {
+            yield* sendNotice(
+              chatKey,
+              "私聊仅限 bot 管理员使用。如需协作,请在群聊中 @机器人。",
+              message.messageId,
+            );
+            return;
+          }
+        }
+
         // E④: remember who this conversation's operator is (per topic). The
         // interaction card binds its buttons to this open id at render time; the
         // cardAction verify re-checks the actual clicker against the token's `o`.
@@ -2894,7 +2916,7 @@ const runBoundSession = (
             yield* sendNotice(
               chatKey,
               outcome.deniedCommand === "/workspace"
-                ? "本群未开放 /workspace(无法在此群选择工作区或发起任务)。如需在此群跑任务,请联系群管理员调整配置。发送 /help 查看本群可用命令。"
+                ? "本群未开放 /workspace(无法在此群选择工作区或发起任务)。如需在此群跑任务,请联系 bot 管理员调整配置。发送 /help 查看本群可用命令。"
                 : `命令 ${outcome.deniedCommand} 在本群未开放。发送 /help 查看本群可用命令。`,
               message.messageId,
             );

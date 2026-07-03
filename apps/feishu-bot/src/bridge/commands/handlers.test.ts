@@ -128,6 +128,8 @@ interface HarnessOptions {
   readonly pendingCreate?: boolean;
   /** M-3: per-chat workspace allowlist (`effectiveChatConfig.workspaces`); undefined = unrestricted. */
   readonly workspaces?: ReadonlyArray<string>;
+  /** M-3: per-chat command allowlist (`effectiveChatConfig.commands`); undefined = unrestricted. */
+  readonly commands?: ReadonlyArray<string>;
   /** M-3: the binding owner open_id (`ownerRef`); undefined = null (no owner, so no exemption). */
   readonly owner?: string;
 }
@@ -198,7 +200,7 @@ const makeHarness = (options: HarnessOptions = {}): Effect.Effect<Harness> =>
               approvalMode: "initiator",
               approvers: [],
               workspaces: options.workspaces,
-              commands: undefined,
+              commands: options.commands,
               toolPolicy: undefined,
             } satisfies EffectiveChatConfig),
           ),
@@ -301,7 +303,7 @@ describe("/workspace", () => {
 
   it.effect("rejects an add argument that is neither a local path nor a git url", () =>
     Effect.gen(function* () {
-      const harness = yield* makeHarness();
+      const harness = yield* makeHarness({ owner: "ou_sender" });
       yield* run(harness, "/workspace add relative/path");
       assert.include(yield* lastNotice(harness), "无法识别参数");
       assert.deepStrictEqual(yield* harness.createdRoots, []);
@@ -310,7 +312,7 @@ describe("/workspace", () => {
 
   it.effect("adds a local absolute path and auto-selects the new project", () =>
     Effect.gen(function* () {
-      const harness = yield* makeHarness();
+      const harness = yield* makeHarness({ owner: "ou_sender" });
       yield* run(harness, "/workspace add /repos/gamma");
       assert.deepStrictEqual(yield* harness.createdRoots, ["/repos/gamma"]);
       assert.strictEqual(yield* harness.selection("oc_test_chat"), PROJECT_B);
@@ -320,7 +322,7 @@ describe("/workspace", () => {
 
   it.effect("re-selects an existing project instead of double-adding its root", () =>
     Effect.gen(function* () {
-      const harness = yield* makeHarness();
+      const harness = yield* makeHarness({ owner: "ou_sender" });
       yield* run(harness, "/workspace add /repos/alpha");
       assert.deepStrictEqual(yield* harness.createdRoots, []);
       assert.strictEqual(yield* harness.selection("oc_test_chat"), PROJECT_A);
@@ -329,7 +331,7 @@ describe("/workspace", () => {
 
   it.effect("clones a git url into the derived default destination", () =>
     Effect.gen(function* () {
-      const harness = yield* makeHarness();
+      const harness = yield* makeHarness({ owner: "ou_sender" });
       yield* run(harness, "/workspace add https://github.com/acme/widget.git");
       assert.deepStrictEqual(yield* harness.clones, [
         ["https://github.com/acme/widget.git", "~/t3-workspaces/widget"],
@@ -342,7 +344,7 @@ describe("/workspace", () => {
 
   it.effect("passes an explicit clone destination through", () =>
     Effect.gen(function* () {
-      const harness = yield* makeHarness();
+      const harness = yield* makeHarness({ owner: "ou_sender" });
       yield* run(harness, "/workspace add git@github.com:acme/widget.git /custom/dest");
       assert.deepStrictEqual(yield* harness.clones, [
         ["git@github.com:acme/widget.git", "/custom/dest"],
@@ -352,7 +354,10 @@ describe("/workspace", () => {
 
   it.effect("surfaces a clone failure as a notice and selects nothing", () =>
     Effect.gen(function* () {
-      const harness = yield* makeHarness({ cloneFailure: "克隆失败: no route" });
+      const harness = yield* makeHarness({
+        cloneFailure: "克隆失败: no route",
+        owner: "ou_sender",
+      });
       yield* run(harness, "/workspace add https://github.com/acme/widget.git");
       assert.include(yield* lastNotice(harness), "克隆失败");
       assert.strictEqual(yield* harness.selection("oc_test_chat"), null);
@@ -438,6 +443,38 @@ describe("M-3 per-chat command allowlist + workspace authorization", () => {
     }),
   );
 
+  // ── /help reflects the allowlist (lists only what actually runs here) ──
+  it.effect("/help lists only allowlisted + floor commands", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ commands: ["/status"] });
+      yield* run(harness, "/help");
+      const notice = yield* lastNotice(harness);
+      assert.include(notice, "/status"); // allowlisted
+      assert.include(notice, "/whoami"); // floor
+      assert.include(notice, "/help"); // floor
+      assert.notInclude(notice, "/workspace"); // not allowlisted → hidden
+      assert.notInclude(notice, "/resume");
+    }),
+  );
+
+  it.effect("/help lists everything when no command allowlist is set", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness(); // commands undefined
+      yield* run(harness, "/help");
+      const notice = yield* lastNotice(harness);
+      assert.include(notice, "/workspace");
+      assert.include(notice, "/resume");
+    }),
+  );
+
+  it.effect("owner /help lists everything despite an allowlist (owner-always)", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ commands: ["/status"], owner: "ou_sender" });
+      yield* run(harness, "/help");
+      assert.include(yield* lastNotice(harness), "/workspace");
+    }),
+  );
+
   // ── workspace authorization (handler gates) ──
   it.effect("lists only authorized workspaces (list filter)", () =>
     Effect.gen(function* () {
@@ -488,18 +525,20 @@ describe("M-3 per-chat command allowlist + workspace authorization", () => {
     }),
   );
 
-  it.effect("a non-owner cannot add a workspace when an allowlist is set (no orphan)", () =>
+  it.effect("a non-owner cannot add a workspace (owner-only, even with no allowlist)", () =>
     Effect.gen(function* () {
-      const harness = yield* makeHarness({ workspaces: [PROJECT_A] });
+      // owner-only add: a non-owner is refused regardless of the workspace
+      // allowlist — even with NO allowlist set (the pre-M-3 "anyone can add").
+      const harness = yield* makeHarness();
       yield* run(harness, "/workspace add /repos/gamma");
       assert.deepStrictEqual(yield* harness.createdRoots, []);
-      assert.include(yield* lastNotice(harness), "仅授权人可新增");
+      assert.include(yield* lastNotice(harness), "仅 bot 管理员可新增工作区");
     }),
   );
 
-  it.effect("owner may add a workspace despite an allowlist", () =>
+  it.effect("owner may add a workspace (owner-only gate passes for owner)", () =>
     Effect.gen(function* () {
-      const harness = yield* makeHarness({ workspaces: [PROJECT_A], owner: "ou_sender" });
+      const harness = yield* makeHarness({ owner: "ou_sender" });
       yield* run(harness, "/workspace add /repos/gamma");
       assert.deepStrictEqual(yield* harness.createdRoots, ["/repos/gamma"]);
     }),
@@ -593,6 +632,7 @@ describe("/workspace review fixes (C/E/G/H)", () => {
     Effect.gen(function* () {
       const harness = yield* makeHarness({
         binding: { threadId: "thread-a" as ThreadId, origin: "self-created" },
+        owner: "ou_sender",
       });
       yield* run(harness, "/workspace add /repos/gamma");
       assert.deepStrictEqual(yield* harness.createdRoots, ["/repos/gamma"]);
@@ -606,7 +646,7 @@ describe("/workspace review fixes (C/E/G/H)", () => {
 
   it.effect("E: add while busy still creates but does NOT auto-switch", () =>
     Effect.gen(function* () {
-      const harness = yield* makeHarness({ busy: true });
+      const harness = yield* makeHarness({ busy: true, owner: "ou_sender" });
       yield* run(harness, "/workspace add /repos/gamma");
       assert.deepStrictEqual(yield* harness.createdRoots, ["/repos/gamma"]);
       assert.strictEqual(yield* harness.selection("oc_test_chat"), null);
@@ -616,7 +656,7 @@ describe("/workspace review fixes (C/E/G/H)", () => {
 
   it.effect("G: a trailing-slash path reuses the existing project", () =>
     Effect.gen(function* () {
-      const harness = yield* makeHarness();
+      const harness = yield* makeHarness({ owner: "ou_sender" });
       yield* run(harness, "/workspace add /repos/alpha/");
       assert.deepStrictEqual(yield* harness.createdRoots, []);
       assert.strictEqual(yield* harness.selection("oc_test_chat"), PROJECT_A);
