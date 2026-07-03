@@ -11,7 +11,9 @@
  * It only classifies an inbound message —
  *   - not a command (no leading `/`)  → `{ handled: false }` (the caller routes
  *     it to the normal turn path),
- *   - a known command                 → runs the handler, `{ handled: true }`,
+ *   - a known + allowed command       → runs the handler, `{ handled: true }`,
+ *   - a known command the per-chat allowlist DENIED (M-3) → `{ handled: true,
+ *     deniedCommand }` WITHOUT running the handler (the caller sends a refusal),
  *   - an unknown command (`/` prefix, no table hit) → `{ handled: true,
  *     unknownCommand }` (the caller decides whether to reply with help).
  *
@@ -70,6 +72,14 @@ export interface CommandOutcome {
    * a hit and on a non-command message.
    */
   readonly unknownCommand?: string;
+  /**
+   * Set only on a table hit the per-chat command allowlist DENIED (M-3): the
+   * normalised command token, including its leading `/`. The handler did NOT
+   * run; the caller sends an explicit refusal notice (symmetric with
+   * {@link unknownCommand}), keeping this layer output-free. Absent on an
+   * allowed hit, an unknown command, and a non-command message.
+   */
+  readonly deniedCommand?: string;
 }
 
 /**
@@ -81,16 +91,25 @@ export interface CommandOutcome {
  *  - Otherwise split on whitespace runs. The command token is the first part,
  *    normalised to lowercase (so `/HELP` ≡ `/help`); `args` is the raw
  *    remainder after that token; `argv` is the remaining parts.
+ *  - On a table hit the `isCommandAllowed` predicate rejects (M-3 per-chat
+ *    allowlist), return `{ handled: true, deniedCommand }` WITHOUT running the
+ *    handler (the caller sends a refusal); the command system still owns it.
  *  - On a table hit, run the handler under {@link Effect.catchCause} (a handler
  *    failure is logged, never bubbled) → `{ handled: true }`.
  *  - On a `/`-prefixed miss, return `{ handled: true, unknownCommand }` without
  *    sending anything (the caller decides the response).
+ *
+ * `isCommandAllowed` is a pure predicate over the normalised command token,
+ * evaluated ONLY on a table hit (a non-command / unknown command never consults
+ * it). The caller closes it over the resolved owner + per-chat config so this
+ * layer stays IO-free and output-free.
  *
  * Always total: never fails, never requires services at the boundary.
  */
 export const tryHandleCommand = (
   message: InboundMessage,
   table: ReadonlyMap<string, CommandHandler>,
+  isCommandAllowed: (command: string) => boolean,
 ): Effect.Effect<CommandOutcome> =>
   Effect.gen(function* () {
     const trimmed = message.text.trim();
@@ -114,6 +133,15 @@ export const tryHandleCommand = (
       // caller does NOT dispatch it as a turn), but we send nothing — the caller
       // reads `unknownCommand` to decide whether to reply with help.
       return { handled: true, unknownCommand: cmd } satisfies CommandOutcome;
+    }
+
+    // Per-chat command allowlist (M-3): a hit the chat is configured not to
+    // allow is still OWNED by the command system (never dispatched as a turn),
+    // but its handler must not run — the caller sends an explicit refusal
+    // (symmetric with `unknownCommand`). Owner + the /help+/whoami floor bypass
+    // this in the caller's predicate.
+    if (!isCommandAllowed(cmd)) {
+      return { handled: true, deniedCommand: cmd } satisfies CommandOutcome;
     }
 
     // Per-handler isolation: a handler failure (any cause — error or defect) is
