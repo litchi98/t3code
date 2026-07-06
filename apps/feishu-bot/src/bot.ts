@@ -3421,8 +3421,33 @@ const runBoundSession = (
           return new Map(map).set(chatKey, forChat);
         });
 
+        // SECURITY (observe pin-drift class — same root the render/observe paths
+        // close above): this echo re-renders every SIBLING request still pending
+        // on THIS card as a LIVE button, re-signing each token's `payload.o`. Sign
+        // those siblings with the TRUSTED session operator (`feishuInitiators` →
+        // durable handle → ""), NEVER with the clicker `evt.operator.openId`.
+        // Otherwise a clicker authorised only because the chat was in `all` /
+        // `designated` mode plants `payload.o = clicker` into a sibling token; the
+        // policy fingerprint does NOT bind `approvalMode` and tokens live
+        // `CALLBACK_TOKEN_TTL_MS`, so a later tighten to `initiator` mode would let
+        // that same clicker self-authorize the still-live sibling (`clicker ===
+        // payload.o`). The audit entry (above) and the resolved-notice below still
+        // record the real clicker `evt.operator` — only the SIGNING identity of the
+        // re-rendered live siblings is forced back to the trusted operator.
+        const echoInitiators = yield* Ref.get(feishuInitiators);
+        const echoHandleOpt = yield* cardHandles
+          .get(evt.chatId)
+          .pipe(Effect.orElseSucceed(() => Option.none<CardHandle>()));
+        const trustedEchoOperator =
+          resolveObserveOperator(
+            echoInitiators.get(threadId),
+            Option.isSome(echoHandleOpt) && echoHandleOpt.value.operatorOpenId.length > 0
+              ? echoHandleOpt.value.operatorOpenId
+              : undefined,
+          ) ?? "";
+
         const echoResolved = (): Effect.Effect<void> => {
-          const operatorOpenId = evt.operator.openId;
+          const operatorOpenId = trustedEchoOperator;
           const ctx: InteractionContext = {
             // The token's `c`/`scope` is the real Feishu chatId (matched at verify
             // against `evt.chatId`); the topic id rides in `larkThreadId` so any
