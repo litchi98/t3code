@@ -622,8 +622,11 @@ export const makeCardActionHandler = (
         // record the real clicker `evt.operator` — only the SIGNING identity of the
         // re-rendered live siblings is forced back to the trusted operator.
         const echoInitiators = yield* Ref.get(feishuInitiators);
+        // Handle store is keyed by the COMPOSITE chatKey (`chatId[:larkThreadId]`,
+        // same key `persistHandle`/M18 write) — a bare `evt.chatId` read would
+        // never match in a topic group, silently dropping the durable fallback leg.
         const echoHandleOpt = yield* cardHandles
-          .get(evt.chatId)
+          .get(chatKey)
           .pipe(Effect.orElseSucceed(() => Option.none<CardHandle>()));
         const trustedEchoOperator =
           resolveObserveOperator(
