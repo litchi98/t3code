@@ -3025,23 +3025,116 @@ const runBoundSession = (
         return resolved;
       });
 
-    // Bystander no-op (M3a; generalised + shared in M4-1). An unauthorised click on
-    // the CURRENT card is ignored WITHOUT mutating the card — the real approver's
-    // buttons stay live — and we only post a neutral, @-addressed notice, deduped to
-    // at most once per (chatKey, card messageId, clicker) so repeated taps don't spam
-    // the topic. Called from the authz gate: the token already passed `verify`, which
-    // proves the click targets the live card for this chat/thread/policy, so no
-    // messageId check is needed (it would be redundant). Generic wording covers both
-    // approval and user-input interactions.
+    // Bystander handling (M3a; generalised + shared in M4-1; §11E re-arm in this PR).
+    // An unauthorised click on the CURRENT card must NOT act on the request — the real
+    // approver's decision is the only one that routes — but it MUST still change the
+    // card, because of how a click that produces no card change gets deduped:
+    //
+    //   The lark SDK (`@larksuite/channel`) drops a card-action whose dedup key
+    //   `card:<messageId>:<clicker>:<tag>|<name>|<option>|<value[:128]>` it has already
+    //   seen within its 12h TTL (`Safety.pushAction` → `seenCache`; `DEFAULT_DEDUP.ttl`,
+    //   no dedup config passed in `lark/channel.ts`). Because `onCardAction` is a
+    //   fire-and-forget `runFork`, the SDK's `await h(evt)` resolves at once and the
+    //   handled click's key is added to the cache immediately. Our signed token's only
+    //   per-sign-varying bytes live PAST that 128-char window, so if we leave the card
+    //   BYTE-FOR-BYTE unchanged, the SAME person's LATER click (e.g. after `approvalMode`
+    //   flipped to `all` and they became authorised) carries an identical dedup key and
+    //   is dropped in-process BEFORE `onCardAction` — the approval dead-ends at the turn's
+    //   local timeout. (Diagnosed 2026-07-06: the second click produced zero
+    //   `onCardAction` deliveries. Feishu may ALSO suppress re-delivery server-side, but
+    //   the SDK seenCache is the code-proven mechanism the fix must defeat.)
+    //
+    // Fix (two parts): (a) `interactionCard.ts` puts a per-sign-unique `k` INSIDE the
+    // 128-char window so a re-render yields a fresh dedup key; (b) here we re-render the
+    // SAME card (same thread body + same live interaction, freshly-signed buttons) onto
+    // the same `messageId`, so a fresh-`k` button lands on the card and the NEXT click —
+    // authorised or not — is delivered. We re-arm on EVERY bystander click (never deduped)
+    // so no click is ever the "unchanged" one the SDK latches onto; only the neutral
+    // @-notice is deduped (to at most once per (chatKey, messageId, clicker)) so repeated
+    // taps don't spam the topic. Buttons are re-signed for the verified token's initiator
+    // (`res.payload.o`, passed as `initiatorOpenId`), NOT the driftable `chatOperators`
+    // Ref and NOT the bystander clicker — see the call below for why. Called from the
+    // authz gate: the token already passed `verify`, which proves the click targets the
+    // live card for this chat/thread/policy. Generic wording covers approval and
+    // user-input interactions.
     const preserveCardForBystander = (
       chatKey: string,
+      threadId: ThreadId,
       messageId: string,
       clickerOpenId: string,
+      // The initiator carried by the just-verified live token (`res.payload.o`). The
+      // re-arm re-signs the card's buttons for THIS id so the re-armed card keeps the
+      // exact same approval authority as the card the bystander clicked.
+      initiatorOpenId: string,
     ): Effect.Effect<void> =>
       Effect.gen(function* () {
         yield* Console.log(
-          `[feishu-bot] cardAction ignored for chat ${chatKey} — unauthorised click on the current card; card preserved.`,
+          `[feishu-bot] cardAction ignored for chat ${chatKey} — unauthorised click; re-arming the card for the real approver.`,
         );
+
+        // Re-arm (core §11E fix). Best-effort and fully isolated: a snapshot / render /
+        // update failure must never swallow the neutral notice below or crash the
+        // handler, so we `catchCause` it to a warning. Mirrors the M18 restart-recovery
+        // re-render (one-shot `subscribeThread` snapshot → `buildInteraction` →
+        // `renderThreadCard` → `updateCard` on the same messageId).
+        yield* Effect.gen(function* () {
+          // Re-sign the re-armed buttons for the EXACT initiator carried by the just-
+          // verified live token (`initiatorOpenId` = `res.payload.o`), passed as
+          // `buildInteraction`'s `operatorOverride`. We must NOT let `buildInteraction`
+          // resolve the operator from the live `chatOperators` Ref, which is DRIFTABLE on
+          // the observe path: a bystander who @-mentions the bot with a floor command
+          // (e.g. `/help`) on an `isChatBusy=false` observe turn (/resume takeover,
+          // chained subagent, M18 recovery) flips the idle-guarded pin to their own id
+          // WITHOUT starting a turn that would re-pin the initiator. Re-signing from that
+          // Ref would let the bystander set the new `payload.o` to themselves and then
+          // self-approve in `initiator` mode — a privilege escalation. Since a non-empty
+          // override wins over the Ref, guard on it: when `initiatorOpenId` is empty (only
+          // a non-initiator-mode / M18-recovered card whose initiator was never captured),
+          // `buildInteraction` would FALL BACK to that driftable Ref, so we SKIP the re-arm
+          // entirely rather than risk re-signing for a drifted bystander — mirroring M18
+          // recovery's refusal to re-sign empty-operator cards. The narrow cost is that
+          // such a recovered card keeps the old dead-button behaviour (no re-arm); the
+          // common case (non-empty initiator) re-arms normally and stays signed for the
+          // real approver, so the bystander stays locked out.
+          if (initiatorOpenId.length === 0) {
+            return;
+          }
+          const firstFrame = yield* Stream.runHead(
+            subscribeThread(threadId).pipe(Stream.take(1)),
+          ).pipe(
+            Effect.scoped,
+            Effect.timeout(Duration.seconds(10)),
+            Effect.option,
+            Effect.map(Option.flatten),
+          );
+          const snapshotThread = Option.match(firstFrame, {
+            onNone: () => null as OrchestrationThread | null,
+            onSome: (item) => (item.kind === "snapshot" ? item.snapshot.thread : null),
+          });
+          if (snapshotThread === null) {
+            return;
+          }
+          const interaction = yield* buildInteraction(chatKey, snapshotThread, initiatorOpenId);
+          // No live interaction (the request was resolved elsewhere while this click was
+          // in flight) → nothing to re-arm; leave the card to the normal render path.
+          if (interaction === undefined) {
+            return;
+          }
+          const card = renderThreadCard(snapshotThread, {
+            streaming: false,
+            density: densityForRuntime(snapshotThread.runtimeMode, groupChatDensity),
+            interaction,
+          }).card;
+          yield* gateway.updateCard(messageId, card);
+        }).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning(
+              `[feishu-bot] bystander card re-arm failed for chat ${chatKey} (message ${messageId}).`,
+              cause,
+            ),
+          ),
+        );
+
         const dedupKey = `${chatKey}:${messageId}:${clickerOpenId}`;
         const alreadyNotified = yield* Ref.modify(bystanderNoticed, (set) => {
           if (set.has(dedupKey)) return [true, set] as const;
@@ -3057,7 +3150,8 @@ const runBoundSession = (
         });
         if (!alreadyNotified) {
           // The WS card path has no native per-clicker toast, so post a short
-          // topic-anchored notice; the card stays intact for the real approver.
+          // topic-anchored notice; the re-arm above keeps the same live interaction on
+          // the card, so the real approver's buttons remain actionable.
           yield* sendNotice(
             chatKey,
             `<at id=${clickerOpenId}></at> 你暂时没有此操作的权限,需由授权人处理。`,
@@ -3167,7 +3261,7 @@ const runBoundSession = (
           initiator: res.payload.o,
         });
         if (!authorized) {
-          yield* preserveCardForBystander(chatKey, evt.messageId, clicker);
+          yield* preserveCardForBystander(chatKey, threadId, evt.messageId, clicker, res.payload.o);
           return;
         }
 
