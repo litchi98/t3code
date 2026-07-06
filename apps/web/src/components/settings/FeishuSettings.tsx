@@ -32,8 +32,11 @@ import {
   commandsSummary,
   type ConfigSource,
   deepEqual,
+  DEFAULT_GROUP_DENSITY,
   defaultsModeSelection,
   defaultsSummary,
+  DENSITY_LABELS,
+  DENSITY_MODES,
   describeInheritedCommands,
   describeInheritedWorkspaces,
   type EffectiveConfig,
@@ -41,9 +44,11 @@ import {
   type FeishuChatConfigMap,
   INHERIT_MODE,
   isChatOverridden,
+  type RenderDensity,
   restingChatSummary,
   setConfigApprovalMode,
   setConfigCommands,
+  setConfigDensity,
   setConfigWorkspaces,
   setDefaultsApprovalMode,
   SOURCE_LABELS,
@@ -570,9 +575,10 @@ function CopyIdButton({ value }: { value: string }) {
 /**
  * Drawer body for a single group override. Renders the effective-preview card
  * (resolved "what the bot enforces" via the shared `effectiveConfig`) above the
- * four dimension editors — flat (the collapse-one-at-a-time grid is deferred). All
- * config values are read LIVE from the section's optimistic overlay via props, so a
- * hard refresh mid-edit never freezes a stale snapshot into the drawer.
+ * five dimension editors (approval / approvers / commands / workspaces / density) —
+ * flat (the collapse-one-at-a-time grid is deferred). All config values are read
+ * LIVE from the section's optimistic overlay via props, so a hard refresh mid-edit
+ * never freezes a stale snapshot into the drawer.
  */
 function ChatConfigDrawer({
   chatId,
@@ -657,6 +663,14 @@ function ChatConfigDrawer({
           offHint={describeInheritedWorkspaces(defaults.workspaces)}
           onChange={onCommit}
         />
+        <DensityDimension
+          title="消息密度"
+          description="卡片信息量;低密度更适合高频刷屏的群。"
+          value={config?.density}
+          includeInherit
+          ariaLabel={`${name} 消息密度`}
+          onChange={(density) => onCommit((current) => setConfigDensity(current, density))}
+        />
       </div>
     </DrawerShell>
   );
@@ -721,6 +735,14 @@ function DefaultsDrawer({
           offHint="不限制,允许全部工作区。"
           onChange={onCommit}
         />
+        <DensityDimension
+          title="默认消息密度"
+          description="未单独配置的群聊都用这个密度(私聊始终用卡片)。"
+          value={defaults.density ?? DEFAULT_GROUP_DENSITY}
+          includeInherit={false}
+          ariaLabel="默认消息密度"
+          onChange={(density) => onCommit((current) => setConfigDensity(current, density))}
+        />
       </div>
     </DrawerShell>
   );
@@ -731,7 +753,7 @@ function DefaultsDrawer({
  * dimension's source tier (`[本群]/[默认]/[内置]`). Values come from the shared
  * `effectiveConfig` (the SAME resolver the bot uses), so "what the editor shows ==
  * what the bot enforces". owner-always is deliberately not surfaced here (no
- * "+授权人" tail); density lands in PR-C3.
+ * "+授权人" tail); the density row mirrors the bot's `resolveDensity` fallback.
  */
 function EffectivePreviewCard({
   effective,
@@ -767,6 +789,11 @@ function EffectivePreviewCard({
       key: "工作区",
       value: workspacesSummary(effective.workspaces.value),
       source: effective.workspaces.source,
+    },
+    {
+      key: "密度",
+      value: DENSITY_LABELS[effective.density.value],
+      source: effective.density.source,
     },
   ];
 
@@ -835,6 +862,76 @@ function ModeSelect({
         ))}
       </SelectPopup>
     </Select>
+  );
+}
+
+/**
+ * Render-density dimension: a segmented control (design-spec form) over a label +
+ * description. `includeInherit` prepends a "继承默认" option (per-chat) that maps to
+ * `undefined`; the defaults editor omits it (density is always an explicit value
+ * there). This dimension is group-only — the bot forces p2p private chats to 卡片
+ * regardless — so only group/topic drawers render it.
+ */
+function DensityDimension({
+  title,
+  description,
+  value,
+  includeInherit,
+  ariaLabel,
+  onChange,
+}: {
+  title: string;
+  description: string;
+  value: RenderDensity | undefined;
+  includeInherit: boolean;
+  ariaLabel: string;
+  onChange: (density: RenderDensity | undefined) => void;
+}) {
+  const options: ReadonlyArray<{
+    readonly key: string;
+    readonly value: RenderDensity | undefined;
+    readonly label: string;
+  }> = [
+    ...(includeInherit ? [{ key: "inherit", value: undefined, label: "继承默认" }] : []),
+    ...DENSITY_MODES.map((density) => ({
+      key: density,
+      value: density,
+      label: DENSITY_LABELS[density],
+    })),
+  ];
+  return (
+    <div className="space-y-2">
+      <div className="min-w-0">
+        <p className="font-medium text-foreground/90 text-xs">{title}</p>
+        <p className="text-[11px] text-muted-foreground/80">{description}</p>
+      </div>
+      {/* Segmented control: connected buttons, selected = bg-accent (design spec).
+          A radiogroup so density is a single-select choice with keyboard semantics. */}
+      <div role="radiogroup" aria-label={ariaLabel} className="inline-flex w-fit">
+        {options.map((option, index) => {
+          const selected = value === option.value;
+          return (
+            <button
+              key={option.key}
+              type="button"
+              role="radio"
+              aria-checked={selected}
+              onClick={() => onChange(option.value)}
+              className={cn(
+                "inline-flex h-8 items-center justify-center border border-input px-3 font-medium text-[13px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring",
+                index === 0 ? "rounded-l-lg" : "-ml-px",
+                index === options.length - 1 ? "rounded-r-lg" : "",
+                selected
+                  ? "bg-accent font-semibold text-foreground"
+                  : "bg-background text-muted-foreground hover:bg-accent/60 hover:text-foreground",
+              )}
+            >
+              {option.label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 

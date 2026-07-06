@@ -183,6 +183,32 @@ describe("ServerSettings.feishuChatConfigs / feishuChatDefaults (M-2/PR2a)", () 
     ).toThrow();
   });
 
+  it("round-trips the M-3 PR-C3 density field (per-chat + defaults)", () => {
+    const decoded = decodeServerSettings({
+      feishuChatConfigs: { oc_group_e: { density: "text" } },
+      feishuChatDefaults: { density: "markdown" },
+    });
+    expect(decoded.feishuChatConfigs.oc_group_e?.density).toBe("text");
+    expect(decoded.feishuChatDefaults.density).toBe("markdown");
+    // Absent density stays absent (bot resolves the fallback) — backward-compatible.
+    const legacy = decodeServerSettings({
+      feishuChatConfigs: { oc_group_f: { approvalMode: "all" } },
+    });
+    expect(legacy.feishuChatConfigs.oc_group_f).not.toHaveProperty("density");
+
+    const encoded = encodeServerSettings(decoded);
+    expect(encoded.feishuChatConfigs).toEqual(decoded.feishuChatConfigs);
+    expect(encoded.feishuChatDefaults).toEqual(decoded.feishuChatDefaults);
+  });
+
+  it("rejects an unknown density literal", () => {
+    expect(() =>
+      decodeServerSettings({
+        feishuChatConfigs: { oc_group_g: { density: "verbose" } },
+      }),
+    ).toThrow();
+  });
+
   it("treats the patch fields as optional whole-value replacements", () => {
     expect(decodeServerSettingsPatch({}).feishuChatConfigs).toBeUndefined();
     expect(decodeServerSettingsPatch({}).feishuChatDefaults).toBeUndefined();

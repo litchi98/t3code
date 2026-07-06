@@ -372,6 +372,15 @@ export const DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL = Duration.seconds(30);
 // fallback at read time: `configs[chatId]?.X ?? defaults.X ?? built-in`.
 // Consumption lands later (approvalMode/approvers in PR2b; workspaces/commands/
 // toolPolicy in M-3); this struct only opens the data channel.
+//
+// Group-chat render density (M-3 PR-C3). MIRRORS the bot's `RenderDensity`
+// (`apps/feishu-bot/src/bridge/eventRenderer.ts`) — a parity test asserts the two
+// literal sets stay equal, so this stays the single source the web editor renders
+// and the bot's `resolveDensity` falls back through. `card` is the full v3 layout;
+// `markdown` / `text` are the low-noise variants.
+export const FEISHU_RENDER_DENSITIES = ["card", "markdown", "text"] as const;
+export type FeishuRenderDensity = (typeof FEISHU_RENDER_DENSITIES)[number];
+
 export const FeishuChatConfig = Schema.Struct({
   // Approval-gate mode. `all` = any chat member, `designated` = the `approvers`
   // set, `initiator` = the turn initiator only. Absent → per-chat-type fallback
@@ -391,6 +400,11 @@ export const FeishuChatConfig = Schema.Struct({
       tools: Schema.Array(Schema.String),
     }),
   ),
+  // Group-chat render density (M-3 PR-C3 consumes). Absent → field-level fallback
+  // resolved by the bot's `resolveDensity` (per-chat → defaults → bind-time
+  // binding density → the group default `card`). p2p private chats are always
+  // `card` regardless; only a group/topic chat honours a lowered density.
+  density: Schema.optional(Schema.Literals(FEISHU_RENDER_DENSITIES)),
 });
 export type FeishuChatConfig = typeof FeishuChatConfig.Type;
 

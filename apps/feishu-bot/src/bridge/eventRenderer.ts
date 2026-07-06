@@ -59,8 +59,14 @@ import type { RenderOptions as BaseRenderOptions, RenderResult } from "./types.t
  * plan / activity / changed-files panels for single-line markdown summaries
  * (`text` further drops the header, plan and changed-files sections). All three
  * keep the assistant body and the interaction section.
+ *
+ * The runtime array is the single in-bot source of the density literals; the type
+ * is derived from it so a parity test (`chatConfig.test.ts`) can assert this set
+ * equals the contracts' `FEISHU_RENDER_DENSITIES` — the web editor renders that
+ * contract list, so drift between the two would silently desync editor and bot.
  */
-export type RenderDensity = "card" | "markdown" | "text";
+export const RENDER_DENSITIES = ["card", "markdown", "text"] as const;
+export type RenderDensity = (typeof RENDER_DENSITIES)[number];
 
 /**
  * Render options consumed by {@link renderThreadCard}. Extends the bridge-shared

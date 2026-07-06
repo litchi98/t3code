@@ -14,6 +14,7 @@ import {
   restingChatSummary,
   setConfigApprovalMode,
   setConfigCommands,
+  setConfigDensity,
   setConfigWorkspaces,
   setDefaultsApprovalMode,
   toggleApprover,
@@ -191,6 +192,8 @@ describe("isChatConfigEmpty", () => {
     expect(isChatConfigEmpty({ commands: [] })).toBe(false);
     // Empty workspaces is also a real override ("nobody authorized").
     expect(isChatConfigEmpty({ workspaces: [] })).toBe(false);
+    // PR-C3: a density-only override is REAL and must not be dropped.
+    expect(isChatConfigEmpty({ density: "text" })).toBe(false);
   });
 });
 
@@ -270,6 +273,70 @@ describe("setConfigWorkspaces / toggleConfigWorkspace (M-3 PR-C)", () => {
   });
 });
 
+describe("setConfigDensity / density override (M-3 PR-C3)", () => {
+  it("clears the field with undefined (inherit) and keeps a value", () => {
+    expect(setConfigDensity({ density: "text" }, undefined)).toEqual({});
+    expect(setConfigDensity({}, "markdown")).toEqual({ density: "markdown" });
+  });
+
+  it("preserves sibling fields when editing density", () => {
+    expect(setConfigDensity({ approvalMode: "all", commands: ["/status"] }, "text")).toEqual({
+      approvalMode: "all",
+      commands: ["/status"],
+      density: "text",
+    });
+    expect(setConfigDensity({ approvalMode: "all", density: "text" }, undefined)).toEqual({
+      approvalMode: "all",
+    });
+  });
+
+  it("keeps the designated approvers invariant (empty [] present) while editing density", () => {
+    expect(setConfigDensity({ approvalMode: "designated", approvers: [] }, "markdown")).toEqual({
+      approvalMode: "designated",
+      approvers: [],
+      density: "markdown",
+    });
+  });
+
+  it("a chat whose ONLY override is density is written, and dropped when cleared", () => {
+    expect(writeChatConfig({}, CHAT, setConfigDensity({}, "text"))).toEqual({
+      [CHAT]: { density: "text" },
+    });
+    expect(
+      writeChatConfig({ [CHAT]: { density: "text" } }, CHAT, setConfigDensity({}, undefined)),
+    ).toEqual({});
+  });
+});
+
+describe("effectiveConfig density fallback — mirrors the bot (所见=所判)", () => {
+  it("per-chat > default > built-in card, tagged by source", () => {
+    // per-chat density wins → [本群]
+    expect(
+      effectiveConfig(CHAT, { [CHAT]: { density: "text" } }, { density: "markdown" }).density,
+    ).toEqual({ value: "text", source: "chat" });
+    // no per-chat density → inherits the default [默认]
+    expect(effectiveConfig(CHAT, {}, { density: "markdown" }).density).toEqual({
+      value: "markdown",
+      source: "default",
+    });
+    // neither set → built-in card [内置]
+    expect(effectiveConfig(CHAT, {}, {}).density).toEqual({ value: "card", source: "builtin" });
+  });
+
+  it("appends a chat-sourced density to the resting summary, not an inherited one", () => {
+    // own density override shows in the row
+    const own = effectiveConfig(CHAT, { [CHAT]: { density: "text" } }, {});
+    expect(restingChatSummary(own, true)).toBe("仅发起人 · 密度 纯文本");
+    // inherited density (from defaults) is NOT listed as this chat's override
+    const inherited = effectiveConfig(
+      CHAT,
+      { [CHAT]: { approvalMode: "all" } },
+      { density: "text" },
+    );
+    expect(restingChatSummary(inherited, true)).toBe("任意群成员");
+  });
+});
+
 describe("describeInherited* — faithful inherit hints (M-3 PR-C)", () => {
   it("commands hint reflects the actual default, never a blanket 'allows all'", () => {
     // absent default → truly unrestricted
@@ -340,6 +407,7 @@ describe("isChatOverridden", () => {
     expect(isChatOverridden({ approvers: [] })).toBe(false); // no mode → empty no-op
     expect(isChatOverridden({ commands: [] })).toBe(true);
     expect(isChatOverridden({ approvalMode: "designated", approvers: [] })).toBe(true);
+    expect(isChatOverridden({ density: "text" })).toBe(true);
   });
 });
 
@@ -368,18 +436,25 @@ describe("summary labels — compact resting/preview text", () => {
     expect(restingChatSummary(eff2, true)).toBe("任意群成员");
   });
 
-  it("defaultsSummary lists審批/命令/工作区 from the explicit defaults", () => {
+  it("defaultsSummary lists审批/命令/工作区/密度 from the explicit defaults", () => {
     expect(defaultsSummary({})).toEqual([
       { key: "审批", value: "仅发起人" },
       { key: "命令", value: "全部" },
       { key: "工作区", value: "全部" },
+      { key: "密度", value: "卡片" },
     ]);
     expect(
-      defaultsSummary({ approvalMode: "designated", approvers: ["a"], workspaces: [] }),
+      defaultsSummary({
+        approvalMode: "designated",
+        approvers: ["a"],
+        workspaces: [],
+        density: "text",
+      }),
     ).toEqual([
       { key: "审批", value: "指定审批人 · 1 人" },
       { key: "命令", value: "全部" },
       { key: "工作区", value: "未授权" },
+      { key: "密度", value: "纯文本" },
     ]);
   });
 });
