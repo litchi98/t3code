@@ -2,11 +2,16 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   chatModeSelection,
+  commandsSummary,
   deepEqual,
   defaultsModeSelection,
+  defaultsSummary,
   describeInheritedCommands,
   describeInheritedWorkspaces,
+  effectiveConfig,
   isChatConfigEmpty,
+  isChatOverridden,
+  restingChatSummary,
   setConfigApprovalMode,
   setConfigCommands,
   setConfigWorkspaces,
@@ -16,6 +21,7 @@ import {
   toggleConfigCommand,
   toggleConfigWorkspace,
   toggleDefaultsApprover,
+  workspacesSummary,
   writeChatConfig,
 } from "./FeishuSettings.logic.ts";
 
@@ -283,5 +289,97 @@ describe("describeInherited* — faithful inherit hints (M-3 PR-C)", () => {
     expect(describeInheritedWorkspaces([])).not.toContain("允许全部");
     expect(describeInheritedWorkspaces(["p1"])).toContain("1 个工作区");
     expect(describeInheritedWorkspaces(["p1"])).not.toContain("允许全部");
+  });
+});
+
+describe("effectiveConfig — field-level fallback mirrors the bot (所见=所判)", () => {
+  it("a clean chat resolves every field from defaults, tagged [默认] / built-in [内置]", () => {
+    const eff = effectiveConfig(
+      CHAT,
+      {},
+      { approvalMode: "designated", approvers: ["ou_x"], commands: ["/status"] },
+    );
+    expect(eff.approvalMode).toEqual({ value: "designated", source: "default" });
+    expect(eff.approvers).toEqual({ value: ["ou_x"], source: "default" });
+    expect(eff.commands).toEqual({ value: ["/status"], source: "default" });
+    // no default workspaces → built-in unrestricted
+    expect(eff.workspaces).toEqual({ value: undefined, source: "builtin" });
+  });
+
+  it("built-in fallback when neither chat nor defaults set a field", () => {
+    const eff = effectiveConfig(CHAT, {}, {});
+    expect(eff.approvalMode).toEqual({ value: "initiator", source: "builtin" });
+    expect(eff.approvers).toEqual({ value: [], source: "builtin" });
+    expect(eff.commands).toEqual({ value: undefined, source: "builtin" });
+    expect(eff.workspaces).toEqual({ value: undefined, source: "builtin" });
+  });
+
+  it("per-chat fields win and are tagged [本群]; unset fields still fall back per-field", () => {
+    const eff = effectiveConfig(
+      CHAT,
+      { [CHAT]: { workspaces: ["p1", "p2"] } },
+      { approvalMode: "all" },
+    );
+    // own workspaces override
+    expect(eff.workspaces).toEqual({ value: ["p1", "p2"], source: "chat" });
+    // approvalMode not set on the chat → inherited from defaults
+    expect(eff.approvalMode).toEqual({ value: "all", source: "default" });
+  });
+
+  it("an empty per-chat list is a REAL override (source 本群), not inheritance", () => {
+    const eff = effectiveConfig(CHAT, { [CHAT]: { commands: [] } }, { commands: ["/status"] });
+    // empty own list wins over the non-empty default (bot enforces "only floor")
+    expect(eff.commands).toEqual({ value: [], source: "chat" });
+  });
+});
+
+describe("isChatOverridden", () => {
+  it("undefined / empty entries are NOT overrides; a real field is", () => {
+    expect(isChatOverridden(undefined)).toBe(false);
+    expect(isChatOverridden({})).toBe(false);
+    expect(isChatOverridden({ approvers: [] })).toBe(false); // no mode → empty no-op
+    expect(isChatOverridden({ commands: [] })).toBe(true);
+    expect(isChatOverridden({ approvalMode: "designated", approvers: [] })).toBe(true);
+  });
+});
+
+describe("summary labels — compact resting/preview text", () => {
+  it("commands/workspaces: undefined→全部, []→仅基础/未授权, list→count", () => {
+    expect(commandsSummary(undefined)).toBe("全部");
+    expect(commandsSummary([])).toBe("仅基础");
+    expect(commandsSummary(["/a", "/b"])).toBe("2 项");
+    expect(workspacesSummary(undefined)).toBe("全部");
+    expect(workspacesSummary([])).toBe("未授权");
+    expect(workspacesSummary(["p1"])).toBe("1 个");
+  });
+
+  it("clean chat reads '继承默认 · <mode>'; only inherited approval shown", () => {
+    const eff = effectiveConfig(CHAT, {}, { approvalMode: "designated", approvers: ["a", "b"] });
+    expect(restingChatSummary(eff, false)).toBe("继承默认 · 指定审批人 · 2 人");
+  });
+
+  it("overridden chat drops '继承默认' and appends only its OWN overridden dimensions", () => {
+    // only workspaces overridden; approval inherited (initiator built-in)
+    const eff = effectiveConfig(CHAT, { [CHAT]: { workspaces: ["p1", "p2"] } }, {});
+    expect(restingChatSummary(eff, true)).toBe("仅发起人 · 工作区 2 个");
+    // an inherited commands restriction is NOT listed (only own overrides), so it
+    // doesn't masquerade as this chat's override
+    const eff2 = effectiveConfig(CHAT, { [CHAT]: { approvalMode: "all" } }, { commands: [] });
+    expect(restingChatSummary(eff2, true)).toBe("任意群成员");
+  });
+
+  it("defaultsSummary lists審批/命令/工作区 from the explicit defaults", () => {
+    expect(defaultsSummary({})).toEqual([
+      { key: "审批", value: "仅发起人" },
+      { key: "命令", value: "全部" },
+      { key: "工作区", value: "全部" },
+    ]);
+    expect(
+      defaultsSummary({ approvalMode: "designated", approvers: ["a"], workspaces: [] }),
+    ).toEqual([
+      { key: "审批", value: "指定审批人 · 1 人" },
+      { key: "命令", value: "全部" },
+      { key: "工作区", value: "未授权" },
+    ]);
   });
 });
