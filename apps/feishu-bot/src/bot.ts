@@ -1,25 +1,17 @@
 import { connectionProjectionPhase, EnvironmentRegistry } from "@t3tools/client-runtime/connection";
-import {
-  respondToThreadApproval,
-  respondToThreadUserInput,
-} from "@t3tools/client-runtime/operations";
 import * as EnvironmentRpc from "@t3tools/client-runtime/rpc";
 import {
   derivePendingApprovals,
   derivePendingUserInputs,
 } from "@t3tools/client-runtime/state/thread-activity";
 import {
-  ApprovalRequestId,
-  CommandId,
   type FeishuChatConfig,
   ModelSelection,
   ORCHESTRATION_WS_METHODS,
   type OrchestrationThread,
   type RuntimeMode,
-  ThreadId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
-import * as Clock from "effect/Clock";
 import * as Console from "effect/Console";
 import * as Crypto from "effect/Crypto";
 import * as Duration from "effect/Duration";
@@ -50,26 +42,11 @@ import {
 import { LarkGateway } from "./lark/index.ts";
 import { larkGatewayLayer } from "./lark/channel.ts";
 import { reportFeishuChatDirectory } from "./chat-directory.ts";
-import type { BridgeHandlers, CardActionEvent, InboundMessage } from "./lark/types.ts";
-import {
-  authorizeApprovalClick,
-  authorizeCommand,
-  COMMAND_FLOOR,
-  isOwnerExempt,
-} from "./bridge/authz.ts";
+import type { BridgeHandlers, InboundMessage } from "./lark/types.ts";
 import { effectiveChatConfig } from "./bridge/chatConfig.ts";
-import { CallbackAuth, computePolicyFingerprint } from "./bridge/callbackAuth.ts";
+import { CallbackAuth } from "./bridge/callbackAuth.ts";
+import { type ResolvedNoticeEntry } from "./bridge/interactionCard.ts";
 import {
-  actionToApprovalDecision,
-  formValueToAnswers,
-  type InteractionContext,
-  parseCardActionValue,
-  renderInteractionSection,
-  type ResolvedNoticeEntry,
-} from "./bridge/interactionCard.ts";
-import {
-  anchorOf,
-  compositeChatKey,
   densityForRuntime,
   resolveRenderDensity,
   splitChatKey,
@@ -81,7 +58,6 @@ import { BindingState, bindingStateLayer } from "./bridge/bindingState.ts";
 import { WorkspaceState, workspaceStateLayer } from "./bridge/workspaceState.ts";
 import { runShellCacheFiber } from "./bridge/shellCache.ts";
 import { runShellWatcherFiber } from "./bridge/shellWatcher.ts";
-import { tryHandleCommand } from "./bridge/commands/registry.ts";
 import { buildCommandTable } from "./bridge/commands/handlers.ts";
 import { resolveModelSelection } from "./bridge/modelSelection.ts";
 import { makeEnvAccess } from "./bridge/envAccess.ts";
@@ -91,11 +67,9 @@ import { makeWorkspaceGate } from "./bridge/workspaceGate.ts";
 import { makeWorkspaceOps } from "./bridge/workspaceOps.ts";
 import { makeTurnRunner } from "./bridge/turnRunner.ts";
 import { makeEnsureThread } from "./bridge/ensureThread.ts";
-import {
-  CALLBACK_TOKEN_TTL_MS,
-  makeInteractionBuilder,
-  staleRequestIdsOf,
-} from "./bridge/interaction.ts";
+import { makeInteractionBuilder } from "./bridge/interaction.ts";
+import { makeInboundHandler } from "./bridge/inbound.ts";
+import { makeCardActionHandler } from "./bridge/cardAction.ts";
 import {
   acquireCredentials,
   bindingIdentityEq,
@@ -128,23 +102,6 @@ const DISCOVERY_TIMEOUT = Duration.seconds(30);
 // `/workspace add`/`switch` before the first prompt. The `workspaceRoot`
 // config field (and the server-managed `T3_WORKSPACE_ROOT` injection) is kept
 // for compatibility but is no longer consumed here.
-
-/**
- * Feishu's client locks a submitted form for ~1s (FORM_SETTLE_MS). Updating the
- * card before that lock clears rolls the update back, so a user-input *form*
- * submit echo waits this long before re-rendering. An approval (plain button)
- * echo is immediate.
- */
-const FORM_SETTLE_DELAY = Duration.seconds(1);
-
-/**
- * M3b: upper bound on the per-bystander "unauthorised click" dedup set. Realistic
- * bystander volume is tiny, but the set is keyed by `(chatKey, messageId, openId)`
- * and lives for the whole bridge scope, so a long-running, high-traffic group
- * could grow it without limit. On overflow we keep the most recent ~80% (Set
- * iteration order ≈ insertion order) and drop the oldest entries.
- */
-const MAX_BYSTANDER_KEYS = 10_000;
 
 // ── Resident bridge core ─────────────────────────────────────────────────────
 
@@ -344,13 +301,6 @@ const runBoundSession = (
     // clicker against the token's `o` field at click time.
     const chatOperators = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
 
-    // Fix B: per-bystander dedup so the "unauthorised click" notice fires at most
-    // once per (chatKey, card messageId, clicker openId) triple. Realistic bystander
-    // volume is tiny, but the set lives for the whole bridge scope, so the write
-    // site (M3b) clamps it to `MAX_BYSTANDER_KEYS`, dropping the oldest keys on
-    // overflow — bounded memory without breaking the at-most-once dedup.
-    const bystanderNoticed = yield* Ref.make<ReadonlySet<string>>(new Set<string>());
-
     // P2: per-chat resolved overlay — chatId → (requestId → {@link ResolvedNoticeEntry}).
     // The cardAction handler writes a resolved entry here on a successful respond;
     // the live `driveTurn` render reads it (via `buildInteraction`) so a
@@ -376,13 +326,6 @@ const runBoundSession = (
 
     const interaction = makeInteractionBuilder({ auth, chatOperators, chatResolvedNotices });
     const { buildInteraction } = interaction;
-
-    // P3: openId → resolved Feishu display name. The cardAction echo prefers the
-    // name the event already carried (`evt.operator.name`), then this in-process
-    // cache, then a one-off `gateway.getUser` contact lookup (cached on success).
-    // A lookup failure (missing `contact:user.base:readonly` scope → 403, etc.)
-    // is swallowed and falls back to the raw openId — never blocking the echo.
-    const operatorNames = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
 
     const envAccess = makeEnvAccess({ registry, environmentId, crypto });
     const { runOnEnv, genId, subscribeThread, isEnvReady } = envAccess;
@@ -604,656 +547,58 @@ const runBoundSession = (
       },
     });
 
-    /**
-     * Handle one inbound message: filter unsupported content, ensure the chat's
-     * thread (binding/buffering on first contact, under `ensureLock`), then offer
-     * it to the per-chat queue. An idle offer returns a merged dispatch (after the
-     * ~600ms coalescing window) we run as a turn; a held offer (turn already
-     * running) returns `null` — the running turn's completion picks it up.
-     *
-     * Forked one-per-message so concurrent `offer` calls drive the queue's
-     * generation-debounce coalescing (rapid messages collapse into one prompt);
-     * the only racy step, first-contact create, is serialized by `ensureLock`.
-     */
-    const handleInbound = (message: InboundMessage): Effect.Effect<void> =>
-      Effect.gen(function* () {
-        // M3a: the composite conversation key — a topic (`omt_…`) is its own
-        // conversation, so binding / queue / operator / mirror state all key on
-        // `chatId[:larkThreadId]` (byte-identical to the bare chatId for p2p /
-        // plain group). All internal state below uses `chatKey`; the gateway sends
-        // recover the real Feishu chatId via `splitChatKey`.
-        const larkThreadId = anchorOf(message);
-        const chatKey = compositeChatKey(message.chatId, larkThreadId);
-
-        // M-3: a p2p private chat is owner-only. p2p is 1:1, so a non-owner DMing
-        // the bot must not be able to drive a session (create a global project, run
-        // a full-access turn). Judge on the authoritative `chatType === "p2p"`
-        // (`chatMode` may be undefined); groups (`chatType === "group"`) are NOT
-        // gated here — they still admit non-owners under the command allowlist /
-        // workspace-authorization gates. Placed before the operator pin so a
-        // non-owner touches no conversation state. `owner === null` (unbound) does
-        // NOT gate — with no configured owner we keep the chat open (e.g. a binding
-        // flow); only once an owner is set do we refuse non-owners.
-        if (message.chatType === "p2p") {
-          const p2pOwner = yield* Ref.get(ownerRef);
-          if (p2pOwner !== null && !isOwnerExempt(p2pOwner, message.senderId)) {
-            yield* sendNotice(
-              chatKey,
-              "私聊仅限 bot 管理员使用。如需协作,请在群聊中 @机器人。",
-              message.messageId,
-            );
-            return;
-          }
-        }
-
-        // E④: remember who this conversation's operator is (per topic). The
-        // interaction card binds its buttons to this open id at render time; the
-        // cardAction verify re-checks the actual clicker against the token's `o`.
-        //
-        // Fix 1(c)/(d) (M3a): record the operator ONLY when the conversation is
-        // currently idle — i.e. this message is (about to become) a fresh turn's
-        // initiator. While a turn is running OR coalescing (`isChatBusy`), the
-        // active turn's operator is already pinned by `driveTurn`'s
-        // `operatorOverride` (the initiator) and must NOT be overwritten: otherwise
-        // a bystander @-mentioning the bot mid-turn would flip the Ref, the next
-        // tick would re-sign the approval buttons to the bystander (who could then
-        // approve someone else's turn), and the real initiator's own click would be
-        // rejected (context-mismatch). The pinned-initiator override is the live
-        // backstop; this idle guard keeps the Ref itself sane for the idle paths
-        // (e.g. `surfacePendingApprovalIfNew`) that still read it. For p2p the
-        // operator is always the same person, so skipping a redundant rewrite while
-        // busy is a no-op → byte-identical.
-        if (!(yield* isChatBusy(chatKey))) {
-          yield* Ref.update(chatOperators, (map) => new Map(map).set(chatKey, message.senderId));
-        }
-
-        // Content filter (M16): M1 dispatches text only. A message with no text
-        // (image/file-only, or an empty body) must NOT become an empty-prompt
-        // turn — reply with an explicit "text only" notice and skip dispatch.
-        if (message.text.trim().length === 0) {
-          const what =
-            message.attachments.length > 0
-              ? "I can only act on text right now (image/file attachments aren't supported yet)."
-              : "I received an empty message — please send some text.";
-          // Fix 5: this reply answers a real triggering message, so anchor it into
-          // the topic (composite `chatKey` + the message id) instead of the group
-          // root; p2p / plain group degrade to the root (byte-identical).
-          yield* sendNotice(chatKey, what, message.messageId);
-          return;
-        }
-
-        // M2a command routing: a `/…` message is a control command, NOT a prompt.
-        // Route it BEFORE `ensureThread` so commands work on an unbound chat
-        // (`/help`, `/resume` listing candidates) without auto-creating a thread.
-        // A known command is fully handled; a `/`-prefixed miss gets a help hint;
-        // a non-command falls through to the normal turn path.
-        // M-3: per-chat command allowlist. Resolve owner + effective config (bare
-        // chatId, like the approval gate) ONLY for `/…` messages; the predicate is
-        // pure and the registry calls it only on a table hit. The binding owner and
-        // the /help+/whoami floor bypass the allowlist (in `authorizeCommand`).
-        let isCommandAllowed: (command: string) => boolean = () => true;
-        if (message.text.trimStart().startsWith("/")) {
-          const cmdOwner = yield* Ref.get(ownerRef);
-          const cmdConfig = effectiveChatConfig(
-            message.chatId,
-            yield* Ref.get(chatConfigsRef),
-            yield* Ref.get(chatDefaultsRef),
-          );
-          isCommandAllowed = (command) =>
-            authorizeCommand({
-              owner: cmdOwner,
-              sender: message.senderId,
-              command,
-              allowlist: cmdConfig.commands,
-              floor: COMMAND_FLOOR,
-            });
-        }
-        const outcome = yield* tryHandleCommand(message, commandTable, isCommandAllowed);
-        if (outcome.handled) {
-          if (outcome.unknownCommand !== undefined) {
-            // Fix 5: anchor the "unknown command" reply into the triggering topic.
-            yield* sendNotice(chatKey, "未知命令,/help 查看可用命令。", message.messageId);
-          } else if (outcome.deniedCommand !== undefined) {
-            // M-3: the command exists but this chat's allowlist denies it —
-            // explicit refusal (never silent), symmetric with unknownCommand.
-            // `/workspace` gets a tailored hint (承主 §4.1: don't clash with the
-            // "no workspace selected" guidance) so its denial reads as intended.
-            yield* sendNotice(
-              chatKey,
-              outcome.deniedCommand === "/workspace"
-                ? "本群未开放 /workspace(无法在此群选择工作区或发起任务)。如需在此群跑任务,请联系 bot 管理员调整配置。发送 /help 查看本群可用命令。"
-                : `命令 ${outcome.deniedCommand} 在本群未开放。发送 /help 查看本群可用命令。`,
-              message.messageId,
-            );
-          }
-          return;
-        }
-
-        // M-1 workspace gate: "no thread without a selected workspace". Only a
-        // NOT-yet-bound conversation needs a (valid) selection — an already
-        // bound chat has its thread and keeps the session regardless (pre-M-1
-        // bindings and `/resume` takeovers pass through untouched). Commands
-        // were routed above, so they are never gated. `ensureThread` re-checks
-        // authoritatively at create time; this early gate exists so a
-        // workspace-less chat is answered BEFORE the turn queue is touched.
-        if ((yield* bindings.get(chatKey)) === null) {
-          const selected = yield* selectedWorkspaceFor(chatKey);
-          if (selected.kind !== "ok") {
-            yield* sendNotice(chatKey, workspaceGateText(selected), message.messageId);
-            return;
-          }
-          // M-3: refuse a selection narrowed out of the authorized set before the
-          // turn queue is touched (owner exempt); `ensureThread` re-checks too.
-          if (!(yield* senderMayUseProjectAtDispatch(message, selected.project.id))) {
-            yield* sendNotice(chatKey, workspaceRevokedText, message.messageId);
-            return;
-          }
-        }
-
-        // Ensure the chat↔thread binding FIRST (serialised) so the queue resolves
-        // the real threadId when it merges — the stable commandId triple includes
-        // the threadId, so offering before binding would derive the wrong id.
-        // We run `ensureThread` for its build-thread side effect (first
-        // contact: create + bind, or buffer offline); the turn's actual target is
-        // NOT taken from here but from the merged dispatch's own resolution (B1),
-        // so a concurrent `/resume` re-bind between here and the offer cannot make
-        // the dispatch target and its commandId disagree. M-1: a `null` result
-        // means the create was refused (workspace missing/stale at create time,
-        // or the deterministic threadId collided with another workspace's
-        // thread) — `ensureThread` already sent the notice, so just stop here
-        // (never offer a turn that has no thread to land on).
-        const ensured = yield* ensureThread(message).pipe(ensureLock.withPermits(1));
-        if (ensured === null) {
-          return;
-        }
-
-        // `offer` blocks for the idle coalescing window; concurrent offers for
-        // the same chat collapse via the generation-debounce into one dispatch.
-        // The returned merge carries `resolvedThreadId` — resolved at the same
-        // instant its commandId was — which `runTurn` dispatches against.
-        const merged = yield* turnQueue.offer(chatKey, message);
-        if (merged === null) {
-          return; // Coalesced into a peer offer, or held during a running turn.
-        }
-        // Live path: `offlineBuffer` buffers (succeeds) rather than signalling a
-        // retry, so `OfflineRetry` is unreachable here — treat it as a defect.
-        yield* runTurn(chatKey, merged, offlineBuffer).pipe(Effect.orDie);
-      });
+    // M-1 / M3a: the per-message inbound pipeline (p2p owner gate → operator pin
+    // → content filter → command routing → workspace gate → first-contact
+    // ensureThread → queue offer → turn drive). §5.7: `ensureLock` is threaded in
+    // so the handler holds it around each first-contact `ensureThread` call.
+    const inbound = makeInboundHandler({
+      ownerRef,
+      chatConfigsRef,
+      chatDefaultsRef,
+      chatOperators,
+      bindings,
+      ensureLock,
+      turnQueue,
+      isChatBusy,
+      commandTable,
+      ensureThread,
+      runTurn,
+      offlineBuffer,
+      sendNotice,
+      selectedWorkspaceFor,
+      workspaceGateText,
+      workspaceRevokedText,
+      senderMayUseProjectAtDispatch,
+    });
+    const { handleInbound } = inbound;
 
     // ── M2b-1: cardAction (button click / form submit) → shared respond RPC ──
     //
-    // P3: resolve the operator's display name for the echo. Priority: the name
-    // the cardAction event already carried → the in-process cache → a one-off
-    // `gateway.getUser` contact lookup (cached on success). Every lookup failure
-    // (missing scope → 403, network) degrades gracefully to the raw openId — the
-    // echo must never block or throw on name resolution.
-    const resolveOperatorName = (operator: {
-      readonly openId: string;
-      readonly name?: string;
-    }): Effect.Effect<string> =>
-      Effect.gen(function* () {
-        const openId = operator.openId;
-        const eventName = operator.name?.trim();
-        if (eventName) {
-          return eventName;
-        }
-        const cached = (yield* Ref.get(operatorNames)).get(openId);
-        if (cached !== undefined) {
-          return cached;
-        }
-        const looked = yield* gateway.getUser(openId).pipe(
-          Effect.map((user): string | null => user.name?.trim() ?? null),
-          // Missing `contact:user.base:readonly` scope (403), network, etc. → fall
-          // back to the openId; never block or fail the echo.
-          Effect.orElseSucceed((): string | null => null),
-        );
-        const resolved = looked && looked.length > 0 ? looked : openId;
-        yield* Ref.update(operatorNames, (map) => new Map(map).set(openId, resolved));
-        return resolved;
-      });
-
-    // Bystander handling (M3a; generalised + shared in M4-1; §11E re-arm in this PR).
-    // An unauthorised click on the CURRENT card must NOT act on the request — the real
-    // approver's decision is the only one that routes — but it MUST still change the
-    // card, because of how a click that produces no card change gets deduped:
-    //
-    //   The lark SDK (`@larksuite/channel`) drops a card-action whose dedup key
-    //   `card:<messageId>:<clicker>:<tag>|<name>|<option>|<value[:128]>` it has already
-    //   seen within its 12h TTL (`Safety.pushAction` → `seenCache`; `DEFAULT_DEDUP.ttl`,
-    //   no dedup config passed in `lark/channel.ts`). Because `onCardAction` is a
-    //   fire-and-forget `runFork`, the SDK's `await h(evt)` resolves at once and the
-    //   handled click's key is added to the cache immediately. Our signed token's only
-    //   per-sign-varying bytes live PAST that 128-char window, so if we leave the card
-    //   BYTE-FOR-BYTE unchanged, the SAME person's LATER click (e.g. after `approvalMode`
-    //   flipped to `all` and they became authorised) carries an identical dedup key and
-    //   is dropped in-process BEFORE `onCardAction` — the approval dead-ends at the turn's
-    //   local timeout. (Diagnosed 2026-07-06: the second click produced zero
-    //   `onCardAction` deliveries. Feishu may ALSO suppress re-delivery server-side, but
-    //   the SDK seenCache is the code-proven mechanism the fix must defeat.)
-    //
-    // Fix (two parts): (a) `interactionCard.ts` puts a per-sign-unique `k` INSIDE the
-    // 128-char window so a re-render yields a fresh dedup key; (b) here we re-render the
-    // SAME card (same thread body + same live interaction, freshly-signed buttons) onto
-    // the same `messageId`, so a fresh-`k` button lands on the card and the NEXT click —
-    // authorised or not — is delivered. We re-arm on EVERY bystander click (never deduped)
-    // so no click is ever the "unchanged" one the SDK latches onto; only the neutral
-    // @-notice is deduped (to at most once per (chatKey, messageId, clicker)) so repeated
-    // taps don't spam the topic. Buttons are re-signed for the verified token's initiator
-    // (`res.payload.o`, passed as `initiatorOpenId`), NOT the driftable `chatOperators`
-    // Ref and NOT the bystander clicker — see the call below for why. Called from the
-    // authz gate: the token already passed `verify`, which proves the click targets the
-    // live card for this chat/thread/policy. Generic wording covers approval and
-    // user-input interactions.
-    const preserveCardForBystander = (
-      chatKey: string,
-      threadId: ThreadId,
-      messageId: string,
-      clickerOpenId: string,
-      // The initiator carried by the just-verified live token (`res.payload.o`). The
-      // re-arm re-signs the card's buttons for THIS id so the re-armed card keeps the
-      // exact same approval authority as the card the bystander clicked.
-      initiatorOpenId: string,
-    ): Effect.Effect<void> =>
-      Effect.gen(function* () {
-        yield* Console.log(
-          `[feishu-bot] cardAction ignored for chat ${chatKey} — unauthorised click; re-arming the card for the real approver.`,
-        );
-
-        // Re-arm (core §11E fix). Best-effort and fully isolated: a snapshot / render /
-        // update failure must never swallow the neutral notice below or crash the
-        // handler, so we `catchCause` it to a warning. Mirrors the M18 restart-recovery
-        // re-render (one-shot `subscribeThread` snapshot → `buildInteraction` →
-        // `renderThreadCard` → `updateCard` on the same messageId).
-        yield* Effect.gen(function* () {
-          // Re-sign the re-armed buttons for the EXACT initiator carried by the just-
-          // verified live token (`initiatorOpenId` = `res.payload.o`), passed as
-          // `buildInteraction`'s `operatorOverride`. We must NOT let `buildInteraction`
-          // resolve the operator from the live `chatOperators` Ref, which is DRIFTABLE on
-          // the observe path: a bystander who @-mentions the bot with a floor command
-          // (e.g. `/help`) on an `isChatBusy=false` observe turn (/resume takeover,
-          // chained subagent, M18 recovery) flips the idle-guarded pin to their own id
-          // WITHOUT starting a turn that would re-pin the initiator. Re-signing from that
-          // Ref would let the bystander set the new `payload.o` to themselves and then
-          // self-approve in `initiator` mode — a privilege escalation. Since a non-empty
-          // override wins over the Ref, guard on it: when `initiatorOpenId` is empty (only
-          // a non-initiator-mode / M18-recovered card whose initiator was never captured),
-          // `buildInteraction` would FALL BACK to that driftable Ref, so we SKIP the re-arm
-          // entirely rather than risk re-signing for a drifted bystander — mirroring M18
-          // recovery's refusal to re-sign empty-operator cards. The narrow cost is that
-          // such a recovered card keeps the old dead-button behaviour (no re-arm); the
-          // common case (non-empty initiator) re-arms normally and stays signed for the
-          // real approver, so the bystander stays locked out.
-          if (initiatorOpenId.length === 0) {
-            return;
-          }
-          const firstFrame = yield* Stream.runHead(
-            subscribeThread(threadId).pipe(Stream.take(1)),
-          ).pipe(
-            Effect.scoped,
-            Effect.timeout(Duration.seconds(10)),
-            Effect.option,
-            Effect.map(Option.flatten),
-          );
-          const snapshotThread = Option.match(firstFrame, {
-            onNone: () => null as OrchestrationThread | null,
-            onSome: (item) => (item.kind === "snapshot" ? item.snapshot.thread : null),
-          });
-          if (snapshotThread === null) {
-            return;
-          }
-          const interaction = yield* buildInteraction(chatKey, snapshotThread, initiatorOpenId);
-          // No live interaction (the request was resolved elsewhere while this click was
-          // in flight) → nothing to re-arm; leave the card to the normal render path.
-          if (interaction === undefined) {
-            return;
-          }
-          const density = yield* resolveDensity(chatKey, snapshotThread.runtimeMode);
-          const card = renderThreadCard(snapshotThread, {
-            streaming: false,
-            density,
-            interaction,
-          }).card;
-          yield* gateway.updateCard(messageId, card);
-        }).pipe(
-          Effect.catchCause((cause) =>
-            Effect.logWarning(
-              `[feishu-bot] bystander card re-arm failed for chat ${chatKey} (message ${messageId}).`,
-              cause,
-            ),
-          ),
-        );
-
-        const dedupKey = `${chatKey}:${messageId}:${clickerOpenId}`;
-        const alreadyNotified = yield* Ref.modify(bystanderNoticed, (set) => {
-          if (set.has(dedupKey)) return [true, set] as const;
-          const next = new Set(set);
-          next.add(dedupKey);
-          // M3b: bound the set. On overflow keep the most recent ~80% (Set iteration
-          // order ≈ insertion order) and drop the oldest keys.
-          if (next.size > MAX_BYSTANDER_KEYS) {
-            const keep = Math.floor(MAX_BYSTANDER_KEYS * 0.8);
-            return [false, new Set(Array.from(next).slice(-keep))] as const;
-          }
-          return [false, next] as const;
-        });
-        if (!alreadyNotified) {
-          // The WS card path has no native per-clicker toast, so post a short
-          // topic-anchored notice; the re-arm above keeps the same live interaction on
-          // the card, so the real approver's buttons remain actionable.
-          yield* sendNotice(
-            chatKey,
-            `<at id=${clickerOpenId}></at> 你暂时没有此操作的权限,需由授权人处理。`,
-            messageId,
-          );
-        }
-      });
-
-    /**
-     * Handle one cardAction (button click / form submit) end to end (contract B9
-     * §9). The bridge is a thin *shared* client: it verifies the signed token,
-     * durably consumes its single-use nonce, then routes the operator's decision
-     * through the SAME shared respond RPC (`respondToThreadApproval` /
-     * `respondToThreadUserInput`) every other end uses — no bridge-private
-     * approval state. Every step that can't proceed degrades the clicked card to
-     * a plain notice instead of leaving a dead button.
-     */
-    const handleCardAction = (evt: CardActionEvent): Effect.Effect<void> =>
-      Effect.gen(function* () {
-        // 1. Parse the callback value. A foreign / legacy button → ignore.
-        const parsed = parseCardActionValue(evt.action.value);
-        if (parsed === null) {
-          return;
-        }
-
-        // M3a: `CardActionEvent` carries no thread field, so the button echoes its
-        // topic id in the value (`parsed.larkThreadId`) — a PRE-VERIFY bootstrap used
-        // to locate the topic's binding (and thus its thread id) *before* the policy
-        // fingerprint can be recomputed to verify the token. It is untrusted on its
-        // own but tamper-evident: the signed fingerprint derives from the topic's
-        // thread id, so a forged/stripped `lt` resolves a different (or no) binding →
-        // a mismatched fingerprint → `verify` fails with `context-mismatch`. The
-        // signed `res.payload.lt` (read after verify succeeds) is the authoritative
-        // copy and, by that fingerprint binding, necessarily equals this bootstrap.
-        const chatKey = compositeChatKey(evt.chatId, parsed.larkThreadId);
-
-        // 2. Resolve the conversation's bound thread under the composite key. No
-        //    binding → the topic/chat is not (or no longer) driving a session; tell
-        //    the operator and stop.
-        const binding = yield* bindings.get(chatKey);
-        if (binding === null) {
-          yield* updateCardNotice(evt.messageId, "会话未接管,无法响应此操作。");
-          return;
-        }
-        const threadId = binding.threadId;
-
-        // 3. Read the thread's *current* runtimeMode from the shell cache (E②:
-        //    the verify side uses the shell's runtimeMode, which may lag the
-        //    render side's by <1s). Absent shell → treat the button as stale.
-        const shell = yield* shellCache.threadById(threadId);
-        if (shell === null) {
-          yield* updateCardNotice(evt.messageId, "⚠️ 此操作已失效。");
-          return;
-        }
-
-        // 4. Recompute the policy fingerprint for the verify context.
-        const fp = computePolicyFingerprint(evt.chatId, threadId, shell.runtimeMode);
-
-        // 5. Verify the token's INTEGRITY against the expected context. M4-1: no
-        //    `operatorOpenId` here either — authz (who may click) is decoupled from
-        //    verify and enforced by the authz gate (step 6b) below. Verify now only
-        //    proves the token is untampered and belongs to THIS chat/thread/policy
-        //    (no `action`, adjustment 2; no `operatorOpenId`, M4-1).
-        const res = auth.verify(parsed.token, {
-          runId: threadId,
-          scope: evt.chatId,
-          chatId: evt.chatId,
-          policyFingerprint: fp,
-        });
-
-        // 6. Verification failure = an INTEGRITY failure: a tampered token or a
-        //    genuinely stale card (e.g. threadId/fp changed after a `/resume` or a
-        //    runtimeMode change). M4-1: because authz is no longer folded into verify,
-        //    the live card passes verify for ANY clicker — so `context-mismatch` no
-        //    longer fires on a mere bystander click (that is now caught by the authz
-        //    gate below), only on a truly stale/foreign card. Degrade it
-        //    unconditionally; there is no live card left to preserve.
-        if (!res.ok) {
-          yield* Console.log(
-            `[feishu-bot] cardAction rejected for chat ${evt.chatId} (${res.reason}).`,
-          );
-          yield* updateCardNotice(evt.messageId, "⚠️ 按钮已失效,请回到最新卡片重新操作。");
-          return;
-        }
-
-        // 6b. Authz (M-2): verify proved integrity (this IS the live card for this
-        //     chat/thread/policy); now decide WHO may act. Owner-always (the bound
-        //     owner) overlays the per-chat three-state mode: `initiator` matches the
-        //     signed `payload.o` (the true turn initiator), `designated` the
-        //     configured approvers, `all` any chat member (any clicker of an in-chat
-        //     card is a member — no roster fetch). A non-authorised clicker is a
-        //     bystander: no-op the card (preserve it for the real approver) + neutral
-        //     @notice. MUST run BEFORE the nonce consume (step 8) so a bystander click
-        //     never burns the single-use nonce out from under the real approver.
-        const clicker = evt.operator.openId;
-        const owner = yield* Ref.get(ownerRef);
-        const chatConfig = effectiveChatConfig(
-          evt.chatId,
-          yield* Ref.get(chatConfigsRef),
-          yield* Ref.get(chatDefaultsRef),
-        );
-        const authorized = authorizeApprovalClick({
-          owner,
-          mode: chatConfig.approvalMode,
-          approvers: chatConfig.approvers,
-          clicker,
-          initiator: res.payload.o,
-        });
-        if (!authorized) {
-          yield* preserveCardForBystander(chatKey, threadId, evt.messageId, clicker, res.payload.o);
-          return;
-        }
-
-        // 7. The request must still be open & pending (it may have been answered
-        //    elsewhere, or force-resolved stale). Take a one-shot snapshot of the
-        //    thread (the subscribe stream replays a full snapshot first) and
-        //    re-derive the pending set, then locate the matching request. The
-        //    `Stream.take(1)` closes the subscription immediately (scoped read).
-        const firstFrame = yield* Stream.runHead(
-          subscribeThread(threadId).pipe(Stream.take(1)),
-        ).pipe(Effect.scoped);
-        const snapshotThread = Option.match(firstFrame, {
-          onNone: () => null as OrchestrationThread | null,
-          onSome: (item) => (item.kind === "snapshot" ? item.snapshot.thread : null),
-        });
-        const activities = snapshotThread?.activities ?? [];
-        const pendingApprovals = derivePendingApprovals(activities);
-        const pendingUserInputs = derivePendingUserInputs(activities);
-        const matchedApproval = pendingApprovals.find(
-          (approval) => approval.requestId === parsed.requestId,
-        );
-        const matchedUserInput = pendingUserInputs.find(
-          (userInput) => userInput.requestId === parsed.requestId,
-        );
-        if (matchedApproval === undefined && matchedUserInput === undefined) {
-          yield* updateCardNotice(evt.messageId, "⚠️ 此操作已失效(请求已被处理或过期)。");
-          return;
-        }
-        // #6/#8: past this guard a request matched, which is only possible when the
-        // snapshot delivered a non-empty `activities` — i.e. `snapshotThread` is
-        // non-null. The old `echoResolved` carried a `snapshotThread === null`
-        // fallback branch (a plain `updateCardNotice` with an *un-truncated*
-        // commandSummary), but that branch was unreachable for exactly this reason
-        // (dead code, and #6/#12's missing-truncation only lived there). We narrow
-        // the type here so the echo always re-renders the full card, and surface the
-        // impossible-null case as a defect rather than silently dead-pathing.
-        if (snapshotThread === null) {
-          return yield* Effect.die(
-            new Error("cardAction: matched a pending request but snapshot thread was null."),
-          );
-        }
-
-        // 8. Durably consume the single-use nonce BEFORE routing (adjustment 1:
-        //    no crash-replay window). A `false` means another delivery already
-        //    consumed it → replay; degrade and stop.
-        const consumed = yield* nonceStore
-          .consume(res.payload.n, res.payload.exp)
-          .pipe(Effect.orElseSucceed(() => false));
-        if (!consumed) {
-          yield* updateCardNotice(evt.messageId, "⚠️ 此操作已失效(重复点击)。");
-          return;
-        }
-
-        // 9. One commandId for both the respond RPC and the audit row (adjustment
-        //    6) so the durable ledger keys exactly the dispatched command.
-        const commandId = yield* genId(CommandId);
-        const requestId = ApprovalRequestId.make(parsed.requestId);
-
-        // 10. Route through the shared respond RPC. `runOnEnv` discharges
-        //     Crypto/EnvironmentSupervisor and orDies any unexpected failure.
-        const isApproval = matchedApproval !== undefined;
-        if (isApproval) {
-          const decision = actionToApprovalDecision(res.payload.a);
-          if (decision === null) {
-            yield* updateCardNotice(evt.messageId, "⚠️ 无法识别的操作。");
-            return;
-          }
-          yield* runOnEnv(respondToThreadApproval({ threadId, requestId, decision, commandId }));
-        } else {
-          const questions = matchedUserInput?.questions ?? [];
-          // The unified user-input form submits natively, so the answers ride in
-          // `evt.action.formValue`. `parsed.formValue` is a legacy fallback (the
-          // removed single-select button group) kept for value-shape stability.
-          const answers = formValueToAnswers(evt.action.formValue ?? parsed.formValue, questions);
-          yield* runOnEnv(respondToThreadUserInput({ threadId, requestId, answers, commandId }));
-        }
-
-        // 11. Append the immutable audit row under the SAME commandId.
-        const ts = yield* Clock.currentTimeMillis;
-        // M3b: record the topic the command was routed within. `evt.chatId` is the
-        // bare Feishu id; the composite `chatKey` carries the topic, so recover it
-        // via `splitChatKey` (normalises empty → undefined). exactOptionalPropertyTypes:
-        // omit the key for p2p / plain group rather than assigning `undefined`.
-        const auditLarkThreadId = splitChatKey(chatKey).larkThreadId;
-        yield* audit
-          .append(commandId, {
-            operatorOpenId: evt.operator.openId,
-            chatId: evt.chatId,
-            threadId,
-            command: res.payload.a,
-            ts,
-            ...(auditLarkThreadId !== undefined ? { larkThreadId: auditLarkThreadId } : {}),
-          })
-          .pipe(Effect.ignore);
-
-        // 12. Echo the outcome onto the clicked card by RE-RENDERING the same
-        //     thread snapshot with this request's interaction controls greyed out,
-        //     preserving the thread body — never replacing the whole card with a
-        //     bare notice (which would drop the conversation). M2b-2: we build a
-        //     structured {@link ResolvedNoticeEntry} (operator name + command
-        //     summary + decision) and hand it to `interactionCard`, which composes
-        //     the localized "✅ 已由 @X 授权 · <命令摘要>" / "🚫 … 拒绝 …" / "✅ … 提交"
-        //     line itself (truncating the summary). We persist the entry into the
-        //     chat's resolved overlay (P2) so every subsequent `driveTurn` render
-        //     tick keeps this request greyed out for the whole turn and after it
-        //     ends, then echo it onto this card now.
-        const who = yield* resolveOperatorName(evt.operator);
-        // Echo-display decision: derive it from the SAME action the respond RPC
-        // routed (line ~2380) so the greyed-out echo matches what was actually
-        // dispatched. A binary "accept vs else→decline" ternary would misclassify
-        // an `acceptForSession` click as a 拒绝 echo, so map the action explicitly.
-        // Only accept/acceptForSession/decline buttons exist (no `cancel` button),
-        // and an unrecognized action can't reach here — routing already rejected a
-        // null decision above — so decline is just a defensive default. User-input
-        // submits stay "submit".
-        const echoDecision = (action: string): ResolvedNoticeEntry["decision"] => {
-          switch (action) {
-            case "approval:accept":
-              return "accept";
-            case "approval:acceptForSession":
-              return "acceptForSession";
-            default:
-              return "decline";
-          }
-        };
-        const decision: ResolvedNoticeEntry["decision"] = isApproval
-          ? echoDecision(res.payload.a)
-          : "submit";
-        // commandSummary: for an approval, the request's detail (the command/file
-        // summary) — trimmed, `null` when empty; the renderer truncates it. A
-        // user-input submit has no single-line detail, so it is `null`.
-        const commandSummary = matchedApproval?.detail?.trim() || null;
-        const entry: ResolvedNoticeEntry = {
-          operatorName: who,
-          commandSummary,
-          decision,
-        };
-
-        // P2: record the overlay BEFORE echoing so any render tick racing this
-        // handler already sees the request as resolved. M3a: keyed by the composite
-        // `chatKey` so every subsequent `driveTurn`/observe render of THIS topic
-        // (which read the overlay under the same composite key) keeps it greyed out.
-        yield* Ref.update(chatResolvedNotices, (map) => {
-          const forChat = new Map(map.get(chatKey) ?? new Map<string, ResolvedNoticeEntry>());
-          forChat.set(parsed.requestId, entry);
-          return new Map(map).set(chatKey, forChat);
-        });
-
-        const echoResolved = (): Effect.Effect<void> =>
-          Effect.gen(function* () {
-            const operatorOpenId = evt.operator.openId;
-            const ctx: InteractionContext = {
-              // The token's `c`/`scope` is the real Feishu chatId (matched at verify
-              // against `evt.chatId`); the topic id rides in `larkThreadId` so any
-              // *other* still-pending request re-signed on this echo card stays
-              // topic-bound. Omitted for p2p / non-topic (token unchanged pre-M3a).
-              chatId: evt.chatId,
-              threadId,
-              operatorOpenId,
-              runtimeMode: shell.runtimeMode,
-              auth,
-              ttlMs: CALLBACK_TOKEN_TTL_MS,
-              ...(parsed.larkThreadId !== undefined ? { larkThreadId: parsed.larkThreadId } : {}),
-            };
-            const resolvedNotice = new Map<string, ResolvedNoticeEntry>([
-              [parsed.requestId, entry],
-            ]);
-            const elements = renderInteractionSection(
-              pendingApprovals,
-              pendingUserInputs,
-              staleRequestIdsOf(activities),
-              resolvedNotice,
-              ctx,
-            );
-            const density = yield* resolveDensity(chatKey, snapshotThread.runtimeMode);
-            const card = renderThreadCard(snapshotThread, {
-              streaming: false,
-              density,
-              interaction: { elements },
-            }).card;
-            yield* gateway.updateCard(evt.messageId, card).pipe(
-              Effect.tapError((error) =>
-                Console.error(
-                  `[feishu-bot] card echo failed for ${evt.messageId}: ${error.message}`,
-                ),
-              ),
-              Effect.ignore,
-            );
-          });
-
-        // Approval (plain button) echoes immediately. A user-input *form* submit
-        // is gated by Feishu's ~1s client-side form lock (FORM_SETTLE_MS); a
-        // button-group tap is not a native form submit so it echoes immediately
-        // too. Native form submit is detected by `evt.action.formValue != null`
-        // (the SDK only fills it on a form submit; a button-group tap carries its
-        // answer in `parsed.formValue`/`value`). The settled echo is fired off
-        // the handler so the cardAction callback returns promptly.
-        const isNativeFormSubmit = !isApproval && evt.action.formValue != null;
-        if (isNativeFormSubmit) {
-          runFork(Effect.sleep(FORM_SETTLE_DELAY).pipe(Effect.andThen(echoResolved())));
-        } else {
-          yield* echoResolved();
-        }
-      });
+    // The click handler (verify → authz → nonce-consume → route → audit → echo)
+    // lives in its module; its private bystander re-arm and operator-name cache
+    // are constructed inside. Built after `runFork` — the form-settle echo forks
+    // onto the bridge's scoped FiberSet runtime.
+    const cardAction = yield* makeCardActionHandler({
+      auth,
+      nonceStore,
+      audit,
+      bindings,
+      shellCache,
+      gateway,
+      ownerRef,
+      chatConfigsRef,
+      chatDefaultsRef,
+      chatResolvedNotices,
+      buildInteraction,
+      resolveDensity,
+      subscribeThread,
+      updateCardNotice,
+      sendNotice,
+      runOnEnv,
+      genId,
+      runFork,
+    });
+    const { handleCardAction } = cardAction;
 
     // Consumer: fork one handler per message so the queue's idle-window coalesce
     // works (the SDK callback already decoupled intake). Offline first-contact is
