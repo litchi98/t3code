@@ -1,9 +1,7 @@
 import { connectionProjectionPhase, EnvironmentRegistry } from "@t3tools/client-runtime/connection";
 import {
-  createThread,
   respondToThreadApproval,
   respondToThreadUserInput,
-  startThreadTurn,
 } from "@t3tools/client-runtime/operations";
 import * as EnvironmentRpc from "@t3tools/client-runtime/rpc";
 import {
@@ -14,7 +12,6 @@ import {
   ApprovalRequestId,
   CommandId,
   type FeishuChatConfig,
-  MessageId,
   ModelSelection,
   ORCHESTRATION_WS_METHODS,
   type OrchestrationThread,
@@ -25,7 +22,6 @@ import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Console from "effect/Console";
 import * as Crypto from "effect/Crypto";
-import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FiberSet from "effect/FiberSet";
@@ -75,38 +71,26 @@ import {
   anchorOf,
   compositeChatKey,
   densityForRuntime,
-  deriveThreadId,
-  ensureThreadForChat,
-  refusesFullAccessTakeover,
   resolveRenderDensity,
-  runtimeModeForChatType,
   splitChatKey,
 } from "./bridge/chatThreadMap.ts";
-import { deriveCommandId } from "./bridge/commandId.ts";
 import { type RenderDensity, renderThreadCard } from "./bridge/eventRenderer.ts";
-import { observeThread, type ThreadObservation } from "./bridge/session.ts";
-import { type MergedDispatch, TurnQueue, turnQueueLayer } from "./bridge/turnQueue.ts";
+import { TurnQueue, turnQueueLayer } from "./bridge/turnQueue.ts";
 import { OutboundQueue, outboundQueueLayer } from "./bridge/outbound.ts";
 import { BindingState, bindingStateLayer } from "./bridge/bindingState.ts";
 import { WorkspaceState, workspaceStateLayer } from "./bridge/workspaceState.ts";
-import {
-  createRejectedNoticeText,
-  noProviderNoticeText,
-  OfflineRetry,
-  runOfflineCreateFlush,
-  turnRejectedNoticeText,
-  workspaceCollisionOutlet,
-} from "./bridge/createIntent.ts";
 import { runShellCacheFiber } from "./bridge/shellCache.ts";
 import { runShellWatcherFiber } from "./bridge/shellWatcher.ts";
 import { tryHandleCommand } from "./bridge/commands/registry.ts";
 import { buildCommandTable } from "./bridge/commands/handlers.ts";
 import { resolveModelSelection } from "./bridge/modelSelection.ts";
 import { makeEnvAccess } from "./bridge/envAccess.ts";
-import { makeNotices, topicSendOpts } from "./bridge/notices.ts";
+import { makeNotices } from "./bridge/notices.ts";
 import { makeObserveMirror } from "./bridge/observeMirror.ts";
 import { makeWorkspaceGate } from "./bridge/workspaceGate.ts";
 import { makeWorkspaceOps } from "./bridge/workspaceOps.ts";
+import { makeTurnRunner } from "./bridge/turnRunner.ts";
+import { makeEnsureThread } from "./bridge/ensureThread.ts";
 import {
   CALLBACK_TOKEN_TTL_MS,
   makeInteractionBuilder,
@@ -493,75 +477,54 @@ const runBoundSession = (
     // low, 1:1 private-chat traffic.
     const ensureLock = yield* Semaphore.make(1);
 
-    // Per-chat turn lock: guarantees at most one turn runs for a chat at a time
-    // regardless of path. The live queue's `running` flag already serialises
-    // *live* turns, but a turn replayed from the outbound flush on reconnect does
-    // not pass through `offer` and so would otherwise be invisible to that flag —
-    // this lock keeps a flushed turn from dispatching concurrently with a fresh
-    // live turn on the same thread (which would steer/overwrite the agent). Locks
-    // are created lazily per chat and never reaped (one tiny Semaphore per chat is
-    // negligible for M1's 1:1 traffic).
-    const chatTurnLocks = yield* Ref.make<ReadonlyMap<string, Semaphore.Semaphore>>(new Map());
-    const withChatTurnLock = <A, E>(chatId: string, effect: Effect.Effect<A, E>) =>
-      Ref.modify(
-        chatTurnLocks,
-        (map): readonly [Semaphore.Semaphore, ReadonlyMap<string, Semaphore.Semaphore>] => {
-          const existing = map.get(chatId);
-          if (existing !== undefined) {
-            return [existing, map];
-          }
-          const created = Semaphore.makeUnsafe(1);
-          return [created, new Map(map).set(chatId, created)];
-        },
-      ).pipe(Effect.flatMap((lock) => lock.withPermits(1)(effect)));
+    // M2b-3 / M8: the per-chat turn runner (turn lock, live card/observer drive,
+    // offline buffering). Constructed after `observeMirror` (needs `stopObserve` /
+    // `renderObservationToCard`); the mutually-recursive `runTurn`/`offlineBuffer`
+    // live inside its module. §5.14 red line: the runner uses the bare
+    // `registry`/`environmentId`/`crypto` (NOT `runOnEnv`) so the offline typed
+    // errors survive to `catchTags`.
+    const turnRunner = yield* makeTurnRunner({
+      registry,
+      environmentId,
+      crypto,
+      turnQueue,
+      sent,
+      outbound,
+      gateway,
+      stopObserve,
+      renderObservationToCard,
+      resolveDensity,
+      sendNotice,
+      subscribeThread,
+      placeholderThread,
+      genId,
+      perTurnModelSelection,
+    });
+    const { runTurn, offlineBuffer } = turnRunner;
 
-    // Chats with an offline `createThread` already buffered this session, so a
-    // *second* offline message for the same brand-new chat does not enqueue a
-    // second create (which would hit the server's "thread already exists"
-    // invariant — distinct create commandIds, same deterministic threadId). The
-    // binding is persisted by the create intent *on success* (not optimistically),
-    // so this in-memory set and the in-memory outbound queue are lost together on
-    // a crash — a restart then re-creates the thread cleanly rather than pointing
-    // a persisted binding at a thread that was never created.
-    const pendingCreates = yield* Ref.make<ReadonlySet<string>>(new Set());
-
-    /**
-     * Build the `ThreadTurnStart` command for a merged dispatch. Stable
-     * commandId, NO `createdAt` (M9/M19); a fresh `MessageId` per attempt is fine
-     * (the server keys idempotency on the stable `commandId`, not the messageId).
-     *
-     * `modelSelection` is attached ONLY when an explicit `T3_MODEL` override is
-     * set (`perTurnModelSelection !== null`); in that case every turn is pinned
-     * to the bot-resolved model. Without an override it is omitted so the server
-     * keeps the thread's persistent model — preserving the creation-time choice
-     * and any model switch made by another end (M2). See `perTurnModelSelection`.
-     */
-    const buildTurnStart = (threadId: ThreadId, dispatch: MergedDispatch) =>
-      genId(MessageId).pipe(
-        Effect.map((messageId) =>
-          startThreadTurn({
-            commandId: dispatch.commandId,
-            threadId,
-            message: { messageId, role: "user", text: dispatch.prompt, attachments: [] },
-            ...(perTurnModelSelection === null ? {} : { modelSelection: perTurnModelSelection }),
-            // M3a: per-turn runtimeMode tracks the chat type of the message(s) that
-            // drove this turn — p2p stays `full-access`, group/topic is
-            // `approval-required`. A dispatched batch always carries ≥1 source
-            // message; the `?? "p2p"` keeps the legacy `full-access` default in the
-            // (unreachable) empty case so existing p2p behaviour is byte-identical.
-            //
-            // NOTE: for an *already-existing* thread this field is INERT — the
-            // server pins `runtimeMode` at thread-creation time and `turn.start`
-            // resolves the active mode from `targetThread.runtimeMode`
-            // (decider.ts), IGNORING this command value. It is carried only because
-            // `ThreadTurnStart` requires it; it does NOT re-assert per-turn policy.
-            // (The group/topic safety gate that matters lives at thread creation +
-            // the `/resume` full-access gate, not here.)
-            runtimeMode: runtimeModeForChatType(dispatch.sources[0]?.message.chatType ?? "p2p"),
-            interactionMode: "default",
-          }),
-        ),
-      );
+    // M-1: first-contact thread resolution (get-or-create, adopt-if-exists,
+    // offline-buffered create). Constructed after `workspaceGate` and before the
+    // command table, which reads its `hasPendingCreate` probe. §5.7: the caller
+    // (`handleInbound`) must hold `ensureLock` around each `ensureThread` call.
+    const ensureThreadHandle = yield* makeEnsureThread({
+      bindings,
+      shellCache,
+      sent,
+      outbound,
+      isEnvReady,
+      runOnEnv,
+      genId,
+      sendNotice,
+      environmentId,
+      groupChatDensity,
+      config,
+      workspace,
+      selectedWorkspaceFor,
+      senderMayUseProjectAtDispatch,
+      workspaceGateText,
+      workspaceRevokedText,
+    });
+    const { ensureThread, hasPendingCreate } = ensureThreadHandle;
 
     // Reverse-notification + reconciliation watcher. One fiber folding the shared
     // `shellCache.changes`: it reconciles dangling bindings (thread deleted /
@@ -623,11 +586,7 @@ const runBoundSession = (
       workspace: { get: workspace.get, select: workspace.select },
       createWorkspaceProject,
       cloneRepository: cloneWorkspaceRepository,
-      // Review fix C①: `/workspace switch` gate 3 — a buffered first-contact
-      // create captured its project at buffer time, so the selection must not
-      // change out from under it while it waits for the reconnect flush.
-      hasPendingCreate: (chatKey) =>
-        Ref.get(pendingCreates).pipe(Effect.map((set) => set.has(chatKey))),
+      hasPendingCreate,
       // M-3: per-chat authz inputs — the live owner open_id + the effective
       // per-chat config resolver (bare chatId grain, mirroring the approval gate
       // at ~3040). The `/workspace` + `/resume` authorization gates read these;
@@ -644,670 +603,6 @@ const runBoundSession = (
           }),
       },
     });
-
-    // Drive the live card + observer + completion for an already-dispatched turn.
-    // `cardDone` is resolved on EVERY exit (success/failure/interrupt) so the SDK
-    // stream producer always exits and `stream()` settles — never a parked
-    // producer (the LOW cardDone finding). Requires a `Scope`: the per-tick card
-    // updater is `forkScoped` onto the caller's turn scope (`runTurn`'s
-    // `Effect.scoped`), so it is interrupted when the turn ends.
-    const driveTurn = (
-      // M3a: composite `chatId[:larkThreadId]` key. The render loop keys state by
-      // it (via `renderObservationToCard`); the card is opened on the real Feishu
-      // chatId, and — for a topic, with the triggering message as the in-thread
-      // reply anchor — posted *inside* that topic.
-      chatId: string,
-      threadId: ThreadId,
-      observation: ThreadObservation,
-      // The Feishu message id that triggered this turn (the topic reply anchor),
-      // or `undefined` (flush/replay with no live trigger) → post at the root.
-      replyToMessageId?: string,
-      // Fix 1(a) (M3a): the open id of *this turn's initiator* (the sender of the
-      // turn's first source message), pinned for the whole turn. Forwarded as the
-      // `operatorOverride` to `renderObservationToCard` so every live tick signs
-      // the approval/user-input buttons (and persists the handle) for the
-      // initiator — NOT for whoever last @-mentioned the bot mid-turn (a group
-      // hazard: a later `@bot` would otherwise re-sign the buttons to a bystander
-      // who could then approve, and lock the real initiator out). `undefined`
-      // (unreachable empty dispatch) falls back to the live Ref. For p2p the
-      // initiator equals the chat owner equals the Ref value → byte-identical.
-      initiatorOperatorOpenId?: string,
-    ): Effect.Effect<void, never, Scope.Scope> =>
-      Effect.gen(function* () {
-        const cardDone = yield* Deferred.make<void>();
-        yield* Effect.gen(function* () {
-          // M-3 PR-C3: resolve the placeholder first-frame density through the same
-          // per-chat > binding > runtime overlay the real frames use (no density jump
-          // when a per-chat override lowers this chat below `card`).
-          const placeholderDensity = yield* resolveDensity(chatId, placeholderThread.runtimeMode);
-          const initial = renderThreadCard(placeholderThread, {
-            streaming: true,
-            density: placeholderDensity,
-          }).card;
-
-          // M3a: real Feishu chatId + (topic-only) in-thread reply opts. driveTurn
-          // anchors to THIS turn's triggering message (`replyToMessageId`) — its
-          // freshest in-topic message — not the binding anchor (red line: unchanged).
-          const { chatId: realChatId, larkThreadId } = splitChatKey(chatId);
-          const sendOpts = topicSendOpts(larkThreadId, replyToMessageId);
-          const card = yield* gateway
-            .startStreamingCard(realChatId, initial, { done: Deferred.await(cardDone) }, sendOpts)
-            .pipe(
-              // A failed card start must not abort the turn; the agent still runs.
-              Effect.tapError((error) =>
-                Console.error(`[feishu-bot] streaming card failed to start: ${error.message}`),
-              ),
-              Effect.option,
-            );
-
-          // Push each render tick to the card (best-effort; throttled by the SDK).
-          const handle = Option.isSome(card) ? card.value : null;
-          if (handle !== null) {
-            // The whole render loop (per-tick + terminal render + handle persistence)
-            // is the shared `renderObservationToCard` helper (M2b-3 DRY): identical
-            // behaviour to the prior inline body. Fix 1(a): pin this turn's initiator
-            // as the operator override so the live card's buttons stay signed for the
-            // initiator across the whole turn.
-            yield* renderObservationToCard(
-              chatId,
-              threadId,
-              observation,
-              handle,
-              initiatorOperatorOpenId,
-            );
-          } else {
-            // No card handle: still wait for the turn to settle (so the SDK
-            // producer / completion path resolves identically).
-            const outcome = yield* observation.completion;
-            yield* Console.log(
-              `[feishu-bot] turn ${outcome.kind} on thread ${threadId}` +
-                (outcome.kind === "failed" ? ` (status=${outcome.status}).` : "."),
-            );
-          }
-        }).pipe(
-          // Whatever happens, release the SDK producer so the card settles into
-          // its terminal (non-streaming) form instead of parking forever.
-          Effect.ensuring(Deferred.succeed(cardDone, undefined)),
-        );
-      });
-
-    /**
-     * What to do when a turn dispatch finds the environment offline. Two callers:
-     *  - **live** (`offlineBuffer`): give a ⏳ receipt and buffer a *flush* turn so
-     *    the reconnect re-runs the full pipeline. Succeeds (the live message is now
-     *    safely queued; the running flag is released by the completion path).
-     *  - **flush** (`offlineRetry`): the environment dropped *again* mid-flush —
-     *    **fail** with `OfflineRetry` so the outbound queue keeps the intent + its
-     *    ⏳ and retries on the next flush (never records it as sent, never drops).
-     */
-    type OfflineStrategy = (params: {
-      readonly chatId: string;
-      readonly dispatch: MergedDispatch;
-      readonly feishuMessageId: string;
-    }) => Effect.Effect<void, OfflineRetry>;
-
-    const offlineRetry: OfflineStrategy = () => Effect.fail(new OfflineRetry());
-
-    const offlineBuffer: OfflineStrategy = ({ chatId, dispatch, feishuMessageId }) =>
-      Effect.gen(function* () {
-        yield* Console.log(
-          `[feishu-bot] environment offline; queued turn for chat ${chatId} (⏳).`,
-        );
-        // Buffer the full turn: on reconnect the flush re-runs `runTurn` with the
-        // `offlineRetry` strategy, so a mid-flush re-drop fails the intent (keeping
-        // it + its ⏳) rather than self-enqueuing under the `offlineBuffer` path.
-        // The turn target rides in `dispatch.resolvedThreadId` (B1).
-        yield* outbound.enqueue({
-          commandId: dispatch.commandId,
-          feishuMessageId,
-          run: runTurn(chatId, dispatch, offlineRetry),
-        });
-      });
-
-    /**
-     * Drive a single turn for `chatId` end to end.
-     *
-     * Accounting model (H3 reconnect-flush regression fix). Every turn — live or
-     * flushed/replayed off the outbound queue — owns the chat's running slot for
-     * exactly its lifetime:
-     *  1. **Begin (inside the lock, before dispatch):** `beginTurn` mints a fresh
-     *     ownership token and (idempotently) marks the slot running. A live turn
-     *     already had `running` set by `offer`; a flushed/replay turn — which never
-     *     passed through `offer` — gets it set here. Either way, messages arriving
-     *     while this turn runs are *held*, not steered (invariant: a flushed turn
-     *     still holds new traffic correctly).
-     *  2. **Settle (inside the lock, on EVERY exit, before release):** the turn's
-     *     finalizer calls `onTurnComplete(chatId, token)`. The queue only mutates
-     *     state when `token` still owns the slot, so this turn settles *exactly*
-     *     the `running`/`held` it claimed — a flushed turn can never clobber a live
-     *     turn's running flag or drain its held messages (the bug). Because the
-     *     settle runs *before the lock releases*, the next same-chat turn cannot
-     *     begin until this one's accounting is committed ("settle before yield").
-     *  3. **Chain (outside the lock):** if the settle drained held messages, the
-     *     follow-up `runTurn` is dispatched *after the lock is released*, so it can
-     *     re-acquire the same chat lock without self-deadlock.
-     *
-     * 1:1 pairing: each `beginTurn` is settled by exactly one matching
-     * `onTurnComplete`; non-owning completions are no-ops. So `running`-true count
-     * and settling count stay balanced even when a reconnect flush overlaps live
-     * traffic on the same chat.
-     *
-     * Ordering rule (M0-verified trap): `observeThread` opens the subscription
-     * *before* `startThreadTurn` dispatches, so no turn event is missed and the
-     * dispatch never races a not-yet-ready session.
-     *
-     * Offline recovery (M8): if the dispatch finds the environment unavailable /
-     * not yet registered, `onOffline` decides — the live caller buffers the *whole*
-     * turn (card, observer, completion) as an outbound intent that re-runs this
-     * same `runTurn` on reconnect (⏳ meanwhile); the flush caller fails with
-     * `OfflineRetry` so the queue retries it. Either way the buffered turn flows
-     * through the identical streaming pipeline and re-joins the queue's running/
-     * completion coordination — never a bare, observer-less dispatch.
-     */
-    const runTurn = (
-      chatId: string,
-      dispatch: MergedDispatch,
-      onOffline: OfflineStrategy,
-    ): Effect.Effect<void, OfflineRetry> =>
-      Effect.gen(function* () {
-        // Single source of truth for *this* turn's target (B1 re-bind TOCTOU fix).
-        // The dispatch carries the threadId resolved at the same instant its
-        // commandId was derived (`turnQueue` → `mergeMessages`); we dispatch and
-        // observe against *that* exact value. `runTurn` deliberately takes NO
-        // separate threadId argument — the caller (`handleInbound`) used to pass a
-        // threadId captured back at `ensureThread`, which a concurrent `/resume`
-        // re-bind could have made stale, leaving the commandId's embedded threadId
-        // and the turn's real target pointing at different threads. By driving
-        // both from the dispatch's own resolution, they are one and the same by
-        // construction and cannot drift. With no concurrent re-bind this equals
-        // the thread `ensureThread` ensured exists.
-        const target = dispatch.resolvedThreadId;
-
-        // The held follow-up the settle drained (if any). Written by the in-lock
-        // settle finalizer; read by the out-of-lock chain finalizer below. A Ref
-        // (not a closure result) because the settle runs inside an `onExit`
-        // finalizer whose value cannot otherwise reach the chain step.
-        const followUp = yield* Ref.make<MergedDispatch | null>(null);
-
-        yield* Effect.gen(function* () {
-          // Own the running slot for this turn's whole critical section. Done
-          // first, inside the lock, so ownership is established before the
-          // dispatch and settled before the lock releases (settle-before-yield).
-          // A flushed/replay turn (which bypassed `offer`) sets `running` here, so
-          // messages arriving while it runs are held — never steering it.
-          const token = yield* turnQueue.beginTurn(chatId);
-
-          // M2b-3: driveTurn > observe. The bridge is now driving its OWN turn for
-          // this chat, so it must be the single render source — preempt any resident
-          // cross-end observe fiber (a takeover mirror) before `driveTurn` opens its
-          // card, or two streaming cards would fight over the same chat. Interrupting
-          // the observe closes its child scope (unsubscribes the thread); idempotent
-          // no-op when nothing is observing. `ensureObserving`'s `isChatBusy` gate
-          // then keeps observe from restarting while this turn owns the running slot.
-          yield* stopObserve(chatId);
-
-          yield* Effect.gen(function* () {
-            // Local idempotency pre-check (M9): a stable commandId already recorded
-            // as sent means a prior attempt/delivery dispatched this exact turn.
-            // Short-circuit so a crash-recovery replay never double-dispatches (the
-            // server's commandReceipt store is the second line of defence).
-            const already = yield* sent
-              .has(dispatch.commandId)
-              .pipe(Effect.orElseSucceed(() => false));
-            if (already) {
-              yield* Console.log(
-                `[feishu-bot] skipping already-dispatched turn for chat ${chatId} (commandId seen).`,
-              );
-              return;
-            }
-
-            // Subscribe BEFORE dispatching (M0-verified ordering trap). Observe
-            // the dispatch's own resolved target so card/observer follow exactly
-            // what the commandId encodes (B1).
-            const observation = yield* observeThread(target, { subscribe: subscribeThread });
-
-            const turnStart = yield* buildTurnStart(target, dispatch);
-
-            // Attempt the dispatch. If the environment is unavailable / not yet
-            // connected (M8), hand off to `onOffline` (buffer live / retry on
-            // flush) instead of dropping; the re-dispatch is idempotent under the
-            // stable commandId. Skip the live card here — there is no live turn to
-            // stream yet.
-            const triggerMessageId = dispatch.sources[0]?.message.messageId ?? dispatch.commandId;
-            const dispatched = yield* registry.run(environmentId, turnStart).pipe(
-              Effect.provideService(Crypto.Crypto, crypto),
-              Effect.as("dispatched" as const),
-              Effect.catchTags({
-                EnvironmentRpcUnavailableError: () => Effect.succeed("offline" as const),
-                EnvironmentNotRegisteredError: () => Effect.succeed("offline" as const),
-              }),
-              // Review fix A③ / turn-intent backstop: any OTHER failure is the
-              // server actively rejecting this dispatch (thread missing after a
-              // dropped create, previously-rejected receipt, validation). It
-              // used to `orDie` — which silently LOST the message on the live
-              // path and carried the intent over FOREVER on the flush path
-              // (dispatchOne retries every failure). A rejection is terminal
-              // for this exact commandId: settle the intent (success → queue
-              // consumes it, ⏳ cleared) and tell the user visibly instead.
-              Effect.catchCause((cause) =>
-                Effect.logWarning(
-                  `[feishu-bot] turn dispatch rejected by the server for chat ${chatId}; dropping with a visible notice.`,
-                  cause,
-                ).pipe(Effect.as("rejected" as const)),
-              ),
-            );
-            if (dispatched === "offline") {
-              yield* onOffline({ chatId, dispatch, feishuMessageId: triggerMessageId });
-              return;
-            }
-            if (dispatched === "rejected") {
-              yield* sendNotice(
-                chatId,
-                turnRejectedNoticeText,
-                dispatch.sources[0]?.message.messageId,
-              );
-              return;
-            }
-            // Record the dispatch as sent (M9) so a later replay/flush short-circuits.
-            yield* sent.add(dispatch.commandId).pipe(Effect.ignore);
-            yield* Console.log(`[feishu-bot] started turn on thread ${target} for chat ${chatId}.`);
-
-            // M3a: pass the *real* triggering Feishu message id (not the commandId
-            // fallback `triggerMessageId` uses for the offline receipt) as the topic
-            // reply anchor — `topicSendOpts` only emits in-thread send opts when this
-            // is a genuine message id, so a flush/replay with no live source posts at
-            // the root instead of replying to a non-message id.
-            //
-            // Fix 1(a): also pin this turn's *initiator* (the sender of the first
-            // source message) as the live card's operator override, so the approval
-            // buttons stay signed for the initiator for the turn's whole lifetime
-            // (and not for a later mid-turn `@bot` from a bystander).
-            yield* driveTurn(
-              chatId,
-              target,
-              observation,
-              dispatch.sources[0]?.message.messageId,
-              dispatch.sources[0]?.message.senderId,
-            );
-          }).pipe(
-            // Per-turn scope: tears down the thread subscription + card update
-            // fiber on this turn's exit (inside the lock so teardown completes
-            // before the next same-chat turn begins).
-            Effect.scoped,
-            // Settle on EVERY exit — success, failure, defect, interrupt, offline
-            // branch alike — and STILL INSIDE THE LOCK, so the next same-chat turn
-            // cannot begin before this turn's running/held accounting is committed.
-            // The queue's token guard makes the settle a no-op unless this turn
-            // owns the slot, so it releases *exactly* the `running`/`held` it
-            // claimed — a flushed turn can never clobber a live turn's slot (the
-            // bug). The drained held follow-up is stashed for the chain finalizer
-            // below; nothing re-dispatches under the lock (would self-deadlock).
-            Effect.onExit(() =>
-              turnQueue
-                .onTurnComplete(chatId, token)
-                .pipe(Effect.flatMap((next) => Ref.set(followUp, next))),
-            ),
-          );
-        }).pipe(
-          (body) => withChatTurnLock(chatId, body),
-          // Chain on EVERY exit, OUTSIDE the lock (mirrors the original finalizer's
-          // every-exit guarantee, but now self-deadlock-free): the held follow-up's
-          // `runTurn` re-acquires the same chat lock and `beginTurn`s afresh, so it
-          // must run only after this turn released the lock. Its own failure is
-          // swallowed so it can never mask this turn's exit.
-          //
-          // Offline strategy for the chain (LOW message-loss fix). The drained held
-          // batch is a set of *new* messages this turn captured while running — it
-          // is NOT part of any existing outbound intent's retry. So the chain must
-          // re-dispatch it under `offlineBuffer` (independent re-buffer as a *new*
-          // intent), NOT the parent `onOffline`. Were it to inherit a flush-path
-          // `offlineRetry`, a re-drop here would raise `OfflineRetry` that only the
-          // parent intent's outbound entry re-queues — and that entry replays the
-          // *original* prompt, never this held batch; meanwhile this chain turn's
-          // own settle already cleared `running`, so the held batch would be neither
-          // re-buffered nor re-held → silently dropped. `offlineBuffer` instead
-          // buffers the held batch as its own outbound intent (with a fresh ⏳),
-          // so a re-drop keeps it for the next flush. (The live path already used
-          // `offlineBuffer`, so for a live-origin chain this is unchanged.)
-          Effect.onExit(() =>
-            Ref.get(followUp).pipe(
-              Effect.flatMap((next) =>
-                next === null
-                  ? Effect.void
-                  : // The follow-up carries its own freshly-resolved threadId (from
-                    // `onTurnComplete`'s merge); `runTurn` dispatches against that (B1).
-                    runTurn(chatId, next, offlineBuffer).pipe(Effect.ignore),
-              ),
-            ),
-          ),
-        );
-      });
-
-    /**
-     * Resolve the chat's bound thread, creating one on first contact. Serialised
-     * under `ensureLock` so two concurrent first messages can't race into two
-     * threads (and, while offline, can't enqueue two conflicting `createThread`s).
-     *
-     * Always returns the chat's threadId. The threadId is *deterministic* from the
-     * chatId (`deriveThreadId`) — the same value the persistent binding holds and
-     * the same value the turn queue resolves for the stable commandId — so the
-     * merged dispatch's commandId is correct whether or not the binding has been
-     * persisted yet.
-     *
-     * Outcomes:
-     *  - already bound → the bound `threadId`.
-     *  - unbound + no valid workspace selection (M-1) → notice + `null` (the
-     *    handleInbound gate is the first line; this re-check is authoritative
-     *    at create time — the project may have been deleted in between).
-     *  - unbound + the deterministic threadId already EXISTS on the server
-     *    (M-1 adopt-if-exists): same project → re-bind to it (no create);
-     *    other project / archived → notice + `null` (the server rejects a
-     *    create for an existing id — `requireThreadAbsent` — and
-     *    `deriveThreadId` is intentionally project-agnostic, so the id cannot
-     *    be re-minted under the new workspace).
-     *  - unbound + ready → online `createThread` + persist → the new `threadId`.
-     *    A mid-create environment drop falls back to the offline buffer.
-     *  - unbound + offline → ⏳/notice + buffered create intent (binding persisted
-     *    on flush success) → the (deterministic) `threadId`. The turn is buffered
-     *    separately by `runTurn`'s offline branch. The buffered create resolves
-     *    its model selection at FLUSH time (the resolve needs a live RPC).
-     */
-    const ensureThread = (message: InboundMessage): Effect.Effect<ThreadId | null> =>
-      Effect.gen(function* () {
-        // M3a: a Feishu topic backs its own thread, so every binding op keys on the
-        // composite `chatId[:larkThreadId]` (byte-identical to the bare chatId for
-        // p2p / plain group). `runtimeMode` is per chat type (p2p full-access;
-        // group/topic approval-required) and injected into both create paths.
-        const larkThreadId = anchorOf(message);
-        const chatKey = compositeChatKey(message.chatId, larkThreadId);
-        const runtimeMode = runtimeModeForChatType(message.chatType);
-
-        // M2a: resolve the chat's *current* binding from the in-memory authority
-        // (BindingState), not the store directly. A `/resume` takeover may have
-        // re-pointed this chat at another end's thread (origin "resumed"); either
-        // origin is honoured here by using the binding's threadId verbatim.
-        const existing = yield* bindings.get(chatKey);
-        if (existing !== null) {
-          return existing.threadId;
-        }
-
-        // M-1 dispatch-time workspace re-check (second line; the handleInbound
-        // gate already screened, but the project can be deleted between the two).
-        const selected = yield* selectedWorkspaceFor(chatKey);
-        if (selected.kind !== "ok") {
-          yield* sendNotice(chatKey, workspaceGateText(selected), message.messageId);
-          return null;
-        }
-        // M-3: even a live "ok" selection may have been narrowed out of the chat's
-        // authorized set since it was chosen (a config change). Refuse rather than
-        // create a thread on a now-unauthorized workspace. Owner exempt.
-        if (!(yield* senderMayUseProjectAtDispatch(message, selected.project.id))) {
-          yield* sendNotice(chatKey, workspaceRevokedText, message.messageId);
-          return null;
-        }
-        const project = selected.project;
-
-        // First contact. Derive the deterministic threadId up front so both the
-        // online and offline create paths agree on it (and on the stable create
-        // commandId), making re-delivery idempotent against the server. The topic
-        // is folded into the derivation so a topic gets a distinct thread id.
-        const threadId = deriveThreadId(message.chatId, larkThreadId);
-
-        // M-1 adopt-if-exists. The server REJECTS a create whose threadId
-        // already exists (`requireThreadAbsent`, commandInvariants.ts) — and a
-        // thread with this derived id can only have been self-created by an
-        // earlier epoch of this very conversation (before a `/release`). So:
-        //   - live + same project  → re-bind (adopt), no create dispatched;
-        //     this also heals the plain `/release` → next-message flow, which
-        //     would otherwise create-collide and wedge in the offline buffer.
-        //   - live + other project → refuse: the deterministic id is taken
-        //     (`deriveThreadId` stays project-agnostic by design — the M3a
-        //     zero-re-bind red line), so this conversation cannot self-create
-        //     under the newly selected workspace. `/resume` still works.
-        //   - archived             → refuse (the create would be rejected, and
-        //     an archived thread cannot run turns). NOTE: normally UNREACHABLE
-        //     — the shell snapshot does not carry archived/deleted threads —
-        //     kept as a defensive fast path; the authoritative backstop for
-        //     "id occupied by a thread the snapshot cannot see" is the
-        //     rejected-create disposition below (review fix B).
-        // Reads the last-known shell snapshot — present whenever the M-1 gate
-        // above passed (an "ok" selection implies a seeded snapshot).
-        const collided = yield* shellCache.threadById(threadId);
-        if (collided !== null) {
-          if (collided.archivedAt !== null) {
-            yield* sendNotice(
-              chatKey,
-              "此对话之前的会话已归档,无法在同一对话中自动重建(会话 ID 由对话唯一决定)。" +
-                workspaceCollisionOutlet(message.chatType),
-              message.messageId,
-            );
-            return null;
-          }
-          if (collided.projectId !== project.id) {
-            yield* sendNotice(
-              chatKey,
-              "此对话之前已在另一个工作区创建过会话,无法在当前工作区新建(会话 ID 由对话唯一决定)。" +
-                workspaceCollisionOutlet(message.chatType),
-              message.messageId,
-            );
-            return null;
-          }
-          // Review fix D: the adopt re-bind is a takeover like `/resume`, so it
-          // must honour the SAME M3a full-access gate (shared predicate) — a
-          // group/topic chat must not silently re-bind a full-access thread.
-          if (refusesFullAccessTakeover(runtimeMode, collided.runtimeMode)) {
-            yield* sendNotice(
-              chatKey,
-              "⚠️ 此对话的历史会话为 full-access(全权限)模式,群聊/话题不可重新绑定全权限会话,以免无人值守执行破坏性操作。请在 web 端处理该会话,或在新话题中开始。",
-              message.messageId,
-            );
-            return null;
-          }
-          yield* bindings.bind(chatKey, {
-            threadId,
-            origin: "self-created",
-            topicAnchorMessageId: message.messageId,
-            density: densityForRuntime(runtimeMode, groupChatDensity),
-          });
-          yield* Console.log(
-            `[feishu-bot] re-bound chat ${message.chatId} to its existing thread ${threadId}.`,
-          );
-          return threadId;
-        }
-
-        // Un-mark this chat's pending-create dedup (review fixes A/B/C: a
-        // DROPPED intent must release the dedup so the chat's next message can
-        // attempt a fresh create instead of being deduped against a corpse).
-        const clearPendingCreate = Ref.update(pendingCreates, (set) => {
-          if (!set.has(chatKey)) {
-            return set;
-          }
-          const next = new Set(set);
-          next.delete(chatKey);
-          return next;
-        });
-
-        // Offline first contact (MEDIUM): visible ⏳ receipt + notice, then buffer
-        // the `createThread` as an outbound intent that persists the binding *on
-        // success* (not optimistically — see `pendingCreates`). The turn itself is
-        // buffered separately by `runTurn`'s offline branch; intents flush in FIFO
-        // order, so the create runs before any turn. A second offline message for
-        // the same chat must NOT buffer a second create (it would hit the server's
-        // "thread already exists" invariant), so we dedup on `pendingCreates`.
-        const bufferOfflineCreate = Effect.gen(function* () {
-          const firstCreate = yield* Ref.modify(
-            pendingCreates,
-            (set): readonly [boolean, ReadonlySet<string>] =>
-              set.has(chatKey) ? [false, set] : [true, new Set(set).add(chatKey)],
-          );
-          // Fix 5: the ⏳ receipt answers the user's just-sent message, so anchor it
-          // into the topic (composite `chatKey` + the message id); p2p / plain group
-          // degrade to the root (byte-identical).
-          yield* sendNotice(
-            chatKey,
-            "⏳ The server is not connected right now — your message is queued and will be sent once it reconnects.",
-            message.messageId,
-          );
-          if (!firstCreate) {
-            // A create for this brand-new chat is already buffered; its flush
-            // persists the binding. This message only needs its turn buffered.
-            yield* Console.log(
-              `[feishu-bot] environment offline; create already buffered for chat ${message.chatId}, queuing turn only (⏳).`,
-            );
-            return threadId;
-          }
-          yield* Console.log(
-            `[feishu-bot] environment offline on first contact; buffering create+turn for chat ${message.chatId} (⏳).`,
-          );
-          const createCommandId = deriveCommandId(message.chatId, threadId, message.messageId, 1);
-          yield* outbound.enqueue({
-            commandId: createCommandId,
-            feishuMessageId: message.messageId,
-            // Create THEN persist the binding — only a created thread gets a
-            // binding, so a crash before the flush leaves no binding pointing at
-            // a missing thread. The flush flow lives in `bridge/createIntent.ts`
-            // (review fixes A/B/C②): the model selection is resolved at FLUSH
-            // time (needs a live RPC; T3_MODEL override still wins inside), the
-            // selection is re-validated against the CURRENT `/workspace` choice,
-            // and a failure while the environment is READY (provider-less
-            // server, `requireThreadAbsent` rejection) is a terminal, VISIBLE
-            // drop — never an eternal carry-over; only a genuine mid-flush
-            // env drop raises `OfflineRetry` (queue keeps the intent + ⏳).
-            run: runOfflineCreateFlush({
-              chatKey,
-              chatType: message.chatType,
-              replyToMessageId: message.messageId,
-              projectId: project.id,
-              getSelectedProject: workspace.get(chatKey),
-              resolveModel: runOnEnv(
-                resolveModelSelection(project.defaultModelSelection, config.modelOverride),
-              ),
-              dispatchCreate: (flushModelSelection) =>
-                runOnEnv(
-                  createThread({
-                    commandId: createCommandId,
-                    threadId,
-                    projectId: project.id,
-                    title: `Feishu · ${message.senderName ?? message.senderId} (${message.chatId.slice(0, 12)})`,
-                    modelSelection: flushModelSelection,
-                    // M3a: p2p stays full-access; group/topic creates an
-                    // approval-required thread (matches the online create path).
-                    runtimeMode,
-                    interactionMode: "default",
-                    branch: null,
-                    worktreePath: null,
-                  }),
-                ),
-              // Bind through the in-memory authority (BindingState), which also
-              // mirrors the write to the durable store and absorbs a persist
-              // failure (logged, not propagated) — so the create flush stays
-              // total and the next message resolves the binding from memory.
-              // M3b: store the trigger message id as the topic reply anchor and
-              // the bind-time density (see `ensureThreadForChat` for the full
-              // rationale); p2p stores them harmlessly.
-              bindChat: bindings.bind(chatKey, {
-                threadId,
-                origin: "self-created",
-                topicAnchorMessageId: message.messageId,
-                density: densityForRuntime(runtimeMode, groupChatDensity),
-              }),
-              isEnvReady,
-              clearPendingCreate,
-              sendNotice,
-            }),
-          });
-          return threadId;
-        });
-
-        const ready = yield* isEnvReady;
-        if (!ready) {
-          return yield* bufferOfflineCreate;
-        }
-
-        // M-1: resolve the model selection for THIS create from the selected
-        // project's default (T3_MODEL override wins inside). Captured as an
-        // exit; the disposition (review fix A) hinges on a READINESS RE-READ:
-        //  - env no longer ready → a genuine mid-resolve drop (TOCTOU with
-        //    `isEnvReady`) → offline buffer (the reconnect edge WILL flush it);
-        //  - env still ready → a provider-less server. Buffering would be a
-        //    LIE: the flush is edge-triggered on reconnect, and an environment
-        //    that never dropped never re-fires it — the intent (and its "queued"
-        //    receipt) would hang forever while the live turn dispatches against
-        //    a thread that was never created (defect → message lost). Fail
-        //    HONESTLY instead: notice + no thread, no queue, `null`.
-        const selectionExit = yield* runOnEnv(
-          resolveModelSelection(project.defaultModelSelection, config.modelOverride),
-        ).pipe(Effect.exit);
-        if (selectionExit._tag === "Failure") {
-          if (!(yield* isEnvReady)) {
-            yield* Effect.logWarning(
-              `[feishu-bot] environment dropped mid model-resolution for chat ${message.chatId}; falling back to offline buffer.`,
-              selectionExit.cause,
-            );
-            return yield* bufferOfflineCreate;
-          }
-          yield* Effect.logWarning(
-            `[feishu-bot] model resolution failed for chat ${message.chatId} while connected (no ready provider?); refusing the message visibly.`,
-            selectionExit.cause,
-          );
-          yield* sendNotice(chatKey, noProviderNoticeText, message.messageId);
-          return null;
-        }
-        const modelSelection = selectionExit.value;
-
-        // Online first contact. Attempt `createThread` + persist now. Capture the
-        // exit so a mid-create environment drop (a TOCTOU between `isEnvReady` and
-        // the dispatch — `runOnEnv` would orDie it into a defect) falls back to the
-        // offline buffer instead of silently dropping the user's first message.
-        const ensuredExit = yield* ensureThreadForChat(
-          message.chatId,
-          message,
-          {
-            environmentId,
-            projectId: project.id,
-            modelSelection,
-            dispatch: runOnEnv,
-            generateThreadId: genId(ThreadId),
-          },
-          // M3a: per-chat-type runtimeMode + topic id (forms the composite binding
-          // key + the topic-aware thread id derivation inside the helper).
-          runtimeMode,
-          groupChatDensity,
-          larkThreadId,
-        ).pipe(Effect.provideService(BindingState, bindings), Effect.exit);
-
-        if (ensuredExit._tag === "Failure") {
-          // Same readiness-re-read disposition as the resolve above (review fix
-          // B backstop): a mid-create env drop buffers (the reconnect edge will
-          // replay it); a rejection while STILL CONNECTED is the server actively
-          // refusing the create (dominantly `requireThreadAbsent`: the
-          // deterministic id is occupied by an archived/deleted thread the
-          // shell snapshot cannot show) — retrying or buffering can never
-          // succeed, so fail visibly instead of wedging in the queue.
-          if (!(yield* isEnvReady)) {
-            yield* Effect.logWarning(
-              `[feishu-bot] online first-contact create failed for chat ${message.chatId} (environment dropped); falling back to offline buffer.`,
-              ensuredExit.cause,
-            );
-            return yield* bufferOfflineCreate;
-          }
-          yield* Effect.logWarning(
-            `[feishu-bot] server rejected first-contact create for chat ${message.chatId}; refusing the message visibly.`,
-            ensuredExit.cause,
-          );
-          yield* sendNotice(chatKey, createRejectedNoticeText(message.chatType), message.messageId);
-          return null;
-        }
-        // M9: record the (stable) create commandId locally on a fresh create so a
-        // crash-recovery replay short-circuits instead of re-dispatching (the
-        // server's commandReceipt store is the authoritative second line). The
-        // triple mirrors `ensureThreadForChat`'s internal derivation (part: 1).
-        if (ensuredExit.value.created) {
-          const createCommandId = deriveCommandId(message.chatId, threadId, message.messageId, 1);
-          yield* sent.add(createCommandId).pipe(Effect.ignore);
-        }
-        return ensuredExit.value.threadId;
-      });
 
     /**
      * Handle one inbound message: filter unsupported content, ensure the chat's
