@@ -361,7 +361,7 @@ describe("summary labels — compact resting/preview text", () => {
   it("overridden chat drops '继承默认' and appends only its OWN overridden dimensions", () => {
     // only workspaces overridden; approval inherited (initiator built-in)
     const eff = effectiveConfig(CHAT, { [CHAT]: { workspaces: ["p1", "p2"] } }, {});
-    expect(restingChatSummary(eff, true)).toBe("仅发起人 · 工作区 2 个");
+    expect(restingChatSummary(eff, true)).toBe("仅会话发起者 · 工作区 2 个");
     // an inherited commands restriction is NOT listed (only own overrides), so it
     // doesn't masquerade as this chat's override
     const eff2 = effectiveConfig(CHAT, { [CHAT]: { approvalMode: "all" } }, { commands: [] });
@@ -370,7 +370,7 @@ describe("summary labels — compact resting/preview text", () => {
 
   it("defaultsSummary lists審批/命令/工作区 from the explicit defaults", () => {
     expect(defaultsSummary({})).toEqual([
-      { key: "审批", value: "仅发起人" },
+      { key: "审批", value: "仅会话发起者" },
       { key: "命令", value: "全部" },
       { key: "工作区", value: "全部" },
     ]);

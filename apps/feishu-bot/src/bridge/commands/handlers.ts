@@ -121,6 +121,10 @@ export interface CommandDeps {
     chatId: string,
     threadId: ThreadId,
     replyToMessageId?: string,
+    // The `/resume` command sender — the takeover initiator. Recorded as the trusted
+    // Feishu initiator for this thread so observe/surface sign approval cards for the
+    // taker, not a driftable last-sender ref (pin-drift fix).
+    initiatorOpenId?: string,
   ) => Effect.Effect<void>;
   /** Tear down any mirror state for `chatId` (mirror-light: candidate-cache clear). */
   readonly stopMirror: (chatId: string) => Effect.Effect<void>;
@@ -912,7 +916,7 @@ export const buildCommandTable = (deps: CommandDeps): ReadonlyMap<string, Comman
       // Hand off to mirror-light: it does the re-bind + takeover snapshot card.
       // M3b path A: pass the `/resume` command message id (belongs to this topic) so
       // the takeover/approval cards anchor inside the topic and the binding records it.
-      yield* deps.startMirror(chatKey, target, ctx.message.messageId);
+      yield* deps.startMirror(chatKey, target, ctx.message.messageId, ctx.message.senderId);
     });
 
   const resume: CommandHandler = (ctx) => {

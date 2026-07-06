@@ -91,6 +91,7 @@ import {
   isWorkspaceAuthorized,
 } from "./bridge/authz.ts";
 import { effectiveChatConfig } from "./bridge/chatConfig.ts";
+import { resolveObserveOperator } from "./bridge/observeOperator.ts";
 import { CallbackAuth, computePolicyFingerprint } from "./bridge/callbackAuth.ts";
 import {
   actionToApprovalDecision,
@@ -509,13 +510,32 @@ const runBoundSession = (
     // `FEISHU_GROUP_CHAT_DENSITY` lowers a group/topic below `card`.
     const groupChatDensity = config.feishu.groupChatDensity;
 
-    // E④: composite chatKey → operator open id, captured from each inbound message.
-    // `chatOperators` records the most recent sender per composite key (chatId or
-    // chatId:larkThreadId). During a running turn the turn initiator is pinned via
-    // `operatorOverride`; after the turn ends `chatOperators` carries the last
-    // known sender as a fallback. The cardAction verify re-checks the actual
-    // clicker against the token's `o` field at click time.
-    const chatOperators = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
+    // Session-operator map (security: pin-drift → `initiator`-mode bypass).
+    // `feishuInitiators` maps a session `threadId` → the Feishu open_id of the
+    // session's CURRENT operator: whoever most recently DROVE a turn or took over.
+    // `initiator` approval mode is DEFINED at session grain, not per-turn (see
+    // `authz.ts` SEMANTICS): the current operator approves the session's turns.
+    // Written ONLY by Feishu-side actions that establish/renew operatorship:
+    // `driveTurn` (a Feishu `@bot` turn's sender), `/resume` (the takeover command's
+    // sender), and M18 restart recovery (the durable handle's operator). It is NEVER
+    // written from a raw inbound sender, so a bystander `@`-mention cannot become
+    // operator — the only way to gain authority is to actually drive or take over.
+    //
+    // The observe / surface render paths sign an approval card's `payload.o` from
+    // THIS map (via `buildInteraction`'s `operatorOverride`), NOT from a per-chat
+    // "last sender" ref (which a bystander could drift while an observe turn keeps
+    // the chat `isChatBusy=false`). A session NO Feishu user has operated — e.g. a
+    // purely web/terminal-driven session the bot merely mirrors — has no entry →
+    // `payload.o` is signed empty → the `initiator`-mode gate rejects every non-owner
+    // click (owner-always still approves; the web end still approves via §11E). That
+    // removes the last driftable ref from the signing path, closing the escalation.
+    // The cardAction verify still re-checks the actual clicker against `o` at click time.
+    //
+    // Lifecycle: entries accumulate per `threadId` (overwrite-on-rewrite — the latest
+    // Feishu-side action wins), bounded by the number of threads the bot has driven or
+    // taken over; correctness never depends on eviction (a re-driven / re-resumed
+    // thread just overwrites its entry), so there is no explicit cleanup.
+    const feishuInitiators = yield* Ref.make<ReadonlyMap<ThreadId, string>>(new Map());
 
     // Fix B: per-bystander dedup so the "unauthorised click" notice fires at most
     // once per (chatKey, card messageId, clicker openId) triple. Realistic bystander
@@ -850,8 +870,21 @@ const runBoundSession = (
       // on the binding as `topicAnchorMessageId` so later topic-anchored cards land
       // inside the topic. Absent (non-`/resume` callers) → cards post at the root.
       replyToMessageId?: string,
+      // The `/resume` command sender (takeover initiator). Recorded as this thread's
+      // trusted Feishu initiator BEFORE any await below, so the observe fiber this
+      // starts signs approval cards for the taker — a bystander who `@`-mentions the
+      // bot during the (up to 10s) snapshot read cannot drift it (pin-drift fix).
+      initiatorOpenId?: string,
     ): Effect.Effect<void> =>
       Effect.gen(function* () {
+        // Record the takeover initiator FIRST (before the snapshot await and the
+        // `ensureObserving` below), so the mirrored turn's approval card is signed for
+        // the taker regardless of who `@`-mentions the bot in between. Non-empty only.
+        if (initiatorOpenId !== undefined && initiatorOpenId.length > 0) {
+          yield* Ref.update(feishuInitiators, (map) =>
+            new Map(map).set(threadId, initiatorOpenId),
+          );
+        }
         // M2b-3: a `/resume` may re-point a chat that is already mirroring a previous
         // thread. Tear down any existing observe fiber first so the new takeover's
         // `ensureObserving` below is not deduped out by a stale entry under this
@@ -985,9 +1018,9 @@ const runBoundSession = (
         // anti-duplication). On takeover there is no prior CardHandle, so the helper's
         // single-source dedup naturally passes and surfaces approval #1 — persisting
         // its requestId as the dedup baseline the watcher then composes with (it skips
-        // the same id and surfaces a later #2). The operator captured by
-        // `handleInbound` before routing `/resume` is read from `chatOperators` inside
-        // the helper. Still mirror-light: no resident observe fiber. Robustness
+        // the same id and surfaces a later #2). The approval is signed for the thread's
+        // trusted `feishuInitiators` value (the `/resume` taker) read inside the helper.
+        // Still mirror-light: no resident observe fiber. Robustness
         // (catchCause) lives inside the helper.
         //
         // #7: reuse the `snapshotThread` we already read above for the transcript card
@@ -1319,13 +1352,13 @@ const runBoundSession = (
       // can recover the topic — both are recovered via `splitChatKey` below.
       chatKey: string,
       thread: OrchestrationThread,
-      // #0/#1(b): optional operator override. The live `driveTurn` path omits it
-      // and resolves the operator from the in-process `chatOperators` Ref. M18
-      // restart recovery passes the operator captured on the persisted card handle
-      // (`handle.operatorOpenId`) because the Ref is empty right after a restart —
-      // re-signing with an empty open id would never match at verify time and would
-      // dead-end the recovered button. A non-empty override wins; otherwise we fall
-      // back to the Ref (preserving the existing live behaviour exactly).
+      // The TRUSTED Feishu initiator to sign into `payload.o`. Every caller now
+      // supplies it explicitly — there is NO driftable-ref fallback: `driveTurn`
+      // pins this turn's initiator, observe / `surfacePendingApprovalIfNew` read
+      // `feishuInitiators`, M18 restart recovery passes the durable handle's
+      // operator. Empty/undefined → `payload.o` is signed empty, which the
+      // `initiator`-mode gate treats as "no Feishu initiator" → rejects non-owner
+      // clicks (owner-always still approves; the web end still approves via §11E).
       operatorOverride?: string,
     ): Effect.Effect<{ readonly elements: ReadonlyArray<object> } | undefined> =>
       Effect.gen(function* () {
@@ -1346,18 +1379,18 @@ const runBoundSession = (
         ) {
           return undefined;
         }
-        const operators = yield* Ref.get(chatOperators);
-        const rawInitiator =
-          operatorOverride !== undefined && operatorOverride.length > 0
-            ? operatorOverride
-            : (operators.get(chatKey) ?? "");
-        // M-2/PR2b: the token's signed `payload.o` is the true turn initiator
-        // (initiator-only). WHO may approve is decided by the cardAction gate's
-        // three-state mode, NOT here; `payload.o` is only consulted in `initiator`
-        // mode, where it must equal the real initiator. The per-turn operator pin
-        // (idle-guarded `chatOperators` + `driveTurn`'s `operatorOverride`) keeps
-        // `rawInitiator` un-flippable by a mid-turn bystander.
-        const operatorOpenId = rawInitiator;
+        // M-2/PR2b + pin-drift fix: `payload.o` is the turn's TRUSTED Feishu
+        // initiator, supplied by the caller via `operatorOverride` — the pinned
+        // initiator for `driveTurn`, the `feishuInitiators` map value for
+        // observe/surface, the durable handle's operator for M18. It is NEVER
+        // resolved from a driftable per-chat "last sender" ref here (that was the
+        // pin-drift escalation). An empty override → `payload.o` signed empty → the
+        // cardAction `initiator`-mode gate rejects every non-owner clicker (owner-
+        // always still approves; the web end still approves via §11E). WHO may
+        // approve is decided by the gate's three-state mode, NOT here; `payload.o`
+        // is only consulted in `initiator` mode.
+        const operatorOpenId =
+          operatorOverride !== undefined && operatorOverride.length > 0 ? operatorOverride : "";
         const staleSet = staleRequestIdsOf(thread.activities);
         // M3a: recover the real Feishu chatId (for the token's `c`/`scope`, matched
         // at verify against `evt.chatId`) and the topic id (signed into the token's
@@ -1416,8 +1449,9 @@ const runBoundSession = (
     // failure must NEVER crash the bot or wedge the watcher's reconciliation loop.
     const surfacePendingApprovalIfNew = (
       // M3a: composite `chatId[:larkThreadId]` conversation key. Used verbatim for
-      // every state lookup (busy/observe gates, cardHandles, chatOperators,
-      // buildInteraction); the actual card is sent to the real Feishu chatId
+      // every state lookup (busy/observe gates, cardHandles, buildInteraction); the
+      // approval operator comes from `feishuInitiators` keyed by `threadId`. The
+      // actual card is sent to the real Feishu chatId
       // (`splitChatKey`) at the `startStreamingCard` call below.
       chatId: string,
       threadId: ThreadId,
@@ -1495,26 +1529,21 @@ const runBoundSession = (
           return;
         }
 
-        // Operator: a `resumed` binding was `/resume`d by a user, so `chatOperators`
-        // is normally populated (the inbound `/resume` set it before routing). After
-        // a restart, though, the Ref is empty even though the durable handle still
-        // carries the operator who triggered the prior card — so for a brand-new
-        // approval that surfaces post-restart we fall back to that persisted operator
-        // (in a p2p private chat the takeover operator is the same person, so the
-        // persisted open id is valid for the new request too). Reuse the handle read
-        // above for the dedup so we don't fetch it twice. If BOTH are empty we still
-        // surface the card so the user *sees* a request is pending. M-2: whether its
-        // buttons are actionable now depends on the authz gate's per-chat mode, not on
-        // this operator: with a bound owner (owner-always) or a `designated`/`all`
-        // chat, the card is approvable regardless of the empty operator here. Only in
-        // `initiator` mode with no owner does an empty operator yield a readable-but-
-        // not-clickable card (the gate then needs `payload.o` = the initiator; no
-        // wildcard / auth bypass), prompting a resend — mirroring M18's graceful fallback.
-        const operators = yield* Ref.get(chatOperators);
+        // Operator = the turn's TRUSTED Feishu initiator (`feishuInitiators`, keyed by
+        // `threadId`), or the durable handle's operator when the map has no entry (a
+        // post-restart approval whose handle still carries the recovered operator; in
+        // p2p the takeover operator is the same person, valid for the new request too).
+        // Reuse the handle read above so we don't fetch it twice. If BOTH are empty we
+        // STILL surface the card so the user *sees* a pending request; whether its
+        // buttons are actionable is decided by the authz gate's per-chat mode, not by
+        // this operator: owner-always / `designated` / `all` stay approvable regardless.
+        // Only `initiator` mode with no owner yields a readable-but-not-clickable card
+        // (the gate needs `payload.o` = the initiator; no wildcard / auth bypass) — the
+        // correct outcome for a turn with no Feishu initiator (approve it from the web).
+        const initiators = yield* Ref.get(feishuInitiators);
         const operatorOpenId =
-          // #5: the trailing `?? ""` was unreachable — the conditional's else branch
-          // already yields `""`, so the `??` could only ever see a non-nullish string.
-          operators.get(chatId) ?? (Option.isSome(handleOpt) ? handleOpt.value.operatorOpenId : "");
+          initiators.get(threadId) ??
+          (Option.isSome(handleOpt) ? handleOpt.value.operatorOpenId : "");
 
         const interaction = yield* buildInteraction(chatId, snapshotThread, operatorOpenId);
         const card = renderThreadCard(snapshotThread, {
@@ -1746,15 +1775,14 @@ const runBoundSession = (
       threadId: ThreadId,
       observation: ThreadObservation,
       handle: StreamingCard,
-      // M2b-3 adopt path: optional operator override forwarded to every
-      // `buildInteraction` here. The live `driveTurn`/streaming paths omit it and
-      // resolve the operator from the in-process `chatOperators` Ref. When this
-      // observe fiber ADOPTS an M18-recovered card after a restart the Ref is empty,
-      // so the adopt branch passes the operator captured on the persisted handle —
-      // exactly as M18 `recoverApprovalCards` re-signs its buttons — so the adopted
-      // approval's buttons verify when clicked instead of dead-ending on an empty
-      // open id. A non-empty override wins inside `buildInteraction`; otherwise it
-      // falls back to the Ref (live behaviour unchanged).
+      // The TRUSTED operator to sign into `payload.o`, forwarded to every
+      // `buildInteraction` here. Callers supply it explicitly — `driveTurn` pins this
+      // turn's initiator; the observe path resolves it from the per-thread
+      // `feishuInitiators` map (falling back to the persisted handle's operator on an
+      // M18-recovered adopt). There is NO driftable-ref fallback: an empty/undefined
+      // override signs `payload.o` empty, which the `initiator`-mode gate treats as
+      // "no Feishu initiator" → rejects non-owner clicks (approve from the web / as
+      // owner). This is what keeps a mid-observe bystander from re-signing the card.
       operatorOverride?: string,
     ): Effect.Effect<void, never, Scope.Scope> =>
       Effect.gen(function* () {
@@ -1779,55 +1807,38 @@ const runBoundSession = (
             Effect.flatMap((seen) =>
               seen === pendingRequestId
                 ? Effect.void
-                : // Capture the chat's *current* real operator open id (#0/#1):
-                  // the verify side reads `evt.operator.openId`, the same source
-                  // `handleInbound` writes into `chatOperators` — so persisting it
-                  // here lets M18 restart recovery re-sign approval buttons for the
-                  // real operator instead of an empty string (which would never
-                  // match at verify time, permanently dead-ending the button).
-                  //
-                  // Bug C — do NOT blank a recoverable operator. After a restart the
-                  // `chatOperators` Ref is empty even though a durable handle may still
-                  // carry the operator who triggered the prior (M18-recovered) card.
-                  // Unconditionally writing `""` here would poison that handle, so on
-                  // the next restart M18 sees an empty operator and DROPS the handle
-                  // (downgrading to a "send a message" nudge). Fall back to the existing
-                  // handle's `operatorOpenId` when the Ref has none. Empty string is
-                  // only written when BOTH are genuinely unknown.
-                  //
-                  // Fix 1(b) (M3a): a non-empty `operatorOverride` (the live
-                  // `driveTurn` now pins this turn's *initiator*; the observe/adopt
-                  // path passes the recovered handle's operator) wins — the SAME
-                  // precedence `buildInteraction` uses. This persists the pinned
-                  // initiator into the durable handle so M18 restart recovery re-signs
-                  // the recovered approval for the initiator, NOT for whoever last
-                  // @-mentioned the bot (which a later inbound could have flipped in
-                  // the Ref). For p2p the initiator equals the chat owner equals the
-                  // Ref value, so this is byte-identical.
-                  Effect.all([
-                    Ref.get(chatOperators),
-                    cardHandles
-                      .get(chatId)
-                      .pipe(Effect.orElseSucceed(() => Option.none<CardHandle>())),
-                  ]).pipe(
-                    Effect.flatMap(([operators, existing]) =>
-                      cardHandles
-                        .put(chatId, {
-                          messageId: handle.messageId,
-                          pendingRequestId,
-                          lastSequence: 0,
-                          operatorOpenId:
-                            operatorOverride !== undefined && operatorOverride.length > 0
-                              ? operatorOverride
-                              : (operators.get(chatId) ??
-                                (Option.isSome(existing) ? existing.value.operatorOpenId : "")),
-                        })
-                        .pipe(
-                          Effect.ignore,
-                          Effect.andThen(Ref.set(lastPendingId, pendingRequestId)),
-                        ),
+                : // Persist the operator so M18 restart recovery can re-sign the
+                  // approval buttons. Precedence: the caller's TRUSTED `operatorOverride`
+                  // (`driveTurn`'s pinned initiator, or the observe path's
+                  // `feishuInitiators` value) → the existing handle's operator (Bug C:
+                  // do NOT blank a recoverable operator — writing `""` would poison the
+                  // handle so the next restart drops it) → `""` when genuinely unknown.
+                  // No driftable `chatOperators` read — the SAME trusted source
+                  // `buildInteraction` signs from, so persisted and rendered `payload.o`
+                  // stay in lock-step (and a bystander cannot poison the durable handle).
+                  cardHandles
+                    .get(chatId)
+                    .pipe(
+                      Effect.orElseSucceed(() => Option.none<CardHandle>()),
+                      Effect.flatMap((existing) =>
+                        cardHandles
+                          .put(chatId, {
+                            messageId: handle.messageId,
+                            pendingRequestId,
+                            lastSequence: 0,
+                            operatorOpenId:
+                              operatorOverride !== undefined && operatorOverride.length > 0
+                                ? operatorOverride
+                                : Option.isSome(existing)
+                                  ? existing.value.operatorOpenId
+                                  : "",
+                          })
+                          .pipe(
+                            Effect.ignore,
+                            Effect.andThen(Ref.set(lastPendingId, pendingRequestId)),
+                          ),
+                      ),
                     ),
-                  ),
             ),
           );
         // Record the card handle once up front (no pending yet) so M2b-2 recovery can
@@ -1993,9 +2004,9 @@ const runBoundSession = (
           // authoritative frame, opening a fresh streaming card would post a SECOND
           // card for it (and `persistHandle(null)` would clobber the durable handle's
           // operator → dead buttons). Instead ADOPT: keep rendering onto the recovered
-          // `messageId` via `updateCard`, re-signing the approval for the operator
-          // captured on the handle (the `chatOperators` Ref is empty right after a
-          // restart — same as M18). A STALE handle from an old turn whose request is
+          // `messageId` via `updateCard`, re-signing the approval for the operator from
+          // the `feishuInitiators` map (falling back to the operator captured on the
+          // handle — M18 recovery seeds both). A STALE handle from an old turn whose request is
           // NOT in this thread's live-pending set is ignored → we fall through and open
           // a fresh card (no mis-adoption). The adopt path has NO streaming producer,
           // so it creates NO `cardDone` (a dangling `cardDone` would never resolve).
@@ -2011,24 +2022,31 @@ const runBoundSession = (
             .get(chatId)
             .pipe(Effect.orElseSucceed(() => Option.none<CardHandle>()));
 
-          // Operator fallback shared by BOTH render branches (adopt AND fresh card).
-          // The live `chatOperators` Ref is the authoritative source while the bot has
-          // seen an inbound/`/resume` for this chat — but it is EMPTY right after a
-          // restart, even though a durable handle may still carry the operator who
-          // triggered the recovered (M18) card. When the Ref has this chat, pass
-          // `undefined` so `buildInteraction` resolves from the Ref (live behaviour
-          // unchanged); when it does not, fall back to the persisted handle's
-          // `operatorOpenId` so an approval that surfaces post-restart is still signed
-          // for the recovered operator instead of an empty open id (dead buttons). The
-          // fresh-card branch previously passed NO override, so on a restart where
-          // observe lost the adopt race (the first live-pending request already
-          // resolved) its approval buttons would dead-end — this fallback fixes that.
-          const liveOperators = yield* Ref.get(chatOperators);
-          const operatorFallback = liveOperators.has(chatId)
-            ? undefined
-            : Option.isSome(existing) && existing.value.operatorOpenId.length > 0
+          // Operator override shared by BOTH render branches (adopt AND fresh card),
+          // resolved from the TRUSTED `feishuInitiators` map (keyed by `threadId`) —
+          // NOT a driftable per-chat "last sender" ref. Security (observe pin-drift →
+          // `initiator`-mode bypass): an observe fiber keeps the chat `isChatBusy=false`,
+          // so the idle-guard would let a mid-observe bystander `@`-mention flip a
+          // per-chat pin to themselves; reading it here would re-sign the approval
+          // card's `payload.o` to that bystander, who could then self-authorize in
+          // `initiator` mode. The map is written only by Feishu-side actions that
+          // establish a real initiator (driveTurn / `/resume` / M18), so a bystander
+          // cannot poison it.
+          //
+          // Precedence (see `resolveObserveOperator`): the map's trusted initiator →
+          // the persisted handle's operator (M18 restart: the durable handle carries the
+          // recovered operator) → `undefined`. A turn with NO Feishu initiator (a
+          // web/terminal-started turn the bot merely mirrors) resolves to `undefined` →
+          // `buildInteraction` signs `payload.o` EMPTY → the `initiator`-mode gate
+          // rejects every non-owner click (approve it from the web / as owner). No
+          // driftable ref remains in the signing path.
+          const initiators = yield* Ref.get(feishuInitiators);
+          const operatorFallback = resolveObserveOperator(
+            initiators.get(threadId),
+            Option.isSome(existing) && existing.value.operatorOpenId.length > 0
               ? existing.value.operatorOpenId
-              : undefined;
+              : undefined,
+          );
 
           if (
             Option.isSome(existing) &&
@@ -2162,6 +2180,17 @@ const runBoundSession = (
       initiatorOperatorOpenId?: string,
     ): Effect.Effect<void, never, Scope.Scope> =>
       Effect.gen(function* () {
+        // Record this Feishu-initiated turn's initiator into the trusted map, so a
+        // later observe fiber for the SAME thread (a chained subagent, or a follow-on
+        // turn) signs the approval card's `payload.o` for the REAL initiator rather
+        // than a driftable last-sender ref. driveTurn itself pins the initiator
+        // directly; this write is for the observe/surface paths that mirror the thread
+        // afterwards. Only a non-empty initiator carries authority.
+        if (initiatorOperatorOpenId !== undefined && initiatorOperatorOpenId.length > 0) {
+          yield* Ref.update(feishuInitiators, (map) =>
+            new Map(map).set(threadId, initiatorOperatorOpenId),
+          );
+        }
         const cardDone = yield* Deferred.make<void>();
         yield* Effect.gen(function* () {
           // M3b: prefer the binding's bind-time density so the placeholder first
@@ -2841,26 +2870,14 @@ const runBoundSession = (
           }
         }
 
-        // E④: remember who this conversation's operator is (per topic). The
-        // interaction card binds its buttons to this open id at render time; the
-        // cardAction verify re-checks the actual clicker against the token's `o`.
-        //
-        // Fix 1(c)/(d) (M3a): record the operator ONLY when the conversation is
-        // currently idle — i.e. this message is (about to become) a fresh turn's
-        // initiator. While a turn is running OR coalescing (`isChatBusy`), the
-        // active turn's operator is already pinned by `driveTurn`'s
-        // `operatorOverride` (the initiator) and must NOT be overwritten: otherwise
-        // a bystander @-mentioning the bot mid-turn would flip the Ref, the next
-        // tick would re-sign the approval buttons to the bystander (who could then
-        // approve someone else's turn), and the real initiator's own click would be
-        // rejected (context-mismatch). The pinned-initiator override is the live
-        // backstop; this idle guard keeps the Ref itself sane for the idle paths
-        // (e.g. `surfacePendingApprovalIfNew`) that still read it. For p2p the
-        // operator is always the same person, so skipping a redundant rewrite while
-        // busy is a no-op → byte-identical.
-        if (!(yield* isChatBusy(chatKey))) {
-          yield* Ref.update(chatOperators, (map) => new Map(map).set(chatKey, message.senderId));
-        }
+        // (Pin-drift fix) The old idle-guard that recorded
+        // `chatOperators[chatKey] = message.senderId` here has been REMOVED. The
+        // approval card's signed `payload.o` is no longer resolved from a per-chat
+        // "last sender" ref — which a mid-observe bystander could drift while an
+        // observe turn keeps the chat `isChatBusy=false`, then self-authorize in
+        // `initiator` mode — but from the per-thread `feishuInitiators` map, written
+        // ONLY by turn-establishing Feishu actions (`driveTurn` / `/resume` / M18).
+        // A raw inbound no longer touches any operator-signing state.
 
         // Content filter (M16): M1 dispatches text only. A message with no text
         // (image/file-only, or an empty body) must NOT become an empty-prompt
@@ -3052,8 +3069,8 @@ const runBoundSession = (
     // so no click is ever the "unchanged" one the SDK latches onto; only the neutral
     // @-notice is deduped (to at most once per (chatKey, messageId, clicker)) so repeated
     // taps don't spam the topic. Buttons are re-signed for the verified token's initiator
-    // (`res.payload.o`, passed as `initiatorOpenId`), NOT the driftable `chatOperators`
-    // Ref and NOT the bystander clicker — see the call below for why. Called from the
+    // (`res.payload.o`, passed as `initiatorOpenId`), NOT the bystander clicker and NOT
+    // any ambient/mutable ref — see the call below for why. Called from the
     // authz gate: the token already passed `verify`, which proves the click targets the
     // live card for this chat/thread/policy. Generic wording covers approval and
     // user-input interactions.
@@ -3080,22 +3097,16 @@ const runBoundSession = (
         yield* Effect.gen(function* () {
           // Re-sign the re-armed buttons for the EXACT initiator carried by the just-
           // verified live token (`initiatorOpenId` = `res.payload.o`), passed as
-          // `buildInteraction`'s `operatorOverride`. We must NOT let `buildInteraction`
-          // resolve the operator from the live `chatOperators` Ref, which is DRIFTABLE on
-          // the observe path: a bystander who @-mentions the bot with a floor command
-          // (e.g. `/help`) on an `isChatBusy=false` observe turn (/resume takeover,
-          // chained subagent, M18 recovery) flips the idle-guarded pin to their own id
-          // WITHOUT starting a turn that would re-pin the initiator. Re-signing from that
-          // Ref would let the bystander set the new `payload.o` to themselves and then
-          // self-approve in `initiator` mode — a privilege escalation. Since a non-empty
-          // override wins over the Ref, guard on it: when `initiatorOpenId` is empty (only
-          // a non-initiator-mode / M18-recovered card whose initiator was never captured),
-          // `buildInteraction` would FALL BACK to that driftable Ref, so we SKIP the re-arm
-          // entirely rather than risk re-signing for a drifted bystander — mirroring M18
-          // recovery's refusal to re-sign empty-operator cards. The narrow cost is that
-          // such a recovered card keeps the old dead-button behaviour (no re-arm); the
-          // common case (non-empty initiator) re-arms normally and stays signed for the
-          // real approver, so the bystander stays locked out.
+          // `buildInteraction`'s `operatorOverride`. This is the token the bystander's
+          // own click just carried, so re-arming reproduces the SAME approval authority
+          // — it can never widen it: `res.payload.o` is fixed by `verify`, never read
+          // from any mutable ref. When `initiatorOpenId` is empty (a card signed with no
+          // Feishu initiator — a web/terminal-mirrored turn, or a non-initiator-mode /
+          // M18-recovered card), re-arming would just re-emit an empty-operator card,
+          // which in `initiator` mode is intentionally non-clickable for non-owners
+          // (approve it from the web); so we SKIP the re-arm rather than churn the card.
+          // The common case (non-empty initiator) re-arms normally and stays signed for
+          // the real approver, so a bystander stays locked out.
           if (initiatorOpenId.length === 0) {
             return;
           }
@@ -3651,21 +3662,20 @@ const runBoundSession = (
             );
           }
 
-          // 修法 3: seed the in-process `chatOperators` Ref with the recovered operator.
-          // That Ref is empty right after a restart (it is only written by inbound /
-          // `/resume`), so every render path that resolves the operator from it —
-          // observe (修法 2), 修法 A/B (`surfacePendingApprovalIfNew`), `driveTurn` —
-          // would sign post-restart approval buttons with an empty open id (dead
-          // buttons) until the next inbound message. Planting the durable handle's
-          // operator here means those paths pick up the recovered operator immediately,
-          // so the buttons verify across the restart even when observe lands on a fresh
-          // card (修法 1 starts observe right below). The recovered operator is seeded
-          // per composite key (chatId or chatId:larkThreadId), covering p2p, group,
-          // and topic chats; it is used for follow-on approval requests until the next
-          // inbound message refreshes `chatOperators`.
-          yield* Ref.update(chatOperators, (map) =>
-            new Map(map).set(chatId, handle.operatorOpenId),
-          );
+          // Seed the trusted `feishuInitiators` map with the recovered operator so the
+          // observe fiber started just below (修法 1) — and any follow-on approval that
+          // surfaces on this thread — signs `payload.o` for the recovered initiator
+          // across the restart, instead of an empty open id (dead buttons). The map is
+          // keyed by `threadId` (the observe / surface paths read it by threadId). Only
+          // a non-empty operator is planted; an empty one carries no authority (owner /
+          // designated / all can still approve — the gate ignores `payload.o` there —
+          // and `initiator` mode correctly has no clickable Feishu approver until the
+          // user acts, mirroring the empty-operator handling above).
+          if (handle.operatorOpenId.length > 0) {
+            yield* Ref.update(feishuInitiators, (map) =>
+              new Map(map).set(threadId, handle.operatorOpenId),
+            );
+          }
 
           // #7: bound the one-shot snapshot read. `subscribeThread` is `orDie`'d and
           // retries the subscription forever on an expected failure, so a thread
@@ -3714,8 +3724,9 @@ const runBoundSession = (
           // Still pending (the original request, or a newer approval B): re-render
           // the approval card with freshly-signed buttons and push it onto the same
           // message id. #0/#1(b): re-sign for the operator captured on the handle
-          // (the `chatOperators` Ref is empty right after a restart) so the buttons
-          // verify correctly when clicked; the operator is re-checked at verify time.
+          // (the `feishuInitiators` map may be empty right after a restart, but the
+          // durable handle carries it) so the buttons verify correctly when clicked;
+          // the operator is re-checked at verify time.
           const interaction = yield* buildInteraction(
             chatId,
             snapshotThread,
@@ -3743,9 +3754,9 @@ const runBoundSession = (
             // rendered — the SAME priority `buildInteraction`/`renderInteractionSection`
             // used (approval first, then user-input) — so the resident shellWatcher's
             // single-source dedup (`CardHandle.pendingRequestId`) matches the surfaced
-            // card and does NOT re-send a duplicate (which would also be signed with the
-            // post-restart-empty `chatOperators`, i.e. dead buttons). Reuse the recovered
-            // `messageId` and the persisted `operatorOpenId` (the Ref is still empty).
+            // card and does NOT re-send a duplicate (which would also be signed with an
+            // empty operator post-restart, i.e. dead buttons). Reuse the recovered
+            // `messageId` and the persisted `operatorOpenId` (the map may still be empty).
             const renderedRequestId =
               pendingApprovals[0]?.requestId ?? pendingUserInputs[0]?.requestId ?? null;
             yield* cardHandles

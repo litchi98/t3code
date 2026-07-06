@@ -15,7 +15,12 @@
  */
 import type { FeishuChatConfig } from "@t3tools/contracts";
 
-/** Resolved approval-gate mode (the non-optional form of `FeishuChatConfig.approvalMode`). */
+/**
+ * Resolved approval-gate mode (the non-optional form of `FeishuChatConfig.approvalMode`).
+ * `initiator` = the session's current Feishu operator (session grain — the most recent
+ * driver/`/resume` taker — NOT the per-turn author; see `authz.ts` SEMANTICS);
+ * `designated` = the `approvers` list; `all` = any chat member.
+ */
 export type ApprovalMode = NonNullable<FeishuChatConfig["approvalMode"]>;
 
 /** Built-in default when neither the per-chat entry nor the defaults set `approvalMode`. */
