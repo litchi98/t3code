@@ -11,7 +11,6 @@ import {
   startThreadTurn,
 } from "@t3tools/client-runtime/operations";
 import * as EnvironmentRpc from "@t3tools/client-runtime/rpc";
-import type { RemoteEnvironmentRequestError } from "@t3tools/client-runtime/rpc";
 import {
   derivePendingApprovals,
   derivePendingUserInputs,
@@ -22,7 +21,6 @@ import {
   CommandId,
   type EnvironmentId,
   type FeishuChatConfig,
-  isProviderAvailable,
   MessageId,
   ModelSelection,
   ORCHESTRATION_WS_METHODS,
@@ -33,18 +31,15 @@ import {
   type OrchestrationThreadStreamItem,
   ProjectId,
   type RuntimeMode,
-  type ServerProvider,
   ThreadId,
   type TurnId,
   TrimmedNonEmptyString,
   WS_METHODS,
 } from "@t3tools/contracts";
-import { resolveSelectableModel } from "@t3tools/shared/model";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Console from "effect/Console";
 import * as Crypto from "effect/Crypto";
-import * as Data from "effect/Data";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -63,12 +58,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
-import {
-  DOMAIN_BY_TENANT,
-  type FeishuBotConfig,
-  type FeishuCredentialOverride,
-  type FeishuTenant,
-} from "./config.ts";
+import { type FeishuBotConfig, type FeishuCredentialOverride } from "./config.ts";
 import { resolveEnvironment, type ResolvedEnvironment } from "./auth.ts";
 import { connectionLayer } from "./runtime/connection.ts";
 import {
@@ -131,6 +121,19 @@ import { runShellCacheFiber, shellStatus } from "./bridge/shellCache.ts";
 import { runShellWatcherFiber } from "./bridge/shellWatcher.ts";
 import { tryHandleCommand } from "./bridge/commands/registry.ts";
 import { buildCommandTable, WorkspaceCommandError } from "./bridge/commands/handlers.ts";
+import { resolveModelSelection } from "./bridge/modelSelection.ts";
+import {
+  acquireCredentials,
+  bindingIdentityEq,
+  type BindingIdentity,
+  FeishuSessionFailure,
+  redactSecret,
+  reportAuthFailure,
+  runBindingAndConfigWatcher,
+  SESSION_RETRY_SCHEDULE,
+  threadIdForChatKey,
+  UNBOUND_RECHECK_INTERVAL,
+} from "./bridge/residency.ts";
 
 /**
  * How long to wait for the first shell snapshot (i.e. a healthy, authenticated
@@ -151,114 +154,6 @@ const DISCOVERY_TIMEOUT = Duration.seconds(30);
 // `/workspace add`/`switch` before the first prompt. The `workspaceRoot`
 // config field (and the server-managed `T3_WORKSPACE_ROOT` injection) is kept
 // for compatibility but is no longer consumed here.
-
-/**
- * Whether `selection` still names a model on a currently-ready provider. Used to
- * validate a persisted `defaultModelSelection` before reusing it: a default that
- * points at a now-disabled/unavailable instance (or a model the instance no
- * longer exposes) must fall back rather than dispatch an unroutable selection.
- */
-const isSelectionRoutable = (
-  selection: ModelSelection,
-  readyProviders: ReadonlyArray<ServerProvider>,
-): boolean =>
-  readyProviders.some(
-    (provider) =>
-      provider.instanceId === selection.instanceId &&
-      provider.models.some((model) => model.slug === selection.model),
-  );
-
-/**
- * Resolve the model selection used to create the thread (and, under an explicit
- * override, to pin every turn — see `buildTurnStart`).
- *
- * Priority:
- *  1. **`T3_MODEL` override** (when set): wins over everything. Match it across
- *     *all* ready providers via the shared canonical resolver
- *     (`resolveSelectableModel`, which honours per-driver slug aliases such as
- *     `opus` → the canonical slug and name matches), preferring an exact/alias
- *     hit. Die — listing the available slugs across *every* ready provider — if
- *     nothing matches.
- *  2. The selected project's **`defaultModelSelection`** (passed by the
- *     caller; M-1 resolves this per chat from the chat's selected workspace),
- *     but only if it still names a model on a ready provider; otherwise fall
- *     back (with a warning).
- *  3. The **first ready provider's first model**.
- *
- * "Ready" mirrors the web client: `enabled && isProviderAvailable && status ===
- * "ready"`. Dies with a clear message when no ready provider (or no model on
- * one) is available.
- */
-const resolveModelSelection = (
-  defaultModelSelection: ModelSelection | null,
-  modelOverride: string | null,
-) =>
-  Effect.gen(function* () {
-    const serverConfig = yield* EnvironmentRpc.request(WS_METHODS.serverGetConfig, {});
-    const readyProviders = serverConfig.providers.filter(
-      (provider) =>
-        provider.enabled && isProviderAvailable(provider) && provider.status === "ready",
-    );
-    if (readyProviders.length === 0) {
-      return yield* Effect.die(
-        new Error("No enabled, available, ready provider is available to start a thread."),
-      );
-    }
-
-    // 1. Explicit T3_MODEL override: match across ALL ready providers via the
-    //    shared canonical resolver (driver-aware alias + name matching),
-    //    preferring an exact/alias hit over a later candidate.
-    if (modelOverride !== null) {
-      const matches: ReadonlyArray<ModelSelection> = readyProviders.flatMap((provider) => {
-        const slug = resolveSelectableModel(provider.driver, modelOverride, provider.models);
-        return slug === null
-          ? []
-          : [{ instanceId: provider.instanceId, model: slug } satisfies ModelSelection];
-      });
-      const chosen = matches[0];
-      if (chosen === undefined) {
-        const available = readyProviders
-          .flatMap((provider) =>
-            provider.models.map((model) => `${provider.instanceId}/${model.slug}`),
-          )
-          .join(", ");
-        return yield* Effect.die(
-          new Error(
-            `No model on any ready provider matches T3_MODEL="${modelOverride}". ` +
-              `Available: ${available || "(none)"}.`,
-          ),
-        );
-      }
-      if (matches.length > 1) {
-        yield* Console.warn(
-          `[feishu-bot] T3_MODEL="${modelOverride}" matched ${matches.length} ready providers; ` +
-            `using ${chosen.instanceId}/${chosen.model}.`,
-        );
-      }
-      return chosen;
-    }
-
-    // 2. No override: prefer the project's persisted default, but only if it is
-    //    still routable on a ready provider; otherwise fall back with a warning.
-    if (defaultModelSelection !== null) {
-      if (isSelectionRoutable(defaultModelSelection, readyProviders)) {
-        return defaultModelSelection;
-      }
-      yield* Console.warn(
-        `[feishu-bot] project default model ${defaultModelSelection.instanceId}/` +
-          `${defaultModelSelection.model} is no longer on a ready provider; ` +
-          "falling back to the first ready provider's first model.",
-      );
-    }
-
-    // 3. First ready provider's first model.
-    const provider = readyProviders[0]!;
-    const firstModel = provider.models[0];
-    if (firstModel === undefined) {
-      return yield* Effect.die(new Error(`Provider ${provider.instanceId} exposes no models.`));
-    }
-    return { instanceId: provider.instanceId, model: firstModel.slug } satisfies ModelSelection;
-  });
 
 /** Generate a branded id from a fresh UUIDv4 using the platform crypto service. */
 const makeBrandedId = <A>(brand: { readonly make: (value: string) => A }) =>
@@ -3891,239 +3786,6 @@ const runBoundSession = (
     return yield* Effect.never;
   });
 
-// ── PR2: runtime credential resolution + the resident re-bind loop ───────────
-
-/**
- * The public identity of a bound bot — what changes on a re-bind (bind a new
- * app, unbind, or swap tenant). Deliberately excludes `appSecret`: the secret is
- * fetched on demand via the credentials RPC and never travels on the settings
- * stream or this view (so a leak surface is one place, not two).
- */
-interface BindingIdentity {
-  readonly appId: string;
-  readonly tenant: FeishuTenant;
-}
-
-/** Structural equality for {@link BindingIdentity} (null = unbound). */
-const bindingIdentityEq = (a: BindingIdentity | null, b: BindingIdentity | null): boolean =>
-  a === null || b === null ? a === b : a.appId === b.appId && a.tenant === b.tenant;
-
-/**
- * Project the public `ServerSettings.feishuBinding` (or `undefined` = no bot
- * bound) onto a {@link BindingIdentity}. Drops `ownerOpenId` — only app id +
- * tenant decide whether the running session must be re-bound.
- */
-const toBindingIdentity = (
-  binding: { readonly appId: string; readonly tenant: FeishuTenant } | undefined,
-): BindingIdentity | null =>
-  binding === undefined ? null : { appId: binding.appId, tenant: binding.tenant };
-
-/**
- * The outcome of resolving the bot's credentials for one loop iteration: either a
- * full credential set (from the `.env` dev override or the server fetch) or
- * "unbound" (no bot bound yet, or the server was transiently unreachable — both
- * collapse to a backoff-and-retry in the resident loop).
- */
-type CredentialResolution =
-  | {
-      readonly _tag: "Resolved";
-      readonly creds: FeishuCredentialOverride;
-      readonly source: "env" | "rpc";
-    }
-  | { readonly _tag: "Unbound" };
-
-/**
- * Internal marker that a per-binding session ended on a NON-interrupt cause
- * (e.g. the orDie'd Lark `connect` defect, or any unexpected session defect). It
- * never surfaces to the user: it exists only to feed `Effect.retry`'s typed
- * failure channel so the session self-heals (rebuild scope+gateway) with backoff.
- * An interrupt (a re-bind won by `raceFirst`) is NOT wrapped — it propagates
- * directly, so the retry never swallows it and re-bind always wins. `effect-smol`
- * has no `Effect.unsandbox`, so this typed-failure bridge replaces the
- * sandbox/retry/unsandbox idiom.
- */
-class FeishuSessionFailure extends Data.TaggedError("FeishuSessionFailure") {}
-
-/**
- * Strip a known secret from a string (e.g. a stringified {@link Cause.Cause})
- * before it is logged, so the secret-isolation red line holds even in the rare
- * case the Lark SDK echoes the `appSecret` inside a connect/session error. A
- * no-op when the secret is empty — a blank `replaceAll` would splice the marker
- * between every character. The bound-session `creds.appSecret` is always present,
- * so this only redacts; it never mangles.
- */
-const redactSecret = (text: string, secret: string): string =>
-  secret.length > 0 ? text.replaceAll(secret, "***") : text;
-
-/**
- * Per-session self-heal schedule: exponential from 1s, capped at 30s, recurring
- * forever (mirrors apps/web's `exponential ∪ spaced` cap idiom — `either` takes
- * the min delay). Used to rebuild the Lark gateway after a transient connect
- * failure (the `gateway.connect` `orDie` defect) without crashing the loop.
- */
-const SESSION_RETRY_SCHEDULE = Schedule.exponential(Duration.seconds(1)).pipe(
-  Schedule.either(Schedule.spaced(Duration.seconds(30))),
-);
-
-/**
- * Safety re-check interval for the Unbound wait: even with no binding-change
- * wakeup we re-acquire periodically, so a secret injected without a
- * `feishuBinding` change (the split-injection e2e) — or a lost wakeup — recovers
- * within this bound instead of parking forever.
- */
-const UNBOUND_RECHECK_INTERVAL = Duration.seconds(30);
-
-/**
- * Resolve the bound thread for a composite chat key from {@link BindingState},
- * falling back to the deterministic `deriveThreadId` for a not-yet-bound chat.
- * Hoisted out of `program` so each per-binding `turnQueueLayer` reuses the SAME
- * lookup (its `BindingState` requirement is satisfied by the outer layer). See
- * the M2a/M3a invariant note on `turnQueueLayer`.
- */
-const threadIdForChatKey = (chatKey: string): Effect.Effect<ThreadId, never, BindingState> =>
-  BindingState.pipe(
-    Effect.flatMap((bindingState) => bindingState.get(chatKey)),
-    Effect.map((binding) => {
-      if (binding !== null) {
-        return binding.threadId;
-      }
-      const { chatId, larkThreadId } = splitChatKey(chatKey);
-      return deriveThreadId(chatId, larkThreadId);
-    }),
-  );
-
-/**
- * Resolve the bot's Feishu credentials for one loop iteration (never fails).
- *
- * - `.env` dev override present → use it verbatim (`source: "env"`); the bot
- *   never consults the server and never re-binds.
- * - Otherwise fetch the bound bot's credentials from the server via the
- *   `feishuGetBotCredentials` RPC. `{bound:false}` (no bot bound yet, or the
- *   secret was lost) → Unbound. `{bound:true}` → assemble the full credential set,
- *   deriving `domain` from `tenant` (the RPC carries `tenant`, not `domain`).
- *
- * A transient RPC failure (server briefly unreachable, reconnect snapshot
- * reload) is caught and collapsed to Unbound so the resident loop backs off and
- * retries — credential acquisition is total, matching the long-lived bot's
- * "wait, don't crash" contract. The logged cause is a typed RPC error and
- * structurally cannot carry the `appSecret` (that only rides a SUCCESS payload),
- * so logging it leaks nothing.
- */
-const acquireCredentials = (
-  config: FeishuBotConfig,
-  environmentId: EnvironmentId,
-): Effect.Effect<CredentialResolution, never, EnvironmentRegistry> =>
-  Effect.gen(function* () {
-    const override = config.feishu.credentialOverride;
-    if (override !== null) {
-      return { _tag: "Resolved", creds: override, source: "env" } as const;
-    }
-    const registry = yield* EnvironmentRegistry;
-    return yield* registry
-      .run(environmentId, EnvironmentRpc.request(WS_METHODS.feishuGetBotCredentials, {}))
-      .pipe(
-        Effect.map(
-          (result): CredentialResolution =>
-            result.bound
-              ? {
-                  _tag: "Resolved",
-                  creds: {
-                    appId: result.appId,
-                    appSecret: result.appSecret,
-                    tenant: result.tenant,
-                    domain: DOMAIN_BY_TENANT[result.tenant],
-                  },
-                  source: "rpc",
-                }
-              : { _tag: "Unbound" },
-        ),
-        Effect.catchCause((cause) =>
-          // Symmetric with the bound-session self-heal: let an interrupt (process
-          // shutdown) propagate verbatim instead of swallowing it into Unbound; any
-          // OTHER cause — a registry/transport defect or the two typed RPC errors —
-          // collapses to Unbound, preserving the never-fail contract (the resident
-          // loop then backs off and retries). The cause here is an RPC error and
-          // structurally cannot carry the `appSecret` (it only rides a SUCCESS
-          // payload), so no redaction is needed.
-          Cause.hasInterrupts(cause)
-            ? Effect.interrupt
-            : Effect.logWarning(
-                "[feishu-bot] could not fetch bot credentials from the server; will retry.",
-                cause,
-              ).pipe(Effect.as({ _tag: "Unbound" } as const)),
-        ),
-      );
-  });
-
-/**
- * Outer (binding-independent) watcher over `subscribeServerConfig`, hoisted from
- * the per-binding session (was the M4-2 fiber) so it survives every re-bind. It
- * carries several duties on each `snapshot` / `settingsUpdated` event, all
- * reading the FULL `ServerSettings` (not a delta):
- *
- *  1. **Binding view.** Publish the public binding identity (no secret) to
- *     `bindingView` so the resident loop can re-bind on a change. Because the
- *     settings are the FULL snapshot, `feishuBinding` always reflects the current
- *     binding — an unrelated settings change re-publishes the SAME identity,
- *     which `bindingIdentityEq` filters out (no spurious re-bind).
- *  2. **Owner + per-chat config live-refresh (M-2).** Publish the binding owner
- *     (`feishuBinding.ownerOpenId`, or `null`) to `ownerRef` for owner-always
- *     authz, and the per-chat approval config (`feishuChatConfigs`/
- *     `feishuChatDefaults`) to `chatConfigsRef`/`chatDefaultsRef` for the gate's
- *     three-state decision. Pure extractions, never cleared on error →
- *     last-known-good (a schema defect keeps the last good config rather than
- *     locking approvals out), preserving the authz fail-safe.
- *
- * `Stream.orDie` mirrors the other forked subscriptions: `subscribeServerConfig`
- * self-heals transient WS drops, and the handler is pure computation that never
- * throws, so `orDie` fires only on a schema defect / unhandled typed failure —
- * rare, and even then fail-safe (the Refs keep last-known-good). Forked onto the
- * OUTER scope by the caller.
- */
-const runBindingAndConfigWatcher = (
-  environmentId: EnvironmentId,
-  bindingView: SubscriptionRef.SubscriptionRef<BindingIdentity | null>,
-  ownerRef: Ref.Ref<string | null>,
-  chatConfigsRef: Ref.Ref<{ readonly [chatId: string]: FeishuChatConfig }>,
-  chatDefaultsRef: Ref.Ref<FeishuChatConfig>,
-): Effect.Effect<void, never, EnvironmentRegistry> =>
-  Effect.gen(function* () {
-    const registry = yield* EnvironmentRegistry;
-    yield* registry
-      .followStream(environmentId, EnvironmentRpc.subscribe(WS_METHODS.subscribeServerConfig, {}))
-      .pipe(
-        Stream.orDie,
-        Stream.runForEach((event) =>
-          Effect.gen(function* () {
-            // ServerConfigStreamEvent union: `snapshot` carries the full
-            // `config.settings`, `settingsUpdated` the full `payload.settings`;
-            // `keybindingsUpdated` / `providerStatuses` carry no settings → ignore.
-            const settings =
-              event.type === "snapshot"
-                ? event.config.settings
-                : event.type === "settingsUpdated"
-                  ? event.payload.settings
-                  : null;
-            if (settings === null) {
-              return;
-            }
-            // (1) Binding view — drives re-bind. Pure extraction, never throws.
-            yield* SubscriptionRef.set(bindingView, toBindingIdentity(settings.feishuBinding));
-            // (2) Owner + per-chat config live-refresh (M-2). Pure extractions,
-            // never throw → last-known-good fail-safe (never cleared on error, so a
-            // schema defect keeps the last good config rather than locking approvals
-            // out). `ownerRef` is the binding owner (a PUBLIC field) read by the
-            // cardAction gate for owner-always authz; `chatConfigsRef` /
-            // `chatDefaultsRef` carry the per-chat approval config the gate reads for
-            // its three-state (initiator/designated/all) decision.
-            yield* Ref.set(ownerRef, settings.feishuBinding?.ownerOpenId ?? null);
-            yield* Ref.set(chatConfigsRef, settings.feishuChatConfigs);
-            yield* Ref.set(chatDefaultsRef, settings.feishuChatDefaults);
-          }),
-        ),
-      );
-  });
-
 /**
  * Top-level program: resolve the environment, build the long-lived OUTER layer
  * (connection + durable stores + binding authority) once, then run the resident
@@ -4307,36 +3969,3 @@ export const program = (
     }),
     Effect.orDie,
   );
-
-/**
- * Translate the typed `resolveEnvironment` failures into an actionable,
- * single-line diagnostic and exit cleanly. Mirrors M0's reporter.
- */
-const reportAuthFailure = (error: RemoteEnvironmentRequestError): Effect.Effect<void> => {
-  switch (error._tag) {
-    case "EnvironmentAuthInvalidError":
-      return Console.error(
-        `[feishu-bot] pairing token rejected (${error.reason}). Re-run /pair on the server and update T3_PAIRING_TOKEN.`,
-      );
-    case "EnvironmentScopeRequiredError":
-      return Console.error(
-        `[feishu-bot] pairing token is missing the required scope "${error.requiredScope}". Re-issue it with the needed scopes.`,
-      );
-    case "EnvironmentRequestInvalidError":
-      return Console.error(`[feishu-bot] auth request rejected by the server (${error.reason}).`);
-    case "EnvironmentOperationForbiddenError":
-      return Console.error(`[feishu-bot] auth operation forbidden (${error.reason}).`);
-    case "EnvironmentInternalError":
-      return Console.error(`[feishu-bot] the server reported an internal error (${error.reason}).`);
-    case "RemoteEnvironmentAuthTimeoutError":
-    case "RemoteEnvironmentAuthFetchError":
-      return Console.error(
-        `[feishu-bot] could not reach the server; is it running and are httpBaseUrl/wsBaseUrl correct? (${error.message})`,
-      );
-    case "RemoteEnvironmentAuthUndeclaredStatusError":
-    case "RemoteEnvironmentAuthInvalidJsonError":
-      return Console.error(
-        `[feishu-bot] the server returned an unexpected response. ${error.message}`,
-      );
-  }
-};
