@@ -39,8 +39,12 @@ export type FeishuChatConfigMap = { readonly [chatId: string]: FeishuChatConfig 
 /** The three approval modes in display order, plus their Chinese labels. */
 export const APPROVAL_MODES: readonly ApprovalMode[] = ["initiator", "designated", "all"];
 
+// `initiator` is session-grain, NOT per-turn: it means the session's current Feishu
+// operator (the most recent person to drive/`/resume` this session). The label says
+// "会话发起者" rather than "发起人" so it does not read as a per-turn author. See the
+// bot's authz.ts SEMANTICS note.
 export const APPROVAL_MODE_LABELS: Record<ApprovalMode, string> = {
-  initiator: "仅发起人",
+  initiator: "仅会话发起者",
   designated: "指定审批人",
   all: "任意群成员",
 };

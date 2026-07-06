@@ -41,16 +41,12 @@ export interface InboundHandlerDeps {
    * snapshot.
    */
   readonly chatDefaultsRef: Ref.Ref<FeishuChatConfig>;
-  /** Assembly-owned current-operator map; this is the idle-guard write point. */
-  readonly chatOperators: Ref.Ref<ReadonlyMap<string, string>>;
   /** Mutable chat-to-thread binding state (in-memory authority). */
   readonly bindings: BindingState["Service"];
   /** Assembly-owned first-contact serialization permit (§5.7). */
   readonly ensureLock: Semaphore.Semaphore;
   /** Per-chat turn queue: idle-window coalescing + running-slot accounting. */
   readonly turnQueue: TurnQueue["Service"];
-  /** Read-only busy probe (turn running or coalescing) for the turn queue. */
-  readonly isChatBusy: (chatId: string) => Effect.Effect<boolean>;
   /** The slash-command dispatch table. */
   readonly commandTable: ReadonlyMap<string, CommandHandler>;
   /** First-contact thread resolution (get-or-create / adopt / offline buffer). */
@@ -93,11 +89,9 @@ export const makeInboundHandler = (deps: InboundHandlerDeps): InboundHandlerHand
     ownerRef,
     chatConfigsRef,
     chatDefaultsRef,
-    chatOperators,
     bindings,
     ensureLock,
     turnQueue,
-    isChatBusy,
     commandTable,
     ensureThread,
     runTurn,
@@ -151,26 +145,14 @@ export const makeInboundHandler = (deps: InboundHandlerDeps): InboundHandlerHand
         }
       }
 
-      // E④: remember who this conversation's operator is (per topic). The
-      // interaction card binds its buttons to this open id at render time; the
-      // cardAction verify re-checks the actual clicker against the token's `o`.
-      //
-      // Fix 1(c)/(d) (M3a): record the operator ONLY when the conversation is
-      // currently idle — i.e. this message is (about to become) a fresh turn's
-      // initiator. While a turn is running OR coalescing (`isChatBusy`), the
-      // active turn's operator is already pinned by `driveTurn`'s
-      // `operatorOverride` (the initiator) and must NOT be overwritten: otherwise
-      // a bystander @-mentioning the bot mid-turn would flip the Ref, the next
-      // tick would re-sign the approval buttons to the bystander (who could then
-      // approve someone else's turn), and the real initiator's own click would be
-      // rejected (context-mismatch). The pinned-initiator override is the live
-      // backstop; this idle guard keeps the Ref itself sane for the idle paths
-      // (e.g. `surfacePendingApprovalIfNew`) that still read it. For p2p the
-      // operator is always the same person, so skipping a redundant rewrite while
-      // busy is a no-op → byte-identical.
-      if (!(yield* isChatBusy(chatKey))) {
-        yield* Ref.update(chatOperators, (map) => new Map(map).set(chatKey, message.senderId));
-      }
+      // (Pin-drift fix) The old idle-guard that recorded
+      // `chatOperators[chatKey] = message.senderId` here has been REMOVED. The
+      // approval card's signed `payload.o` is no longer resolved from a per-chat
+      // "last sender" ref — which a mid-observe bystander could drift while an
+      // observe turn keeps the chat `isChatBusy=false`, then self-authorize in
+      // `initiator` mode — but from the per-thread `feishuInitiators` map, written
+      // ONLY by turn-establishing Feishu actions (`driveTurn` / `/resume` / M18).
+      // A raw inbound no longer touches any operator-signing state.
 
       // Content filter (M16): M1 dispatches text only. A message with no text
       // (image/file-only, or an empty body) must NOT become an empty-prompt

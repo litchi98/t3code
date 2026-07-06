@@ -33,6 +33,7 @@ import type { BindingState } from "./bindingState.ts";
 import { type RenderDensity, renderThreadCard } from "./eventRenderer.ts";
 import { splitChatKey } from "./chatThreadMap.ts";
 import { topicSendOpts } from "./notices.ts";
+import { resolveObserveOperator } from "./observeOperator.ts";
 import { observeThread, type ThreadObservation } from "./session.ts";
 import { type ShellSnapshotCache, shellStatus } from "./shellCache.ts";
 
@@ -50,8 +51,13 @@ export interface ObserveMirrorDeps {
   readonly shellCache: ShellSnapshotCache;
   /** Assembly-owned read-only busy probe for the turn queue. */
   readonly isChatBusy: (chatId: string) => Effect.Effect<boolean>;
-  /** Assembly-owned current-operator map, read at render time. */
-  readonly chatOperators: Ref.Ref<ReadonlyMap<string, string>>;
+  /**
+   * Assembly-owned trusted per-thread Feishu-initiator map (`threadId` →
+   * operator open_id), read at render time to sign approval cards. Written ONLY
+   * by turn-establishing Feishu actions (`driveTurn` / `/resume` / M18), never a
+   * raw inbound — so a mid-observe bystander cannot drift it (pin-drift fix).
+   */
+  readonly feishuInitiators: Ref.Ref<ReadonlyMap<ThreadId, string>>;
   /** Build signed approval and user-input controls for a thread. */
   readonly buildInteraction: (
     chatKey: string,
@@ -85,6 +91,7 @@ export interface ObserveMirrorHandle {
     chatId: string,
     threadId: ThreadId,
     replyToMessageId?: string,
+    initiatorOpenId?: string,
   ) => Effect.Effect<void>;
   readonly isObserving: (chatId: string) => Effect.Effect<boolean>;
   readonly stopObserve: (chatId: string) => Effect.Effect<void>;
@@ -119,7 +126,7 @@ export const makeObserveMirror = (deps: ObserveMirrorDeps): Effect.Effect<Observ
       cardHandles,
       shellCache,
       isChatBusy,
-      chatOperators,
+      feishuInitiators,
       buildInteraction,
       resolveDensity,
       subscribeThread,
@@ -147,8 +154,21 @@ export const makeObserveMirror = (deps: ObserveMirrorDeps): Effect.Effect<Observ
       // on the binding as `topicAnchorMessageId` so later topic-anchored cards land
       // inside the topic. Absent (non-`/resume` callers) → cards post at the root.
       replyToMessageId?: string,
+      // The `/resume` command sender (takeover initiator). Recorded as this thread's
+      // trusted Feishu initiator BEFORE any await below, so the observe fiber this
+      // starts signs approval cards for the taker — a bystander who `@`-mentions the
+      // bot during the (up to 10s) snapshot read cannot drift it (pin-drift fix).
+      initiatorOpenId?: string,
     ): Effect.Effect<void> =>
       Effect.gen(function* () {
+        // Record the takeover initiator FIRST (before the snapshot await and the
+        // `ensureObserving` below), so the mirrored turn's approval card is signed for
+        // the taker regardless of who `@`-mentions the bot in between. Non-empty only.
+        if (initiatorOpenId !== undefined && initiatorOpenId.length > 0) {
+          yield* Ref.update(feishuInitiators, (map) =>
+            new Map(map).set(threadId, initiatorOpenId),
+          );
+        }
         // M2b-3: a `/resume` may re-point a chat that is already mirroring a previous
         // thread. Tear down any existing observe fiber first so the new takeover's
         // `ensureObserving` below is not deduped out by a stale entry under this
@@ -282,9 +302,9 @@ export const makeObserveMirror = (deps: ObserveMirrorDeps): Effect.Effect<Observ
         // anti-duplication). On takeover there is no prior CardHandle, so the helper's
         // single-source dedup naturally passes and surfaces approval #1 — persisting
         // its requestId as the dedup baseline the watcher then composes with (it skips
-        // the same id and surfaces a later #2). The operator captured by
-        // `handleInbound` before routing `/resume` is read from `chatOperators` inside
-        // the helper. Still mirror-light: no resident observe fiber. Robustness
+        // the same id and surfaces a later #2). The approval is signed for the thread's
+        // trusted `feishuInitiators` value (the `/resume` taker) read inside the helper.
+        // Still mirror-light: no resident observe fiber. Robustness
         // (catchCause) lives inside the helper.
         //
         // #7: reuse the `snapshotThread` we already read above for the transcript card
@@ -531,8 +551,9 @@ export const makeObserveMirror = (deps: ObserveMirrorDeps): Effect.Effect<Observ
     // failure must NEVER crash the bot or wedge the watcher's reconciliation loop.
     const surfacePendingApprovalIfNew = (
       // M3a: composite `chatId[:larkThreadId]` conversation key. Used verbatim for
-      // every state lookup (busy/observe gates, cardHandles, chatOperators,
-      // buildInteraction); the actual card is sent to the real Feishu chatId
+      // every state lookup (busy/observe gates, cardHandles, buildInteraction); the
+      // approval operator comes from `feishuInitiators` keyed by `threadId`. The
+      // actual card is sent to the real Feishu chatId
       // (`splitChatKey`) at the `startStreamingCard` call below.
       chatId: string,
       threadId: ThreadId,
@@ -610,26 +631,21 @@ export const makeObserveMirror = (deps: ObserveMirrorDeps): Effect.Effect<Observ
           return;
         }
 
-        // Operator: a `resumed` binding was `/resume`d by a user, so `chatOperators`
-        // is normally populated (the inbound `/resume` set it before routing). After
-        // a restart, though, the Ref is empty even though the durable handle still
-        // carries the operator who triggered the prior card — so for a brand-new
-        // approval that surfaces post-restart we fall back to that persisted operator
-        // (in a p2p private chat the takeover operator is the same person, so the
-        // persisted open id is valid for the new request too). Reuse the handle read
-        // above for the dedup so we don't fetch it twice. If BOTH are empty we still
-        // surface the card so the user *sees* a request is pending. M-2: whether its
-        // buttons are actionable now depends on the authz gate's per-chat mode, not on
-        // this operator: with a bound owner (owner-always) or a `designated`/`all`
-        // chat, the card is approvable regardless of the empty operator here. Only in
-        // `initiator` mode with no owner does an empty operator yield a readable-but-
-        // not-clickable card (the gate then needs `payload.o` = the initiator; no
-        // wildcard / auth bypass), prompting a resend — mirroring M18's graceful fallback.
-        const operators = yield* Ref.get(chatOperators);
+        // Operator = the turn's TRUSTED Feishu initiator (`feishuInitiators`, keyed by
+        // `threadId`), or the durable handle's operator when the map has no entry (a
+        // post-restart approval whose handle still carries the recovered operator; in
+        // p2p the takeover operator is the same person, valid for the new request too).
+        // Reuse the handle read above so we don't fetch it twice. If BOTH are empty we
+        // STILL surface the card so the user *sees* a pending request; whether its
+        // buttons are actionable is decided by the authz gate's per-chat mode, not by
+        // this operator: owner-always / `designated` / `all` stay approvable regardless.
+        // Only `initiator` mode with no owner yields a readable-but-not-clickable card
+        // (the gate needs `payload.o` = the initiator; no wildcard / auth bypass) — the
+        // correct outcome for a turn with no Feishu initiator (approve it from the web).
+        const initiators = yield* Ref.get(feishuInitiators);
         const operatorOpenId =
-          // #5: the trailing `?? ""` was unreachable — the conditional's else branch
-          // already yields `""`, so the `??` could only ever see a non-nullish string.
-          operators.get(chatId) ?? (Option.isSome(handleOpt) ? handleOpt.value.operatorOpenId : "");
+          initiators.get(threadId) ??
+          (Option.isSome(handleOpt) ? handleOpt.value.operatorOpenId : "");
 
         const interaction = yield* buildInteraction(chatId, snapshotThread, operatorOpenId);
         const density = yield* resolveDensity(chatId, snapshotThread.runtimeMode);
@@ -701,15 +717,14 @@ export const makeObserveMirror = (deps: ObserveMirrorDeps): Effect.Effect<Observ
       threadId: ThreadId,
       observation: ThreadObservation,
       handle: StreamingCard,
-      // M2b-3 adopt path: optional operator override forwarded to every
-      // `buildInteraction` here. The live `driveTurn`/streaming paths omit it and
-      // resolve the operator from the in-process `chatOperators` Ref. When this
-      // observe fiber ADOPTS an M18-recovered card after a restart the Ref is empty,
-      // so the adopt branch passes the operator captured on the persisted handle —
-      // exactly as M18 `recoverApprovalCards` re-signs its buttons — so the adopted
-      // approval's buttons verify when clicked instead of dead-ending on an empty
-      // open id. A non-empty override wins inside `buildInteraction`; otherwise it
-      // falls back to the Ref (live behaviour unchanged).
+      // The TRUSTED operator to sign into `payload.o`, forwarded to every
+      // `buildInteraction` here. Callers supply it explicitly — `driveTurn` pins this
+      // turn's initiator; the observe path resolves it from the per-thread
+      // `feishuInitiators` map (falling back to the persisted handle's operator on an
+      // M18-recovered adopt). There is NO driftable-ref fallback: an empty/undefined
+      // override signs `payload.o` empty, which the `initiator`-mode gate treats as
+      // "no Feishu initiator" → rejects non-owner clicks (approve from the web / as
+      // owner). This is what keeps a mid-observe bystander from re-signing the card.
       operatorOverride?: string,
     ): Effect.Effect<void, never, Scope.Scope> =>
       Effect.gen(function* () {
@@ -734,55 +749,38 @@ export const makeObserveMirror = (deps: ObserveMirrorDeps): Effect.Effect<Observ
             Effect.flatMap((seen) =>
               seen === pendingRequestId
                 ? Effect.void
-                : // Capture the chat's *current* real operator open id (#0/#1):
-                  // the verify side reads `evt.operator.openId`, the same source
-                  // `handleInbound` writes into `chatOperators` — so persisting it
-                  // here lets M18 restart recovery re-sign approval buttons for the
-                  // real operator instead of an empty string (which would never
-                  // match at verify time, permanently dead-ending the button).
-                  //
-                  // Bug C — do NOT blank a recoverable operator. After a restart the
-                  // `chatOperators` Ref is empty even though a durable handle may still
-                  // carry the operator who triggered the prior (M18-recovered) card.
-                  // Unconditionally writing `""` here would poison that handle, so on
-                  // the next restart M18 sees an empty operator and DROPS the handle
-                  // (downgrading to a "send a message" nudge). Fall back to the existing
-                  // handle's `operatorOpenId` when the Ref has none. Empty string is
-                  // only written when BOTH are genuinely unknown.
-                  //
-                  // Fix 1(b) (M3a): a non-empty `operatorOverride` (the live
-                  // `driveTurn` now pins this turn's *initiator*; the observe/adopt
-                  // path passes the recovered handle's operator) wins — the SAME
-                  // precedence `buildInteraction` uses. This persists the pinned
-                  // initiator into the durable handle so M18 restart recovery re-signs
-                  // the recovered approval for the initiator, NOT for whoever last
-                  // @-mentioned the bot (which a later inbound could have flipped in
-                  // the Ref). For p2p the initiator equals the chat owner equals the
-                  // Ref value, so this is byte-identical.
-                  Effect.all([
-                    Ref.get(chatOperators),
-                    cardHandles
-                      .get(chatId)
-                      .pipe(Effect.orElseSucceed(() => Option.none<CardHandle>())),
-                  ]).pipe(
-                    Effect.flatMap(([operators, existing]) =>
-                      cardHandles
-                        .put(chatId, {
-                          messageId: handle.messageId,
-                          pendingRequestId,
-                          lastSequence: 0,
-                          operatorOpenId:
-                            operatorOverride !== undefined && operatorOverride.length > 0
-                              ? operatorOverride
-                              : (operators.get(chatId) ??
-                                (Option.isSome(existing) ? existing.value.operatorOpenId : "")),
-                        })
-                        .pipe(
-                          Effect.ignore,
-                          Effect.andThen(Ref.set(lastPendingId, pendingRequestId)),
-                        ),
+                : // Persist the operator so M18 restart recovery can re-sign the
+                  // approval buttons. Precedence: the caller's TRUSTED `operatorOverride`
+                  // (`driveTurn`'s pinned initiator, or the observe path's
+                  // `feishuInitiators` value) → the existing handle's operator (Bug C:
+                  // do NOT blank a recoverable operator — writing `""` would poison the
+                  // handle so the next restart drops it) → `""` when genuinely unknown.
+                  // No driftable `chatOperators` read — the SAME trusted source
+                  // `buildInteraction` signs from, so persisted and rendered `payload.o`
+                  // stay in lock-step (and a bystander cannot poison the durable handle).
+                  cardHandles
+                    .get(chatId)
+                    .pipe(
+                      Effect.orElseSucceed(() => Option.none<CardHandle>()),
+                      Effect.flatMap((existing) =>
+                        cardHandles
+                          .put(chatId, {
+                            messageId: handle.messageId,
+                            pendingRequestId,
+                            lastSequence: 0,
+                            operatorOpenId:
+                              operatorOverride !== undefined && operatorOverride.length > 0
+                                ? operatorOverride
+                                : Option.isSome(existing)
+                                  ? existing.value.operatorOpenId
+                                  : "",
+                          })
+                          .pipe(
+                            Effect.ignore,
+                            Effect.andThen(Ref.set(lastPendingId, pendingRequestId)),
+                          ),
+                      ),
                     ),
-                  ),
             ),
           );
         // Record the card handle once up front (no pending yet) so M2b-2 recovery can
@@ -958,9 +956,9 @@ export const makeObserveMirror = (deps: ObserveMirrorDeps): Effect.Effect<Observ
           // authoritative frame, opening a fresh streaming card would post a SECOND
           // card for it (and `persistHandle(null)` would clobber the durable handle's
           // operator → dead buttons). Instead ADOPT: keep rendering onto the recovered
-          // `messageId` via `updateCard`, re-signing the approval for the operator
-          // captured on the handle (the `chatOperators` Ref is empty right after a
-          // restart — same as M18). A STALE handle from an old turn whose request is
+          // `messageId` via `updateCard`, re-signing the approval for the operator from
+          // the `feishuInitiators` map (falling back to the operator captured on the
+          // handle — M18 recovery seeds both). A STALE handle from an old turn whose request is
           // NOT in this thread's live-pending set is ignored → we fall through and open
           // a fresh card (no mis-adoption). The adopt path has NO streaming producer,
           // so it creates NO `cardDone` (a dangling `cardDone` would never resolve).
@@ -976,24 +974,31 @@ export const makeObserveMirror = (deps: ObserveMirrorDeps): Effect.Effect<Observ
             .get(chatId)
             .pipe(Effect.orElseSucceed(() => Option.none<CardHandle>()));
 
-          // Operator fallback shared by BOTH render branches (adopt AND fresh card).
-          // The live `chatOperators` Ref is the authoritative source while the bot has
-          // seen an inbound/`/resume` for this chat — but it is EMPTY right after a
-          // restart, even though a durable handle may still carry the operator who
-          // triggered the recovered (M18) card. When the Ref has this chat, pass
-          // `undefined` so `buildInteraction` resolves from the Ref (live behaviour
-          // unchanged); when it does not, fall back to the persisted handle's
-          // `operatorOpenId` so an approval that surfaces post-restart is still signed
-          // for the recovered operator instead of an empty open id (dead buttons). The
-          // fresh-card branch previously passed NO override, so on a restart where
-          // observe lost the adopt race (the first live-pending request already
-          // resolved) its approval buttons would dead-end — this fallback fixes that.
-          const liveOperators = yield* Ref.get(chatOperators);
-          const operatorFallback = liveOperators.has(chatId)
-            ? undefined
-            : Option.isSome(existing) && existing.value.operatorOpenId.length > 0
+          // Operator override shared by BOTH render branches (adopt AND fresh card),
+          // resolved from the TRUSTED `feishuInitiators` map (keyed by `threadId`) —
+          // NOT a driftable per-chat "last sender" ref. Security (observe pin-drift →
+          // `initiator`-mode bypass): an observe fiber keeps the chat `isChatBusy=false`,
+          // so the idle-guard would let a mid-observe bystander `@`-mention flip a
+          // per-chat pin to themselves; reading it here would re-sign the approval
+          // card's `payload.o` to that bystander, who could then self-authorize in
+          // `initiator` mode. The map is written only by Feishu-side actions that
+          // establish a real initiator (driveTurn / `/resume` / M18), so a bystander
+          // cannot poison it.
+          //
+          // Precedence (see `resolveObserveOperator`): the map's trusted initiator →
+          // the persisted handle's operator (M18 restart: the durable handle carries the
+          // recovered operator) → `undefined`. A turn with NO Feishu initiator (a
+          // web/terminal-started turn the bot merely mirrors) resolves to `undefined` →
+          // `buildInteraction` signs `payload.o` EMPTY → the `initiator`-mode gate
+          // rejects every non-owner click (approve it from the web / as owner). No
+          // driftable ref remains in the signing path.
+          const initiators = yield* Ref.get(feishuInitiators);
+          const operatorFallback = resolveObserveOperator(
+            initiators.get(threadId),
+            Option.isSome(existing) && existing.value.operatorOpenId.length > 0
               ? existing.value.operatorOpenId
-              : undefined;
+              : undefined,
+          );
 
           if (
             Option.isSome(existing) &&

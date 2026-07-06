@@ -60,8 +60,6 @@ export const CALLBACK_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 export interface InteractionBuilderDeps {
   /** Per-binding CallbackAuth instance. */
   readonly auth: CallbackAuth;
-  /** Assembly-owned shared operator Ref. */
-  readonly chatOperators: Ref.Ref<ReadonlyMap<string, string>>;
   /** Assembly-owned shared resolved-notices Ref. */
   readonly chatResolvedNotices: Ref.Ref<
     ReadonlyMap<string, ReadonlyMap<string, ResolvedNoticeEntry>>
@@ -70,7 +68,7 @@ export interface InteractionBuilderDeps {
 
 /** Construct the interaction-section builder for one bound Feishu session. */
 export const makeInteractionBuilder = (deps: InteractionBuilderDeps) => {
-  const { auth, chatOperators, chatResolvedNotices } = deps;
+  const { auth, chatResolvedNotices } = deps;
 
   /**
    * Build the interaction section (approval buttons / user-input form / stale
@@ -95,13 +93,13 @@ export const makeInteractionBuilder = (deps: InteractionBuilderDeps) => {
     // can recover the topic — both are recovered via `splitChatKey` below.
     chatKey: string,
     thread: OrchestrationThread,
-    // #0/#1(b): optional operator override. The live `driveTurn` path omits it
-    // and resolves the operator from the in-process `chatOperators` Ref. M18
-    // restart recovery passes the operator captured on the persisted card handle
-    // (`handle.operatorOpenId`) because the Ref is empty right after a restart —
-    // re-signing with an empty open id would never match at verify time and would
-    // dead-end the recovered button. A non-empty override wins; otherwise we fall
-    // back to the Ref (preserving the existing live behaviour exactly).
+    // The TRUSTED Feishu initiator to sign into `payload.o`. Every caller now
+    // supplies it explicitly — there is NO driftable-ref fallback: `driveTurn`
+    // pins this turn's initiator, observe / `surfacePendingApprovalIfNew` read
+    // `feishuInitiators`, M18 restart recovery passes the durable handle's
+    // operator. Empty/undefined → `payload.o` is signed empty, which the
+    // `initiator`-mode gate treats as "no Feishu initiator" → rejects non-owner
+    // clicks (owner-always still approves; the web end still approves via §11E).
     operatorOverride?: string,
   ): Effect.Effect<{ readonly elements: ReadonlyArray<object> } | undefined> =>
     Effect.gen(function* () {
@@ -122,18 +120,18 @@ export const makeInteractionBuilder = (deps: InteractionBuilderDeps) => {
       ) {
         return undefined;
       }
-      const operators = yield* Ref.get(chatOperators);
-      const rawInitiator =
-        operatorOverride !== undefined && operatorOverride.length > 0
-          ? operatorOverride
-          : (operators.get(chatKey) ?? "");
-      // M-2/PR2b: the token's signed `payload.o` is the true turn initiator
-      // (initiator-only). WHO may approve is decided by the cardAction gate's
-      // three-state mode, NOT here; `payload.o` is only consulted in `initiator`
-      // mode, where it must equal the real initiator. The per-turn operator pin
-      // (idle-guarded `chatOperators` + `driveTurn`'s `operatorOverride`) keeps
-      // `rawInitiator` un-flippable by a mid-turn bystander.
-      const operatorOpenId = rawInitiator;
+      // M-2/PR2b + pin-drift fix: `payload.o` is the turn's TRUSTED Feishu
+      // initiator, supplied by the caller via `operatorOverride` — the pinned
+      // initiator for `driveTurn`, the `feishuInitiators` map value for
+      // observe/surface, the durable handle's operator for M18. It is NEVER
+      // resolved from a driftable per-chat "last sender" ref here (that was the
+      // pin-drift escalation). An empty override → `payload.o` signed empty → the
+      // cardAction `initiator`-mode gate rejects every non-owner clicker (owner-
+      // always still approves; the web end still approves via §11E). WHO may
+      // approve is decided by the gate's three-state mode, NOT here; `payload.o`
+      // is only consulted in `initiator` mode.
+      const operatorOpenId =
+        operatorOverride !== undefined && operatorOverride.length > 0 ? operatorOverride : "";
       const staleSet = staleRequestIdsOf(thread.activities);
       // M3a: recover the real Feishu chatId (for the token's `c`/`scope`, matched
       // at verify against `evt.chatId`) and the topic id (signed into the token's

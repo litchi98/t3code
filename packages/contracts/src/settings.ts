@@ -383,8 +383,10 @@ export type FeishuRenderDensity = (typeof FEISHU_RENDER_DENSITIES)[number];
 
 export const FeishuChatConfig = Schema.Struct({
   // Approval-gate mode. `all` = any chat member, `designated` = the `approvers`
-  // set, `initiator` = the turn initiator only. Absent → per-chat-type fallback
-  // (resolved by the bot in PR2b), never a hard default baked in here.
+  // set, `initiator` = the session's current Feishu operator only (the most recent
+  // person to drive/`/resume` this session — session grain, NOT the per-turn author;
+  // see the bot's authz.ts SEMANTICS note). Absent → per-chat-type fallback (resolved
+  // by the bot in PR2b), never a hard default baked in here.
   approvalMode: Schema.optional(Schema.Literals(["all", "designated", "initiator"])),
   // open_ids allowed to approve when `approvalMode === "designated"`.
   approvers: Schema.optional(Schema.Array(Schema.String)),

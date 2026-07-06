@@ -38,6 +38,7 @@ import * as Stream from "effect/Stream";
 import type { LarkGateway } from "../lark/index.ts";
 import type { CardActionEvent } from "../lark/types.ts";
 import type { AuditStore, CallbackNonceStore } from "../runtime/persistence.ts";
+import type { CardHandle, CardHandleStore } from "../runtime/persistence.ts";
 import { authorizeApprovalClick } from "./authz.ts";
 import type { BindingState } from "./bindingState.ts";
 import type { CallbackAuth } from "./callbackAuth.ts";
@@ -46,6 +47,7 @@ import { effectiveChatConfig } from "./chatConfig.ts";
 import { compositeChatKey, splitChatKey } from "./chatThreadMap.ts";
 import { type RenderDensity, renderThreadCard } from "./eventRenderer.ts";
 import { CALLBACK_TOKEN_TTL_MS, staleRequestIdsOf } from "./interaction.ts";
+import { resolveObserveOperator } from "./observeOperator.ts";
 import {
   actionToApprovalDecision,
   formValueToAnswers,
@@ -83,6 +85,16 @@ export interface CardActionHandlerDeps {
   readonly audit: AuditStore["Service"];
   /** Mutable chat-to-thread binding state (in-memory authority). */
   readonly bindings: BindingState["Service"];
+  /** Durable latest-card handles; the echo reads the recovered operator fallback. */
+  readonly cardHandles: CardHandleStore["Service"];
+  /**
+   * Assembly-owned trusted per-thread Feishu-initiator map (`threadId` →
+   * operator open_id). The approval echo re-signs still-pending SIBLING controls
+   * from THIS map (not the clicker) so a clicker authorised only by `all` /
+   * `designated` mode cannot plant `payload.o = clicker` into a sibling token
+   * and self-authorize after a later tighten to `initiator` mode (pin-drift class).
+   */
+  readonly feishuInitiators: Ref.Ref<ReadonlyMap<ThreadId, string>>;
   /** Resident shell snapshot cache (verify-side runtimeMode read). */
   readonly shellCache: ShellSnapshotCache;
   /** Connected Feishu gateway for card updates + contact lookups. */
@@ -152,6 +164,8 @@ export const makeCardActionHandler = (
       nonceStore,
       audit,
       bindings,
+      cardHandles,
+      feishuInitiators,
       shellCache,
       gateway,
       ownerRef,
@@ -241,8 +255,8 @@ export const makeCardActionHandler = (
     // so no click is ever the "unchanged" one the SDK latches onto; only the neutral
     // @-notice is deduped (to at most once per (chatKey, messageId, clicker)) so repeated
     // taps don't spam the topic. Buttons are re-signed for the verified token's initiator
-    // (`res.payload.o`, passed as `initiatorOpenId`), NOT the driftable `chatOperators`
-    // Ref and NOT the bystander clicker — see the call below for why. Called from the
+    // (`res.payload.o`, passed as `initiatorOpenId`), NOT the bystander clicker and NOT
+    // any ambient/mutable ref — see the call below for why. Called from the
     // authz gate: the token already passed `verify`, which proves the click targets the
     // live card for this chat/thread/policy. Generic wording covers approval and
     // user-input interactions.
@@ -269,22 +283,16 @@ export const makeCardActionHandler = (
         yield* Effect.gen(function* () {
           // Re-sign the re-armed buttons for the EXACT initiator carried by the just-
           // verified live token (`initiatorOpenId` = `res.payload.o`), passed as
-          // `buildInteraction`'s `operatorOverride`. We must NOT let `buildInteraction`
-          // resolve the operator from the live `chatOperators` Ref, which is DRIFTABLE on
-          // the observe path: a bystander who @-mentions the bot with a floor command
-          // (e.g. `/help`) on an `isChatBusy=false` observe turn (/resume takeover,
-          // chained subagent, M18 recovery) flips the idle-guarded pin to their own id
-          // WITHOUT starting a turn that would re-pin the initiator. Re-signing from that
-          // Ref would let the bystander set the new `payload.o` to themselves and then
-          // self-approve in `initiator` mode — a privilege escalation. Since a non-empty
-          // override wins over the Ref, guard on it: when `initiatorOpenId` is empty (only
-          // a non-initiator-mode / M18-recovered card whose initiator was never captured),
-          // `buildInteraction` would FALL BACK to that driftable Ref, so we SKIP the re-arm
-          // entirely rather than risk re-signing for a drifted bystander — mirroring M18
-          // recovery's refusal to re-sign empty-operator cards. The narrow cost is that
-          // such a recovered card keeps the old dead-button behaviour (no re-arm); the
-          // common case (non-empty initiator) re-arms normally and stays signed for the
-          // real approver, so the bystander stays locked out.
+          // `buildInteraction`'s `operatorOverride`. This is the token the bystander's
+          // own click just carried, so re-arming reproduces the SAME approval authority
+          // — it can never widen it: `res.payload.o` is fixed by `verify`, never read
+          // from any mutable ref. When `initiatorOpenId` is empty (a card signed with no
+          // Feishu initiator — a web/terminal-mirrored turn, or a non-initiator-mode /
+          // M18-recovered card), re-arming would just re-emit an empty-operator card,
+          // which in `initiator` mode is intentionally non-clickable for non-owners
+          // (approve it from the web); so we SKIP the re-arm rather than churn the card.
+          // The common case (non-empty initiator) re-arms normally and stays signed for
+          // the real approver, so a bystander stays locked out.
           if (initiatorOpenId.length === 0) {
             return;
           }
@@ -600,9 +608,34 @@ export const makeCardActionHandler = (
           return new Map(map).set(chatKey, forChat);
         });
 
+        // SECURITY (observe pin-drift class — same root the render/observe paths
+        // close above): this echo re-renders every SIBLING request still pending
+        // on THIS card as a LIVE button, re-signing each token's `payload.o`. Sign
+        // those siblings with the TRUSTED session operator (`feishuInitiators` →
+        // durable handle → ""), NEVER with the clicker `evt.operator.openId`.
+        // Otherwise a clicker authorised only because the chat was in `all` /
+        // `designated` mode plants `payload.o = clicker` into a sibling token; the
+        // policy fingerprint does NOT bind `approvalMode` and tokens live
+        // `CALLBACK_TOKEN_TTL_MS`, so a later tighten to `initiator` mode would let
+        // that same clicker self-authorize the still-live sibling (`clicker ===
+        // payload.o`). The audit entry (above) and the resolved-notice below still
+        // record the real clicker `evt.operator` — only the SIGNING identity of the
+        // re-rendered live siblings is forced back to the trusted operator.
+        const echoInitiators = yield* Ref.get(feishuInitiators);
+        const echoHandleOpt = yield* cardHandles
+          .get(evt.chatId)
+          .pipe(Effect.orElseSucceed(() => Option.none<CardHandle>()));
+        const trustedEchoOperator =
+          resolveObserveOperator(
+            echoInitiators.get(threadId),
+            Option.isSome(echoHandleOpt) && echoHandleOpt.value.operatorOpenId.length > 0
+              ? echoHandleOpt.value.operatorOpenId
+              : undefined,
+          ) ?? "";
+
         const echoResolved = (): Effect.Effect<void> =>
           Effect.gen(function* () {
-            const operatorOpenId = evt.operator.openId;
+            const operatorOpenId = trustedEchoOperator;
             const ctx: InteractionContext = {
               // The token's `c`/`scope` is the real Feishu chatId (matched at verify
               // against `evt.chatId`); the topic id rides in `larkThreadId` so any
