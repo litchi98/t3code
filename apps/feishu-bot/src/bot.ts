@@ -1,10 +1,5 @@
+import { connectionProjectionPhase, EnvironmentRegistry } from "@t3tools/client-runtime/connection";
 import {
-  connectionProjectionPhase,
-  EnvironmentRegistry,
-  EnvironmentSupervisor,
-} from "@t3tools/client-runtime/connection";
-import {
-  createProject,
   createThread,
   respondToThreadApproval,
   respondToThreadUserInput,
@@ -19,22 +14,15 @@ import {
 import {
   ApprovalRequestId,
   CommandId,
-  type EnvironmentId,
   type FeishuChatConfig,
   MessageId,
   ModelSelection,
   ORCHESTRATION_WS_METHODS,
-  type OrchestrationMessage,
-  type OrchestrationProjectShell,
   type OrchestrationThread,
   type OrchestrationThreadActivity,
-  type OrchestrationThreadStreamItem,
-  ProjectId,
   type RuntimeMode,
   ThreadId,
   type TurnId,
-  TrimmedNonEmptyString,
-  WS_METHODS,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
@@ -52,7 +40,6 @@ import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schedule from "effect/Schedule";
-import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
@@ -73,13 +60,12 @@ import {
 import { LarkGateway, type StreamingCard } from "./lark/index.ts";
 import { larkGatewayLayer } from "./lark/channel.ts";
 import { reportFeishuChatDirectory } from "./chat-directory.ts";
-import type { BridgeHandlers, CardActionEvent, InboundMessage, SendOptions } from "./lark/types.ts";
+import type { BridgeHandlers, CardActionEvent, InboundMessage } from "./lark/types.ts";
 import {
   authorizeApprovalClick,
   authorizeCommand,
   COMMAND_FLOOR,
   isOwnerExempt,
-  isWorkspaceAuthorized,
 } from "./bridge/authz.ts";
 import { effectiveChatConfig } from "./bridge/chatConfig.ts";
 import { CallbackAuth, computePolicyFingerprint } from "./bridge/callbackAuth.ts";
@@ -120,8 +106,12 @@ import {
 import { runShellCacheFiber, shellStatus } from "./bridge/shellCache.ts";
 import { runShellWatcherFiber } from "./bridge/shellWatcher.ts";
 import { tryHandleCommand } from "./bridge/commands/registry.ts";
-import { buildCommandTable, WorkspaceCommandError } from "./bridge/commands/handlers.ts";
+import { buildCommandTable } from "./bridge/commands/handlers.ts";
 import { resolveModelSelection } from "./bridge/modelSelection.ts";
+import { makeEnvAccess } from "./bridge/envAccess.ts";
+import { makeNotices, topicSendOpts } from "./bridge/notices.ts";
+import { makeWorkspaceGate } from "./bridge/workspaceGate.ts";
+import { makeWorkspaceOps } from "./bridge/workspaceOps.ts";
 import {
   acquireCredentials,
   bindingIdentityEq,
@@ -154,29 +144,6 @@ const DISCOVERY_TIMEOUT = Duration.seconds(30);
 // `/workspace add`/`switch` before the first prompt. The `workspaceRoot`
 // config field (and the server-managed `T3_WORKSPACE_ROOT` injection) is kept
 // for compatibility but is no longer consumed here.
-
-/** Generate a branded id from a fresh UUIDv4 using the platform crypto service. */
-const makeBrandedId = <A>(brand: { readonly make: (value: string) => A }) =>
-  Crypto.Crypto.pipe(
-    Effect.flatMap((crypto) => crypto.randomUUIDv4),
-    Effect.orDie,
-    Effect.map((uuid) => brand.make(uuid)),
-  );
-
-/**
- * Decode a `TrimmedNonEmptyString`. Compiled once at module scope (the schema's
- * decoder is rebuilt on every call site otherwise). Used only for the
- * statically-valid placeholder title, so callers `Effect.orDie` the result.
- */
-const decodeTrimmedNonEmpty = Schema.decodeEffect(TrimmedNonEmptyString);
-
-/**
- * Decode a {@link ModelSelection} from a plain literal. Compiled once at module
- * scope. Used only for the statically-valid placeholder selection (M-1: the
- * placeholder thread no longer inherits a startup project/model), so callers
- * `Effect.orDie` the result.
- */
-const decodeModelSelection = Schema.decodeUnknownEffect(ModelSelection);
 
 /**
  * The set of request ids whose pending approval/user-input was force-resolved by
@@ -230,29 +197,6 @@ const FORM_SETTLE_DELAY = Duration.seconds(1);
  * iteration order ≈ insertion order) and drop the oldest entries.
  */
 const MAX_BYSTANDER_KEYS = 10_000;
-
-// ── M3a (group + topic) routing helpers ──────────────────────────────────────
-
-/**
- * Build the SDK {@link SendOptions} that post a streaming card *inside* a Feishu
- * topic or plain-group thread (M3a). Only produced when BOTH an anchor
- * (`larkThreadId`, non-undefined for topic / in-thread plain-group turns) and a
- * reply target (`replyTo`, the triggering message) are known — Feishu requires
- * `replyTo` to anchor the card inside the thread. Otherwise `undefined`, which
- * posts at the chat root (pre-M3a behaviour, and the acceptable degradation for
- * the observe path which has no triggering message). p2p always yields `undefined`
- * (`anchorOf` returns `undefined` for p2p, so no `larkThreadId` is ever set).
- * Plain-group and topic turns carry the composite anchor (rootId / messageId) and
- * post with `replyInThread: true`, which is also why plain-group turns require
- * topic mode (Feishu error 230071 otherwise).
- */
-const topicSendOpts = (
-  larkThreadId: string | undefined,
-  replyTo: string | undefined,
-): SendOptions | undefined =>
-  larkThreadId !== undefined && replyTo !== undefined
-    ? { replyTo, replyInThread: true }
-    : undefined;
 
 // ── Resident bridge core ─────────────────────────────────────────────────────
 
@@ -489,158 +433,11 @@ const runBoundSession = (
     // is swallowed and falls back to the raw openId — never blocking the echo.
     const operatorNames = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
 
-    /**
-     * Run an environment-scoped orchestration command on the connected
-     * environment, discharging its `EnvironmentSupervisor` (via `registry.run`)
-     * and `Crypto` requirements and surfacing any RPC/unavailable failure as a
-     * defect. Returns a fully total `Effect<A>` the bridge can compose freely.
-     */
-    const runOnEnv = <A, E>(
-      operation: Effect.Effect<A, E, Crypto.Crypto | EnvironmentSupervisor>,
-    ): Effect.Effect<A> =>
-      registry
-        .run(environmentId, operation)
-        .pipe(Effect.provideService(Crypto.Crypto, crypto), Effect.orDie);
+    const envAccess = makeEnvAccess({ registry, environmentId, crypto });
+    const { runOnEnv, genId, subscribeThread, isEnvReady } = envAccess;
 
-    // Branded-id generator with `Crypto` already provided → fully total effect.
-    const genId = <A>(brand: { readonly make: (value: string) => A }): Effect.Effect<A> =>
-      makeBrandedId(brand).pipe(Effect.provideService(Crypto.Crypto, crypto));
-
-    // `subscribeThread` stream for the session observer (replays a snapshot
-    // first; the defensive retry mirrors M0's create→subscribe propagation lag).
-    const subscribeThread = (threadId: ThreadId): Stream.Stream<OrchestrationThreadStreamItem> =>
-      registry
-        .followStream(
-          environmentId,
-          EnvironmentRpc.subscribe(
-            ORCHESTRATION_WS_METHODS.subscribeThread,
-            { threadId },
-            {
-              onExpectedFailure: () =>
-                Console.log("[feishu-bot] thread not ready yet; retrying subscription..."),
-              retryExpectedFailureAfter: "250 millis",
-            },
-          ),
-        )
-        .pipe(Stream.orDie);
-
-    // Point read of whether the t3code environment is currently connected
-    // (`ready`). Used to gate first-contact thread creation: a brand-new chat
-    // arriving while the server is offline must be buffered (⏳ + outbound queue)
-    // rather than orDie'ing inside the `createThread` dispatch. Never fails
-    // (a not-yet-registered environment reads as "not ready").
-    const isEnvReady: Effect.Effect<boolean> = registry.state(environmentId).pipe(
-      Effect.map((state) => connectionProjectionPhase(state) === "ready"),
-      Effect.orElseSucceed(() => false),
-    );
-
-    // A minimal, schema-valid `OrchestrationThread` used as the seed for the
-    // first card render (before any tick) and as the envelope for static notice
-    // cards. Built once from real branded ids + the resolved model selection, so
-    // it satisfies every required field with proper types — no `as unknown`
-    // cast. `renderThreadCard` only reads `messages`/`activities`/`session`; the
-    // rest is well-typed filler.
-    // A statically-valid constant; a decode failure here would be a programmer
-    // error, so surface it as a defect rather than threading `SchemaError`.
-    const placeholderTitle = yield* decodeTrimmedNonEmpty("feishu-bot").pipe(Effect.orDie);
-    const placeholderTimestamp = "1970-01-01T00:00:00.000Z";
-    const placeholderThreadId = yield* genId(ThreadId);
-    const placeholderMessageId = yield* genId(MessageId);
-    // M-1: with no startup project the placeholder carries *synthetic* ids. It
-    // is a local render seed only — `renderThreadCard` reads
-    // `messages`/`activities`/`session` and never the project/model fields, and
-    // the workspace gate guarantees a real selected project exists before any
-    // real thread render replaces this seed. The decode is statically valid, so
-    // a failure is a programmer error (defect), same as `placeholderTitle`.
-    const placeholderProjectId = yield* genId(ProjectId);
-    const placeholderModelSelection = yield* decodeModelSelection({
-      instanceId: "feishu-bot",
-      model: "placeholder",
-    }).pipe(Effect.orDie);
-    const placeholderThread: OrchestrationThread = {
-      id: placeholderThreadId,
-      projectId: placeholderProjectId,
-      title: placeholderTitle,
-      modelSelection: placeholderModelSelection,
-      // Safe default for the first streaming frame: driveTurn / runObserveFiber
-      // render this placeholder before the real snapshot arrives, and
-      // approval-required carries no header badge — so the card never flashes a
-      // misleading red `bypass` for what is actually an approval-required session.
-      // The real runtimeMode overwrites it on the first folded frame. (sendNotice
-      // renders this thread with chrome:false, so the value is moot there.)
-      runtimeMode: "approval-required",
-      interactionMode: "default",
-      branch: null,
-      worktreePath: null,
-      latestTurn: null,
-      createdAt: placeholderTimestamp,
-      updatedAt: placeholderTimestamp,
-      archivedAt: null,
-      deletedAt: null,
-      messages: [],
-      proposedPlans: [],
-      activities: [],
-      checkpoints: [],
-      session: null,
-    };
-
-    // Render a static, single-message notice card into the placeholder envelope.
-    // The notice text rides in as one assistant message so it flows through the
-    // real renderer (markdown body, byte clamping) instead of hand-built JSON.
-    const makeNoticeThread = (text: string): OrchestrationThread => {
-      const message: OrchestrationMessage = {
-        id: placeholderMessageId,
-        role: "assistant",
-        text,
-        turnId: null,
-        streaming: false,
-        createdAt: placeholderTimestamp,
-        updatedAt: placeholderTimestamp,
-      };
-      return { ...placeholderThread, messages: [message] };
-    };
-
-    // Send a one-off, non-streaming notice card to `chatId` (e.g. "text only",
-    // "server not connected"). Opens a streaming card whose completion is already
-    // resolved, so the SDK producer renders once and settles immediately. Failures
-    // are logged and swallowed — a notice must never crash the handler.
-    // M3a: `chatKey` is the composite `chatId[:larkThreadId]` (the bridge's
-    // internal conversation identity). Fix 5: when the notice answers a *triggering*
-    // message (`replyToMessageId` supplied) AND the key is a topic, `topicSendOpts`
-    // anchors the card inside that topic; for p2p / plain group / no anchor it
-    // returns `undefined` so the card posts at the chat/group root (byte-identical
-    // to pre-Fix-5). A bare `chatId` (p2p / plain group) has no `larkThreadId`, so
-    // the topic opts never fire there.
-    const sendNotice = (
-      chatKey: string,
-      text: string,
-      replyToMessageId?: string,
-    ): Effect.Effect<void> =>
-      Effect.gen(function* () {
-        const { chatId, larkThreadId } = splitChatKey(chatKey);
-        const done = yield* Deferred.make<void>();
-        yield* Deferred.succeed(done, undefined);
-        // #3/#4: notice cards carry only a short text body on a synthetic
-        // placeholder thread (no real title/workspace), so `chrome: false`
-        // suppresses the 🧵 header + 📁 subtitle that would otherwise be noise.
-        const card = renderThreadCard(makeNoticeThread(text), {
-          streaming: false,
-          chrome: false,
-        }).card;
-        yield* gateway
-          .startStreamingCard(
-            chatId,
-            card,
-            { done: Deferred.await(done) },
-            topicSendOpts(larkThreadId, replyToMessageId),
-          )
-          .pipe(
-            Effect.tapError((error) =>
-              Console.error(`[feishu-bot] notice card failed for chat ${chatId}: ${error.message}`),
-            ),
-            Effect.ignore,
-          );
-      });
+    const notices = yield* makeNotices({ gateway, genId });
+    const { placeholderThread, sendNotice, renderTranscriptMarkdown, updateCardNotice } = notices;
 
     // ── M2a: resident shell cache + reverse-notification watcher ─────────────
     //
@@ -659,71 +456,19 @@ const runBoundSession = (
       .pipe(Stream.orDie);
     const shellCache = yield* runShellCacheFiber({ shellStream: shellSubscription });
 
-    // ── M-1: per-chat selected workspace resolution ──────────────────────────
-    //
-    // The three-way status of a conversation's `/workspace` selection, resolved
-    // against the *current* shell snapshot at the moment of use (so a project
-    // deleted after selection is caught at dispatch time, not trusted forever):
-    //   - "none":        the chat never selected a workspace.
-    //   - "unavailable": a selection exists but its project is not in the
-    //     current snapshot (deleted elsewhere, or the snapshot has not been
-    //     seeded yet). The selection is intentionally KEPT (not auto-cleared):
-    //     the snapshot can be transiently stale around reconnects, and a
-    //     `/workspace` re-select overwrites it anyway.
-    //   - "ok":          the selection names a live project (carried along).
-    type SelectedWorkspace =
-      | { readonly kind: "none" }
-      | { readonly kind: "unavailable"; readonly projectId: ProjectId }
-      | { readonly kind: "ok"; readonly project: OrchestrationProjectShell };
-
-    const selectedWorkspaceFor = (chatKey: string): Effect.Effect<SelectedWorkspace> =>
-      Effect.gen(function* () {
-        const projectId = yield* workspace.get(chatKey);
-        if (projectId === null) {
-          return { kind: "none" } satisfies SelectedWorkspace;
-        }
-        const snapshot = yield* shellCache.current;
-        const project = snapshot?.projects.find((candidate) => candidate.id === projectId);
-        return project === undefined
-          ? ({ kind: "unavailable", projectId } satisfies SelectedWorkspace)
-          : ({ kind: "ok", project } satisfies SelectedWorkspace);
-      });
-
-    // User-facing gate text for a not-"ok" selection (the workspace gate and
-    // the `ensureThread` dispatch-time re-check share this wording).
-    const workspaceGateText = (selected: SelectedWorkspace): string =>
-      selected.kind === "none"
-        ? "请先用 /workspace 选择工作区(发送 /workspace 查看可选项)。"
-        : "当前选中的工作区已不可用(项目可能已被删除或服务器尚未同步),请用 /workspace 重新选择。";
-
-    // M-3: a live "ok" selection that a per-chat config change has since NARROWED
-    // out of the chat's authorized set. Distinct wording from the none/unavailable
-    // gate text so the user re-selects rather than thinking the project vanished.
-    const workspaceRevokedText =
-      "当前选中的工作区已不在本群授权范围,请用 /workspace 重新选择授权内的工作区。";
-
-    // M-3 dispatch-time workspace authorization: whether `message`'s sender may
-    // use `projectId` in this chat right now (owner exempt; `undefined` allowlist
-    // = all authorized). Mirrors the approval gate's owner + effectiveChatConfig
-    // resolve on the bare chatId.
-    const senderMayUseProjectAtDispatch = (
-      message: InboundMessage,
-      projectId: ProjectId,
-    ): Effect.Effect<boolean> =>
-      Effect.gen(function* () {
-        const owner = yield* Ref.get(ownerRef);
-        const config = effectiveChatConfig(
-          message.chatId,
-          yield* Ref.get(chatConfigsRef),
-          yield* Ref.get(chatDefaultsRef),
-        );
-        return isWorkspaceAuthorized({
-          owner,
-          sender: message.senderId,
-          projectId,
-          authorized: config.workspaces,
-        });
-      });
+    const workspaceGate = makeWorkspaceGate({
+      workspace,
+      shellCache,
+      ownerRef,
+      chatConfigsRef,
+      chatDefaultsRef,
+    });
+    const {
+      selectedWorkspaceFor,
+      workspaceGateText,
+      workspaceRevokedText,
+      senderMayUseProjectAtDispatch,
+    } = workspaceGate;
 
     // PR2: the binding + owner + per-chat config live-refresh fiber is hoisted OUT
     // of this per-binding session into the resident loop's OUTER scope (see
@@ -731,40 +476,6 @@ const runBoundSession = (
     // / per-chat config it publishes are binding-independent — and it doubles as the
     // binding-change watcher that drives re-bind. Here we only consume the shared
     // `ownerRef` / `chatConfigsRef` / `chatDefaultsRef` it maintains.
-
-    // Render the last few messages of a takeover snapshot into a compact
-    // markdown transcript (M2b-2). One line per message: `🧑 …` (user) / `🤖 …`
-    // (assistant), each on its own paragraph. Each message body is trimmed to a
-    // single short excerpt so the takeover card stays light — this is a *simple*
-    // transcript, not the live card (no tools/reasoning). The renderer's global
-    // byte-clamp is the backstop; this keeps the common case readable.
-    const TRANSCRIPT_MESSAGE_COUNT = 5;
-    const TRANSCRIPT_EXCERPT_CHARS = 280;
-    const renderTranscriptMarkdown = (
-      messages: ReadonlyArray<OrchestrationMessage>,
-    ): string | null => {
-      const recent = messages
-        .filter(
-          (message) =>
-            (message.role === "user" || message.role === "assistant") &&
-            message.text.trim().length > 0,
-        )
-        .slice(-TRANSCRIPT_MESSAGE_COUNT);
-      if (recent.length === 0) {
-        return null;
-      }
-      return recent
-        .map((message) => {
-          const icon = message.role === "user" ? "🧑" : "🤖";
-          const text = message.text.trim();
-          const excerpt =
-            text.length > TRANSCRIPT_EXCERPT_CHARS
-              ? `${text.slice(0, TRANSCRIPT_EXCERPT_CHARS)}…`
-              : text;
-          return `${icon} ${excerpt}`;
-        })
-        .join("\n\n");
-    };
 
     // Mirror-light: a `/resume` takeover (or a self-created first contact) does
     // not start a resident per-thread observe fiber. `startMirror` re-binds the
@@ -1531,92 +1242,13 @@ const runBoundSession = (
 
     // ── M-1: `/workspace add` backends ───────────────────────────────────────
 
-    // Best-effort human-readable description of a typed RPC/registry failure,
-    // for the user-facing WorkspaceCommandError messages below.
-    const describeError = (error: unknown): string =>
-      error instanceof Error
-        ? error.message
-        : typeof error === "object" && error !== null && "message" in error
-          ? String((error as { message: unknown }).message)
-          : String(error);
-
-    // After a `createProject` dispatch, wait for the project to surface in the
-    // shell snapshot (the projection round-trip is normally instant; 10s is the
-    // generous bound). `null` on timeout — the caller reports it rather than
-    // guessing at a shell it cannot see.
-    const AWAIT_PROJECT_TRIES = 40;
-    const AWAIT_PROJECT_INTERVAL = Duration.millis(250);
-    const awaitProjectVisible = (
-      projectId: ProjectId,
-    ): Effect.Effect<OrchestrationProjectShell | null> =>
-      Effect.gen(function* () {
-        for (let attempt = 0; attempt < AWAIT_PROJECT_TRIES; attempt += 1) {
-          const snapshot = yield* shellCache.current;
-          const found = snapshot?.projects.find((project) => project.id === projectId);
-          if (found !== undefined) {
-            return found;
-          }
-          yield* Effect.sleep(AWAIT_PROJECT_INTERVAL);
-        }
-        return null;
-      });
-
-    // `/workspace add <local path>` backend: dispatch `createProject`
-    // (creating the directory when missing — the M0 escape-hatch template) and
-    // resolve once the shell snapshot carries the new project.
-    const createWorkspaceProject = (
-      workspaceRoot: string,
-    ): Effect.Effect<OrchestrationProjectShell, WorkspaceCommandError> =>
-      Effect.gen(function* () {
-        const projectId = yield* genId(ProjectId);
-        const title = workspaceRoot.replace(/\/+$/, "").split("/").pop() ?? "workspace";
-        yield* registry
-          .run(
-            environmentId,
-            createProject({
-              projectId,
-              title: title.length > 0 ? title : "workspace",
-              workspaceRoot,
-              createWorkspaceRootIfMissing: true,
-            }),
-          )
-          .pipe(
-            Effect.provideService(Crypto.Crypto, crypto),
-            Effect.mapError(
-              (error) =>
-                new WorkspaceCommandError({ message: `创建工作区失败: ${describeError(error)}` }),
-            ),
-          );
-        const visible = yield* awaitProjectVisible(projectId);
-        if (visible === null) {
-          return yield* new WorkspaceCommandError({
-            message: "工作区创建已提交,但尚未出现在项目列表;稍后发送 /workspace 查看并切换。",
-          });
-        }
-        return visible;
-      });
-
-    // `/workspace add <git url>` backend: server-side clone via the
-    // `sourceControl.cloneRepository` RPC (the server expands `~`/relative
-    // destination paths against its own filesystem), returning the checkout cwd.
-    const cloneWorkspaceRepository = (
-      remoteUrl: string,
-      destinationPath: string,
-    ): Effect.Effect<string, WorkspaceCommandError> =>
-      registry
-        .run(
-          environmentId,
-          EnvironmentRpc.request(WS_METHODS.sourceControlCloneRepository, {
-            remoteUrl,
-            destinationPath,
-          }),
-        )
-        .pipe(
-          Effect.map((result) => result.cwd),
-          Effect.mapError(
-            (error) => new WorkspaceCommandError({ message: `克隆失败: ${describeError(error)}` }),
-          ),
-        );
+    const workspaceOps = makeWorkspaceOps({
+      registry,
+      environmentId,
+      crypto,
+      shellCache,
+    });
+    const { createWorkspaceProject, cloneWorkspaceRepository } = workspaceOps;
 
     // The slash-command table (`/help`, `/status`, `/workspace`, `/resume`,
     // `/release`, `/whoami`). All deps are already-total effects (captured
@@ -2919,24 +2551,6 @@ const runBoundSession = (
 
     // ── M2b-1: cardAction (button click / form submit) → shared respond RPC ──
     //
-    // Echo an outcome onto the very card that was clicked. `messageId` is taken
-    // from the event (E④), so this never queries the card-handle store. Failures
-    // degrade the card to a "已失效/已接管" notice rather than crashing the fiber.
-    const updateCardNotice = (messageId: string, text: string): Effect.Effect<void> =>
-      gateway
-        .updateCard(
-          messageId,
-          // #3/#4: same notice/status card path as `sendNotice` — `chrome: false`
-          // drops the meaningless 🧵/📁 chrome on the synthetic placeholder thread.
-          renderThreadCard(makeNoticeThread(text), { streaming: false, chrome: false }).card,
-        )
-        .pipe(
-          Effect.tapError((error) =>
-            Console.error(`[feishu-bot] card update failed for ${messageId}: ${error.message}`),
-          ),
-          Effect.ignore,
-        );
-
     // P3: resolve the operator's display name for the echo. Priority: the name
     // the cardAction event already carried → the in-process cache → a one-off
     // `gateway.getUser` contact lookup (cached on success). Every lookup failure
