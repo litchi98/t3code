@@ -30,6 +30,8 @@
  * `buildInteraction`) and the per-turn operator pin (idle-guarded `chatOperators`
  * + `driveTurn`'s `operatorOverride`) keeps un-flippable by a mid-turn bystander.
  */
+import { FEISHU_COMMAND_FLOOR } from "@t3tools/contracts";
+
 import type { ApprovalMode } from "./chatConfig.ts";
 
 /** Inputs to the approval-card authorization decision. All identities are Feishu open_ids. */
@@ -80,8 +82,12 @@ export const authorizeApprovalClick = (input: ApprovalClickAuthzInput): boolean 
  * available commands and `/whoami` echoes the caller's own open_id, so a
  * mis-configured allowlist can never lock a chat out of discovering how to fix
  * itself. Tokens are normalised (lowercase, leading `/`) to match the registry.
+ *
+ * The tokens live in `@t3tools/contracts` (`FEISHU_COMMAND_FLOOR`) as the single
+ * source of truth shared with the web command-allowlist editor (M-3 PR-C); this
+ * re-export keeps the bot's existing `COMMAND_FLOOR` consumers unchanged.
  */
-export const COMMAND_FLOOR: ReadonlyArray<string> = ["/help", "/whoami"];
+export const COMMAND_FLOOR: ReadonlyArray<string> = FEISHU_COMMAND_FLOOR;
 
 /**
  * The owner-always overlay, shared by every per-chat gate: the configured

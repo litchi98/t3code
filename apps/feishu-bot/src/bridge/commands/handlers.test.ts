@@ -6,6 +6,7 @@
  */
 import { assert, describe, it } from "@effect/vitest";
 import {
+  FEISHU_COMMAND_REGISTRY,
   type OrchestrationProjectShell,
   OrchestrationShellSnapshot,
   ProjectId,
@@ -21,6 +22,7 @@ import {
   buildCommandTable,
   type CommandDeps,
   defaultCloneDestination,
+  HELP_SECTIONS,
   isGitUrl,
   normalizeLocalWorkspacePath,
   repoNameOf,
@@ -234,6 +236,30 @@ const lastNotice = (harness: Harness) =>
     Effect.map((all) => Option.fromUndefinedOr(all[all.length - 1])),
     Effect.map(Option.getOrElse(() => "")),
   );
+
+describe("command registry parity (M-3 PR-C)", () => {
+  it.effect("the built command table's keys match the contracts registry tokens", () =>
+    Effect.gen(function* () {
+      // The web command-allowlist editor renders `FEISHU_COMMAND_REGISTRY`; if the
+      // bot ever adds/removes a command without updating the registry, the editor
+      // silently drifts. Assert the two are exactly the same command set.
+      const harness = yield* makeHarness();
+      const tableTokens = [...harness.table.keys()].sort();
+      const registryTokens = FEISHU_COMMAND_REGISTRY.map((command) => command.token).sort();
+      assert.deepStrictEqual(tableTokens, registryTokens);
+    }),
+  );
+
+  it("HELP_SECTIONS advertises exactly the registry's command set (order-independent)", () => {
+    // `/help` filters HELP_SECTIONS through `authorizeCommand`, so a command missing
+    // here is never advertised even where it is allowlisted (and a stale entry
+    // advertises a removed command). The parity test above only guards the table
+    // keys; assert the help surface stays in sync with the registry too.
+    const helpTokens = HELP_SECTIONS.map((section) => section.command).sort();
+    const registryTokens = FEISHU_COMMAND_REGISTRY.map((command) => command.token).sort();
+    assert.deepStrictEqual(helpTokens, registryTokens);
+  });
+});
 
 describe("/workspace", () => {
   it.effect("lists projects with ordinals and marks the current selection", () =>

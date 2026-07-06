@@ -56,7 +56,7 @@ const MAX_CANDIDATES = 5;
  * (via `authorizeCommand`). `/help` is filtered on the same predicate as the gate,
  * so what it shows == what actually runs.
  */
-const HELP_SECTIONS: ReadonlyArray<{
+export const HELP_SECTIONS: ReadonlyArray<{
   readonly command: string;
   readonly lines: ReadonlyArray<string>;
 }> = [
