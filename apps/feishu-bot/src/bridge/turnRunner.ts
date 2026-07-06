@@ -223,8 +223,8 @@ export const makeTurnRunner = (deps: TurnRunnerDeps): Effect.Effect<TurnRunnerHa
       // initiator — NOT for whoever last @-mentioned the bot mid-turn (a group
       // hazard: a later `@bot` would otherwise re-sign the buttons to a bystander
       // who could then approve, and lock the real initiator out). `undefined`
-      // (unreachable empty dispatch) falls back to the live Ref. For p2p the
-      // initiator equals the chat owner equals the Ref value → byte-identical.
+      // (unreachable empty dispatch) signs `payload.o` empty → owner-only in
+      // `initiator` mode; there is no last-sender ref to fall back to.
       initiatorOperatorOpenId?: string,
     ): Effect.Effect<void, never, Scope.Scope> =>
       Effect.gen(function* () {

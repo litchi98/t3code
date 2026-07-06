@@ -165,9 +165,7 @@ export const makeObserveMirror = (deps: ObserveMirrorDeps): Effect.Effect<Observ
         // `ensureObserving` below), so the mirrored turn's approval card is signed for
         // the taker regardless of who `@`-mentions the bot in between. Non-empty only.
         if (initiatorOpenId !== undefined && initiatorOpenId.length > 0) {
-          yield* Ref.update(feishuInitiators, (map) =>
-            new Map(map).set(threadId, initiatorOpenId),
-          );
+          yield* Ref.update(feishuInitiators, (map) => new Map(map).set(threadId, initiatorOpenId));
         }
         // M2b-3: a `/resume` may re-point a chat that is already mirroring a previous
         // thread. Tear down any existing observe fiber first so the new takeover's
@@ -644,8 +642,10 @@ export const makeObserveMirror = (deps: ObserveMirrorDeps): Effect.Effect<Observ
         // correct outcome for a turn with no Feishu initiator (approve it from the web).
         const initiators = yield* Ref.get(feishuInitiators);
         const operatorOpenId =
-          initiators.get(threadId) ??
-          (Option.isSome(handleOpt) ? handleOpt.value.operatorOpenId : "");
+          resolveObserveOperator(
+            initiators.get(threadId),
+            Option.isSome(handleOpt) ? handleOpt.value.operatorOpenId : undefined,
+          ) ?? "";
 
         const interaction = yield* buildInteraction(chatId, snapshotThread, operatorOpenId);
         const density = yield* resolveDensity(chatId, snapshotThread.runtimeMode);
@@ -758,29 +758,27 @@ export const makeObserveMirror = (deps: ObserveMirrorDeps): Effect.Effect<Observ
                   // No driftable `chatOperators` read — the SAME trusted source
                   // `buildInteraction` signs from, so persisted and rendered `payload.o`
                   // stay in lock-step (and a bystander cannot poison the durable handle).
-                  cardHandles
-                    .get(chatId)
-                    .pipe(
-                      Effect.orElseSucceed(() => Option.none<CardHandle>()),
-                      Effect.flatMap((existing) =>
-                        cardHandles
-                          .put(chatId, {
-                            messageId: handle.messageId,
-                            pendingRequestId,
-                            lastSequence: 0,
-                            operatorOpenId:
-                              operatorOverride !== undefined && operatorOverride.length > 0
-                                ? operatorOverride
-                                : Option.isSome(existing)
-                                  ? existing.value.operatorOpenId
-                                  : "",
-                          })
-                          .pipe(
-                            Effect.ignore,
-                            Effect.andThen(Ref.set(lastPendingId, pendingRequestId)),
-                          ),
-                      ),
+                  cardHandles.get(chatId).pipe(
+                    Effect.orElseSucceed(() => Option.none<CardHandle>()),
+                    Effect.flatMap((existing) =>
+                      cardHandles
+                        .put(chatId, {
+                          messageId: handle.messageId,
+                          pendingRequestId,
+                          lastSequence: 0,
+                          operatorOpenId:
+                            operatorOverride !== undefined && operatorOverride.length > 0
+                              ? operatorOverride
+                              : Option.isSome(existing)
+                                ? existing.value.operatorOpenId
+                                : "",
+                        })
+                        .pipe(
+                          Effect.ignore,
+                          Effect.andThen(Ref.set(lastPendingId, pendingRequestId)),
+                        ),
                     ),
+                  ),
             ),
           );
         // Record the card handle once up front (no pending yet) so M2b-2 recovery can
@@ -1009,8 +1007,9 @@ export const makeObserveMirror = (deps: ObserveMirrorDeps): Effect.Effect<Observ
             // Adopt: a static handle that patches the recovered card in place. No
             // streaming producer ⇒ no `cardDone`. `updateCard` failures are swallowed
             // (a bad patch must never crash the observe fiber); the operator override
-            // (handle's captured operator, falling back to the live Ref when present)
-            // re-signs the approval so its buttons verify across the restart.
+            // (the trusted per-thread initiator, else the handle's captured operator
+            // — see `resolveObserveOperator`) re-signs the approval so its buttons
+            // verify across the restart.
             const recovered = existing.value;
             const adoptHandle: StreamingCard = {
               messageId: recovered.messageId,
