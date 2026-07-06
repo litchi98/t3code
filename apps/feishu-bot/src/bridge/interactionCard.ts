@@ -118,6 +118,23 @@ export interface ResolvedNoticeEntry {
  * in M2b-1's unified-form rendering); kept optional for value-shape stability.
  */
 export interface CardActionValue {
+  /**
+   * SDK-dedup discriminator (NOT authority). The `@larksuite/channel` edge drops a
+   * card-action whose key `card:<messageId>:<clicker>:<tag>|<name>|<option>|<value[:128]>`
+   * it has already seen within its 12h dedup TTL. Our signed token `t` is long, and its
+   * only per-sign-varying bytes (`exp`, `n`, signature) live PAST that 128-char window
+   * (the leading `r`/`s`/`c` payload fields — thread + chat ids — fill it). So two
+   * distinct RE-RENDERS of the same logical button (e.g. re-arming a card after a
+   * bystander click, so a now-authorised user can click again) would otherwise collide
+   * on an identical dedup key, and the SDK would silently drop that next click before it
+   * ever reaches the bot. `k` echoes the signature tail — which changes on every sign
+   * (`n` is fresh random) — as the FIRST value field, moving a per-sign-unique byte INTO
+   * the 128-char window so each re-render yields a distinct dedup key. It carries no
+   * authority (the token `t` is the sole credential; `k` is unsigned and ignored by
+   * {@link parseCardActionValue}). Feishu's own double-delivery of the SAME rendered
+   * button keeps an identical `k`, so legitimate duplicate-drop still works.
+   */
+  readonly k?: string;
   readonly t: string;
   readonly rid: string;
   readonly q?: string;
@@ -505,8 +522,8 @@ const actionValue = (
   ctx: InteractionContext,
   requestId: string,
   action: string,
-): CardActionValue => ({
-  t: ctx.auth.sign({
+): CardActionValue => {
+  const t = ctx.auth.sign({
     runId: ctx.threadId,
     scope: ctx.chatId,
     chatId: ctx.chatId,
@@ -519,14 +536,22 @@ const actionValue = (
     // so a p2p ctx omits the key entirely — `sign` then keeps the token
     // byte-identical to the pre-M3a shape.
     ...(ctx.larkThreadId !== undefined ? { larkThreadId: ctx.larkThreadId } : {}),
-  }),
-  rid: requestId,
-  // Echo the topic id in the plain value too — a pre-verify bootstrap so the
-  // handler can locate the topic binding before it can recompute the fingerprint
-  // to verify (cross-checked by that signed fingerprint). Omitted for p2p so the
-  // value object is unchanged from the pre-M3a shape.
-  ...(ctx.larkThreadId !== undefined ? { lt: ctx.larkThreadId } : {}),
-});
+  });
+  return {
+    // FIRST field on purpose: a per-sign-unique byte inside the SDK's 128-char dedup
+    // window so a re-render's button gets a distinct dedup key (see {@link CardActionValue.k}).
+    // The signature tail changes whenever the payload does (`n` is fresh random each sign).
+    k: t.slice(-16),
+    t,
+    rid: requestId,
+    // Echo the topic id in the plain value too — a pre-verify bootstrap so the
+    // handler can locate the topic binding before it can recompute the fingerprint
+    // to verify (cross-checked by that signed fingerprint). Omitted for p2p (`lt` alone
+    // matches the pre-M3a shape; the outer value now always carries `k`, but the SIGNED
+    // token bytes stay byte-identical to the pre-M3a shape — `k` is unsigned).
+    ...(ctx.larkThreadId !== undefined ? { lt: ctx.larkThreadId } : {}),
+  };
+};
 
 // ── Parsing ──────────────────────────────────────────────────────────────────
 
