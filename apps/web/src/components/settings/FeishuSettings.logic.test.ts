@@ -4,11 +4,17 @@ import {
   chatModeSelection,
   deepEqual,
   defaultsModeSelection,
+  describeInheritedCommands,
+  describeInheritedWorkspaces,
   isChatConfigEmpty,
   setConfigApprovalMode,
+  setConfigCommands,
+  setConfigWorkspaces,
   setDefaultsApprovalMode,
   toggleApprover,
   toggleConfigApprover,
+  toggleConfigCommand,
+  toggleConfigWorkspace,
   toggleDefaultsApprover,
   writeChatConfig,
 } from "./FeishuSettings.logic.ts";
@@ -177,5 +183,105 @@ describe("isChatConfigEmpty", () => {
     expect(isChatConfigEmpty({ approvalMode: "initiator" })).toBe(false);
     expect(isChatConfigEmpty({ approvalMode: "designated", approvers: [] })).toBe(false);
     expect(isChatConfigEmpty({ commands: [] })).toBe(false);
+    // Empty workspaces is also a real override ("nobody authorized").
+    expect(isChatConfigEmpty({ workspaces: [] })).toBe(false);
+  });
+});
+
+describe("setConfigCommands / toggleConfigCommand (M-3 PR-C)", () => {
+  it("clears the field with undefined (inherit / unrestricted) and keeps a list", () => {
+    expect(setConfigCommands({ commands: ["/status"] }, undefined)).toEqual({});
+    expect(setConfigCommands({}, ["/status"])).toEqual({ commands: ["/status"] });
+    // An empty [] is a real override ("only the floor commands"), NOT dropped.
+    expect(setConfigCommands({}, [])).toEqual({ commands: [] });
+  });
+
+  it("preserves sibling fields (approval / workspaces) when editing commands", () => {
+    expect(setConfigCommands({ approvalMode: "all", workspaces: ["p1"] }, ["/status"])).toEqual({
+      approvalMode: "all",
+      workspaces: ["p1"],
+      commands: ["/status"],
+    });
+    // Clearing commands leaves the others intact.
+    expect(setConfigCommands({ approvalMode: "all", commands: ["/status"] }, undefined)).toEqual({
+      approvalMode: "all",
+    });
+  });
+
+  it("keeps the designated approvers invariant (empty [] present) while editing commands", () => {
+    expect(setConfigCommands({ approvalMode: "designated", approvers: [] }, ["/status"])).toEqual({
+      approvalMode: "designated",
+      approvers: [],
+      commands: ["/status"],
+    });
+  });
+
+  it("toggles a token in/out, materializing an empty list first", () => {
+    expect(toggleConfigCommand({}, "/status")).toEqual({ commands: ["/status"] });
+    expect(toggleConfigCommand({ commands: ["/status", "/resume"] }, "/status")).toEqual({
+      commands: ["/resume"],
+    });
+    // Toggling the last token off leaves an explicit empty [] (only-floor), not undefined.
+    expect(toggleConfigCommand({ commands: ["/status"] }, "/status")).toEqual({ commands: [] });
+  });
+
+  it("a chat whose ONLY override is commands is written, and dropped when cleared", () => {
+    expect(writeChatConfig({}, CHAT, setConfigCommands({}, ["/status"]))).toEqual({
+      [CHAT]: { commands: ["/status"] },
+    });
+    expect(
+      writeChatConfig(
+        { [CHAT]: { commands: ["/status"] } },
+        CHAT,
+        setConfigCommands({}, undefined),
+      ),
+    ).toEqual({});
+  });
+});
+
+describe("setConfigWorkspaces / toggleConfigWorkspace (M-3 PR-C)", () => {
+  it("clears the field with undefined (inherit / all authorized) and keeps a list", () => {
+    expect(setConfigWorkspaces({ workspaces: ["p1"] }, undefined)).toEqual({});
+    expect(setConfigWorkspaces({}, ["p1"])).toEqual({ workspaces: ["p1"] });
+    // An empty [] is a real override ("nobody authorized"), NOT dropped.
+    expect(setConfigWorkspaces({}, [])).toEqual({ workspaces: [] });
+  });
+
+  it("preserves sibling fields when editing workspaces", () => {
+    expect(setConfigWorkspaces({ approvalMode: "all", commands: ["/status"] }, ["p1"])).toEqual({
+      approvalMode: "all",
+      commands: ["/status"],
+      workspaces: ["p1"],
+    });
+  });
+
+  it("toggles a projectId in/out, materializing an empty list first", () => {
+    expect(toggleConfigWorkspace({}, "p1")).toEqual({ workspaces: ["p1"] });
+    expect(toggleConfigWorkspace({ workspaces: ["p1", "p2"] }, "p1")).toEqual({
+      workspaces: ["p2"],
+    });
+    expect(toggleConfigWorkspace({ workspaces: ["p1"] }, "p1")).toEqual({ workspaces: [] });
+  });
+});
+
+describe("describeInherited* — faithful inherit hints (M-3 PR-C)", () => {
+  it("commands hint reflects the actual default, never a blanket 'allows all'", () => {
+    // absent default → truly unrestricted
+    expect(describeInheritedCommands(undefined)).toContain("允许全部命令");
+    // empty default → only the floor commands (NOT "allows all")
+    expect(describeInheritedCommands([])).toContain("仅基础命令");
+    expect(describeInheritedCommands([])).not.toContain("允许全部");
+    // restricted default → count of allowed commands
+    expect(describeInheritedCommands(["/status", "/resume"])).toContain("2 项命令");
+    expect(describeInheritedCommands(["/status", "/resume"])).not.toContain("允许全部");
+  });
+
+  it("workspaces hint says 'nobody' for an empty default, never 'allows all'", () => {
+    expect(describeInheritedWorkspaces(undefined)).toContain("允许全部工作区");
+    // empty default = NOBODY authorized (opposite of the empty-command case)
+    expect(describeInheritedWorkspaces([])).toContain("未授权任何工作区");
+    expect(describeInheritedWorkspaces([])).not.toContain("允许全部");
+    expect(describeInheritedWorkspaces(["p1"])).toContain("1 个工作区");
+    expect(describeInheritedWorkspaces(["p1"])).not.toContain("允许全部");
   });
 });

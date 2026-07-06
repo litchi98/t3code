@@ -5,9 +5,11 @@ import type {
   FeishuChatDirectoryEntry,
   FeishuChatMember,
 } from "@t3tools/contracts";
+import { FEISHU_COMMAND_REGISTRY, FEISHU_CONFIGURABLE_COMMANDS } from "@t3tools/contracts";
 import { LinkIcon, PlusIcon, UsersIcon, XIcon } from "lucide-react";
 import { useCallback, useRef, useState } from "react";
 
+import { useProjects } from "~/state/entities";
 import { usePrimaryEnvironment } from "~/state/environments";
 import { useEnvironmentQuery } from "~/state/query";
 import { serverEnvironment } from "~/state/server";
@@ -25,15 +27,28 @@ import {
   type ChatModeSelection,
   deepEqual,
   defaultsModeSelection,
+  describeInheritedCommands,
+  describeInheritedWorkspaces,
   type FeishuChatConfigMap,
   INHERIT_MODE,
   setConfigApprovalMode,
+  setConfigCommands,
+  setConfigWorkspaces,
   setDefaultsApprovalMode,
   toggleConfigApprover,
+  toggleConfigCommand,
+  toggleConfigWorkspace,
   toggleDefaultsApprover,
   writeChatConfig,
 } from "./FeishuSettings.logic";
 import { SettingsPageContainer, SettingsSection } from "./settingsLayout";
+
+/** Minimal project shape the workspace-allowlist editor needs. */
+interface WorkspaceOption {
+  readonly id: string;
+  readonly title: string;
+  readonly workspaceRoot: string;
+}
 
 /**
  * Feishu bot binding + per-chat approval configuration.
@@ -224,6 +239,13 @@ function FeishuChatConfigSection() {
   );
 
   const serverConfigs = usePrimarySettings((s) => s.feishuChatConfigs) as FeishuChatConfigMap;
+  // The default config a chat with no per-chat override inherits. Read here (not
+  // just inside the defaults editor) so each per-chat card can show its TRUE
+  // inherited command/workspace state — the bot resolves per-chat-absent fields
+  // against these defaults, so a card must not claim "allows all" when the default
+  // itself restricts. (Informational only; a one-round-trip lag vs the defaults
+  // editor's own optimistic value is harmless for hint text.)
+  const serverDefaults = usePrimarySettings((s) => s.feishuChatDefaults);
   // The binding owner is always allowed to approve (owner-always overlay), so
   // their roster checkbox is shown pre-checked and locked, not toggleable.
   const bindingOwnerOpenId = usePrimarySettings((s) => s.feishuBinding?.ownerOpenId);
@@ -240,6 +262,15 @@ function FeishuChatConfigSection() {
     [commitConfigs],
   );
 
+  // Workspace-allowlist options: the projects on THIS (primary) environment — the
+  // one the bot is bound to. `useProjects()` aggregates every environment, so
+  // filter to the primary one (a projectId is only meaningful within its env).
+  const allProjects = useProjects();
+  const projects: ReadonlyArray<WorkspaceOption> =
+    environmentId === null
+      ? []
+      : allProjects.filter((project) => project.environmentId === environmentId);
+
   // Group/topic chats only — p2p (single-user) chats have no approval roster and
   // always fall back to the initiator/owner path, so there is nothing to configure.
   const chats = (data?.chats ?? []).filter((chat) => chat.chatMode !== "p2p");
@@ -255,16 +286,19 @@ function FeishuChatConfigSection() {
           的授权人始终可审批,无需在此列出。
         </p>
         <p>
-          先设默认,再按需为单个群覆盖。在群里发{" "}
+          先设默认,再按需为单个群覆盖:每个群可单独限制{" "}
+          <strong className="font-medium text-foreground/90">可用命令</strong>与
+          <strong className="font-medium text-foreground/90">可用工作区</strong>
+          。在群里发{" "}
           <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px] text-foreground">
             /whoami
           </code>{" "}
-          可获取自己的 open_id。
+          可获取自己的 open_id。绑定的授权人不受这些限制约束。
         </p>
       </div>
 
       <div className="border-t border-border/60 px-4 py-3 sm:px-5">
-        <FeishuDefaultsEditor />
+        <FeishuDefaultsEditor projects={projects} />
       </div>
 
       <div className="border-t border-border/60 px-4 py-3 sm:px-5">
@@ -287,6 +321,9 @@ function FeishuChatConfigSection() {
                 chat={chat}
                 config={configs[chat.chatId]}
                 bindingOwnerOpenId={bindingOwnerOpenId}
+                projects={projects}
+                defaultCommands={serverDefaults.commands}
+                defaultWorkspaces={serverDefaults.workspaces}
                 onCommit={commitChat}
               />
             ))}
@@ -297,8 +334,12 @@ function FeishuChatConfigSection() {
   );
 }
 
-/** Default-mode editor (`feishuChatDefaults`); always shows an explicit mode. */
-function FeishuDefaultsEditor() {
+/**
+ * Default-config editor (`feishuChatDefaults`); always shows an explicit approval
+ * mode. Commands/workspaces here are the baseline every un-overridden chat
+ * inherits; absent = unrestricted (the built-in default).
+ */
+function FeishuDefaultsEditor({ projects }: { projects: ReadonlyArray<WorkspaceOption> }) {
   const serverDefaults = usePrimarySettings((s) => s.feishuChatDefaults);
   const update = useUpdatePrimarySettings();
   const writeDefaults = useCallback(
@@ -332,6 +373,13 @@ function FeishuDefaultsEditor() {
           onToggle={(openId) => commit((current) => toggleDefaultsApprover(current, openId))}
         />
       ) : null}
+      <CommandsEditor commands={draft.commands} offHint="不限制,允许全部命令。" onChange={commit} />
+      <WorkspacesEditor
+        workspaces={draft.workspaces}
+        projects={projects}
+        offHint="不限制,允许全部工作区。"
+        onChange={commit}
+      />
     </div>
   );
 }
@@ -345,15 +393,27 @@ function FeishuChatConfigCard({
   chat,
   config,
   bindingOwnerOpenId,
+  projects,
+  defaultCommands,
+  defaultWorkspaces,
   onCommit,
 }: {
   chat: FeishuChatDirectoryEntry;
   config: FeishuChatConfig | undefined;
   bindingOwnerOpenId?: string | undefined;
+  projects: ReadonlyArray<WorkspaceOption>;
+  defaultCommands: ReadonlyArray<string> | undefined;
+  defaultWorkspaces: ReadonlyArray<string> | undefined;
   onCommit: (chatId: string, updater: (config: FeishuChatConfig) => FeishuChatConfig) => void;
 }) {
   const mode = chatModeSelection(config);
   const memberCount = chat.memberCount ?? chat.members.length;
+  // A card is fully controlled by the section; every editor emits an updater over
+  // THIS chat's current config, applied against the freshest accumulated draft.
+  const change = useCallback(
+    (updater: (current: FeishuChatConfig) => FeishuChatConfig) => onCommit(chat.chatId, updater),
+    [onCommit, chat.chatId],
+  );
 
   return (
     <div className="rounded-lg border border-border/60 p-3">
@@ -370,9 +430,7 @@ function FeishuChatConfigCard({
           value={mode}
           includeInherit
           ariaLabel={`${chat.name || chat.chatId} 审批模式`}
-          onChange={(selection) =>
-            onCommit(chat.chatId, (current) => setConfigApprovalMode(current, selection))
-          }
+          onChange={(selection) => change((current) => setConfigApprovalMode(current, selection))}
         />
       </div>
       {mode === "designated" ? (
@@ -381,11 +439,20 @@ function FeishuChatConfigCard({
           members={chat.members}
           bindingOwnerOpenId={bindingOwnerOpenId}
           idPrefix={`feishu-chat-${chat.chatId}`}
-          onToggle={(openId) =>
-            onCommit(chat.chatId, (current) => toggleConfigApprover(current, openId))
-          }
+          onToggle={(openId) => change((current) => toggleConfigApprover(current, openId))}
         />
       ) : null}
+      <CommandsEditor
+        commands={config?.commands}
+        offHint={describeInheritedCommands(defaultCommands)}
+        onChange={change}
+      />
+      <WorkspacesEditor
+        workspaces={config?.workspaces}
+        projects={projects}
+        offHint={describeInheritedWorkspaces(defaultWorkspaces)}
+        onChange={change}
+      />
     </div>
   );
 }
@@ -566,6 +633,219 @@ function ApproversEditor({
         </Button>
       </div>
       {error ? <p className="text-xs text-destructive">{error}</p> : null}
+    </div>
+  );
+}
+
+/**
+ * Per-chat (or default) slash-command allowlist editor.
+ *
+ * A leading "限制可用命令" toggle maps directly to the field's presence semantics
+ * (faithful to the bot's `authorizeCommand`): OFF = field ABSENT (inherit default
+ * → all commands allowed); ON = an explicit allowlist. Turning it ON materializes
+ * every configurable command checked (a no-op-yet-explicit restriction, never a
+ * silent lock-out), which the admin then narrows. The floor commands (`/help`,
+ * `/whoami`) are shown locked-on — always allowed, never stored. An empty checked
+ * set is a real "only the floor" override (kept in the map), flagged in-line.
+ */
+function CommandsEditor({
+  commands,
+  offHint,
+  onChange,
+}: {
+  commands: ReadonlyArray<string> | undefined;
+  offHint: string;
+  onChange: (updater: (config: FeishuChatConfig) => FeishuChatConfig) => void;
+}) {
+  const restricted = commands !== undefined;
+  const selected = new Set(commands ?? []);
+  const configurable = FEISHU_COMMAND_REGISTRY.filter((command) => !command.floor);
+  const floor = FEISHU_COMMAND_REGISTRY.filter((command) => command.floor);
+
+  return (
+    <div className="mt-2 space-y-2 rounded-md border border-border/60 bg-muted/20 p-2.5">
+      <label className="flex cursor-pointer items-center gap-2">
+        <Checkbox
+          checked={restricted}
+          onCheckedChange={() =>
+            onChange((current) =>
+              setConfigCommands(
+                current,
+                restricted ? undefined : [...FEISHU_CONFIGURABLE_COMMANDS],
+              ),
+            )
+          }
+          aria-label="限制可用命令"
+        />
+        <span className="font-medium text-[11px] text-foreground/90">限制可用命令</span>
+      </label>
+      {restricted ? (
+        <div className="space-y-1.5">
+          <p className="text-[11px] text-muted-foreground/70">勾选本群可用的命令:</p>
+          <div className="grid gap-1 sm:grid-cols-2">
+            {configurable.map((command) => (
+              <label
+                key={command.token}
+                className="flex min-w-0 cursor-pointer items-center gap-2 rounded-sm px-1 py-1 hover:bg-accent/50"
+              >
+                <Checkbox
+                  checked={selected.has(command.token)}
+                  onCheckedChange={() =>
+                    onChange((current) => toggleConfigCommand(current, command.token))
+                  }
+                  aria-label={`命令 ${command.token}`}
+                />
+                <span className="min-w-0 flex-1 truncate text-[11px] text-foreground/90">
+                  <span className="font-mono">{command.token}</span>
+                  <span className="text-muted-foreground/70"> · {command.label}</span>
+                </span>
+              </label>
+            ))}
+            {floor.map((command) => (
+              <label
+                key={command.token}
+                title="基础命令,始终可用"
+                className="flex min-w-0 items-center gap-2 rounded-sm px-1 py-1"
+              >
+                <Checkbox checked disabled aria-label={`命令 ${command.token}(基础,始终可用)`} />
+                <span className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground/70">
+                  <span className="font-mono">{command.token}</span>
+                  <span> · {command.label}</span>
+                </span>
+                <span className="shrink-0 rounded bg-muted px-1 py-0.5 text-[10px] text-muted-foreground">
+                  基础
+                </span>
+              </label>
+            ))}
+          </div>
+          {selected.size === 0 ? (
+            <p className="text-[11px] text-amber-600 dark:text-amber-500">
+              仅基础命令(/help、/whoami)可用,本群无法使用其它命令。
+            </p>
+          ) : null}
+        </div>
+      ) : (
+        <p className="text-[11px] text-muted-foreground/70">{offHint}</p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Per-chat (or default) workspace allowlist editor.
+ *
+ * Same presence semantics as {@link CommandsEditor} but faithful to the bot's
+ * `isWorkspaceAuthorized`, and with the OPPOSITE empty meaning: OFF = field ABSENT
+ * (inherit → every workspace authorized); ON = an explicit allowlist of
+ * `ProjectId`s. Turning it ON materializes every current project checked (never a
+ * silent lock-out). An empty checked set means NO workspace is authorized — the
+ * chat can run nothing — so it is flagged as a destructive state. Authorized ids
+ * no longer in the project list (deleted/renamed, or hand-edited) are surfaced as
+ * removable rows rather than hidden.
+ */
+function WorkspacesEditor({
+  workspaces,
+  projects,
+  offHint,
+  onChange,
+}: {
+  workspaces: ReadonlyArray<string> | undefined;
+  projects: ReadonlyArray<WorkspaceOption>;
+  offHint: string;
+  onChange: (updater: (config: FeishuChatConfig) => FeishuChatConfig) => void;
+}) {
+  const restricted = workspaces !== undefined;
+  const selected = new Set(workspaces ?? []);
+  const knownIds = new Set(projects.map((project) => project.id));
+  const extras = (workspaces ?? []).filter((id) => !knownIds.has(id));
+  // Turning restriction ON materializes every current project. With no projects to
+  // authorize (still hydrating, or a genuinely empty env) that would commit
+  // `workspaces: []` = NOBODY authorized — a silent lock-out — so block enabling
+  // restriction until there is something to authorize. (Once ON, keep the toggle
+  // enabled so it can always be turned back OFF.)
+  const cannotEnable = !restricted && projects.length === 0;
+
+  return (
+    <div className="mt-2 space-y-2 rounded-md border border-border/60 bg-muted/20 p-2.5">
+      <label
+        className={
+          cannotEnable
+            ? "flex items-center gap-2 opacity-60"
+            : "flex cursor-pointer items-center gap-2"
+        }
+      >
+        <Checkbox
+          checked={restricted}
+          disabled={cannotEnable}
+          onCheckedChange={() =>
+            onChange((current) =>
+              setConfigWorkspaces(
+                current,
+                restricted ? undefined : projects.map((project) => project.id),
+              ),
+            )
+          }
+          aria-label="限制可用工作区"
+        />
+        <span className="font-medium text-[11px] text-foreground/90">限制可用工作区</span>
+        {cannotEnable ? (
+          <span className="text-[11px] text-muted-foreground/60">(暂无工作区可授权)</span>
+        ) : null}
+      </label>
+      {restricted ? (
+        <div className="space-y-1.5">
+          <p className="text-[11px] text-muted-foreground/70">勾选本群可用的工作区:</p>
+          {projects.length === 0 && extras.length === 0 ? (
+            <p className="text-[11px] text-muted-foreground/60">当前没有工作区。</p>
+          ) : (
+            <div className="space-y-1">
+              {projects.map((project) => (
+                <label
+                  key={project.id}
+                  title={project.workspaceRoot}
+                  className="flex min-w-0 cursor-pointer items-center gap-2 rounded-sm px-1 py-1 hover:bg-accent/50"
+                >
+                  <Checkbox
+                    checked={selected.has(project.id)}
+                    onCheckedChange={() =>
+                      onChange((current) => toggleConfigWorkspace(current, project.id))
+                    }
+                    aria-label={`工作区 ${project.title}`}
+                  />
+                  <span className="min-w-0 flex-1 truncate text-[11px] text-foreground/90">
+                    {project.title}
+                    <span className="text-muted-foreground/60"> · {project.workspaceRoot}</span>
+                  </span>
+                </label>
+              ))}
+              {extras.map((id) => (
+                <label
+                  key={id}
+                  className="flex min-w-0 cursor-pointer items-center gap-2 rounded-sm px-1 py-1 hover:bg-accent/50"
+                >
+                  <Checkbox
+                    checked
+                    onCheckedChange={() =>
+                      onChange((current) => toggleConfigWorkspace(current, id))
+                    }
+                    aria-label={`工作区 ${id}`}
+                  />
+                  <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground/80">
+                    {id}(不在当前项目列表)
+                  </span>
+                </label>
+              ))}
+            </div>
+          )}
+          {selected.size === 0 ? (
+            <p className="text-[11px] text-destructive">
+              ⚠ 未授权任何工作区,本群将无法使用任何工作区。
+            </p>
+          ) : null}
+        </div>
+      ) : (
+        <p className="text-[11px] text-muted-foreground/70">{offHint}</p>
+      )}
     </div>
   );
 }

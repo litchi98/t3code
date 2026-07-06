@@ -22,7 +22,14 @@ import type { FeishuChatConfig } from "@t3tools/contracts";
  *   default approvers. `initiator`/`all` ignore approvers, so it is dropped there.
  * This keeps what the editor shows equal to what the bot enforces.
  *
- * M-3 fields (`workspaces`/`commands`/`toolPolicy`) are preserved untouched.
+ * M-3 fields:
+ * - `commands` / `workspaces` are now web-editable (PR-C). Both use the SAME
+ *   presence semantics the bot's `authorizeCommand` / `isWorkspaceAuthorized`
+ *   enforce: absent = "not configured" (inherit default → unrestricted), a
+ *   present list = an override. The two EMPTY-list meanings are OPPOSITE and both
+ *   real overrides that must be kept: `commands: []` = only the floor commands
+ *   (`/help`, `/whoami`) are allowed; `workspaces: []` = NO workspace is allowed
+ *   (the chat can run nothing). `toolPolicy` is preserved untouched (PR-B paused).
  */
 
 export type ApprovalMode = NonNullable<FeishuChatConfig["approvalMode"]>;
@@ -113,6 +120,94 @@ export const setConfigApprovalMode = (
 /** Toggle a designated approver open_id on a single config, preserving its mode. */
 export const toggleConfigApprover = (config: FeishuChatConfig, openId: string): FeishuChatConfig =>
   normalizeConfig({ ...config, approvers: toggleApprover(config.approvers ?? [], openId) });
+
+/**
+ * Set (or clear) the command allowlist on a config (per-chat or defaults). Passing
+ * `undefined` REMOVES the field (inherit default → all commands allowed); a list —
+ * including the empty `[]` ("only the floor commands `/help`, `/whoami`") — is a
+ * real override kept in the map. Floor commands are always allowed by the bot and
+ * are never stored here. Fields are added/omitted by construction (contract fields
+ * are readonly), then re-normalized to keep the `approvers`-presence invariant.
+ */
+export const setConfigCommands = (
+  config: FeishuChatConfig,
+  commands: ReadonlyArray<string> | undefined,
+): FeishuChatConfig => {
+  if (commands === undefined) {
+    const { commands: _dropped, ...rest } = config;
+    return normalizeConfig(rest);
+  }
+  return normalizeConfig({ ...config, commands });
+};
+
+/** Toggle one command token in the allowlist (materializing `[]` first if absent). */
+export const toggleConfigCommand = (config: FeishuChatConfig, token: string): FeishuChatConfig =>
+  // `toggleApprover` is a pure add-if-absent/remove-if-present string-list toggle.
+  setConfigCommands(config, toggleApprover(config.commands ?? [], token));
+
+/**
+ * Set (or clear) the workspace allowlist on a config (per-chat or defaults).
+ * Passing `undefined` REMOVES the field (inherit default → every workspace
+ * authorized); a list — including the empty `[]` ("NO workspace authorized", the
+ * opposite of the empty-command case) — is a real override kept in the map. Values
+ * are bare `ProjectId` strings.
+ */
+export const setConfigWorkspaces = (
+  config: FeishuChatConfig,
+  workspaces: ReadonlyArray<string> | undefined,
+): FeishuChatConfig => {
+  if (workspaces === undefined) {
+    const { workspaces: _dropped, ...rest } = config;
+    return normalizeConfig(rest);
+  }
+  return normalizeConfig({ ...config, workspaces });
+};
+
+/** Toggle one projectId in the workspace allowlist (materializing `[]` first if absent). */
+export const toggleConfigWorkspace = (
+  config: FeishuChatConfig,
+  projectId: string,
+): FeishuChatConfig =>
+  setConfigWorkspaces(config, toggleApprover(config.workspaces ?? [], projectId));
+
+/**
+ * Describe what commands a chat with NO own `commands` override inherits, faithful
+ * to the bot's field-level fallback (per-chat absent → `feishuChatDefaults.commands`
+ * → built-in unrestricted). A per-chat card must NOT hardcode "allows all" — the
+ * default itself may be a restriction or an empty ("only floor") list, and the
+ * shown text has to equal what the bot enforces ("what the editor shows == what
+ * the bot enforces"). `defaultCommands` is `feishuChatDefaults.commands`.
+ */
+export const describeInheritedCommands = (
+  defaultCommands: ReadonlyArray<string> | undefined,
+): string => {
+  if (defaultCommands === undefined) {
+    return "继承默认配置(默认:允许全部命令)。";
+  }
+  if (defaultCommands.length === 0) {
+    return "继承默认配置(默认:仅基础命令 /help、/whoami)。";
+  }
+  return `继承默认配置(默认:限制为 ${defaultCommands.length} 项命令 + 基础)。`;
+};
+
+/**
+ * Describe what workspaces a chat with NO own `workspaces` override inherits,
+ * faithful to the bot's field-level fallback. Note the OPPOSITE empty meaning: a
+ * default of `[]` authorizes NO workspace (the chat can run nothing), so the hint
+ * must say so rather than claim "allows all". `defaultWorkspaces` is
+ * `feishuChatDefaults.workspaces`.
+ */
+export const describeInheritedWorkspaces = (
+  defaultWorkspaces: ReadonlyArray<string> | undefined,
+): string => {
+  if (defaultWorkspaces === undefined) {
+    return "继承默认配置(默认:允许全部工作区)。";
+  }
+  if (defaultWorkspaces.length === 0) {
+    return "继承默认配置(默认:未授权任何工作区,本群无法使用工作区)。";
+  }
+  return `继承默认配置(默认:限制为 ${defaultWorkspaces.length} 个工作区)。`;
+};
 
 /**
  * Write a per-chat config into the map with whole-map replacement, canonicalizing
