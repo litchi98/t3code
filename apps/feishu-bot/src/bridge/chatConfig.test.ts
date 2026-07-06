@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vite-plus/test";
 
+import { FEISHU_RENDER_DENSITIES } from "@t3tools/contracts";
+
 import { DEFAULT_APPROVAL_MODE, effectiveChatConfig } from "./chatConfig.ts";
+import { resolveRenderDensity } from "./chatThreadMap.ts";
+import { RENDER_DENSITIES } from "./eventRenderer.ts";
 
 const CHAT = "oc_group_a";
 
@@ -57,5 +61,46 @@ describe("effectiveChatConfig — field-level fallback", () => {
     expect(eff.commands).toEqual(["/status"]);
     expect(eff.toolPolicy).toEqual({ mode: "denylist", tools: ["Write"] });
     expect(eff.workspaces).toBeUndefined();
+  });
+
+  it("resolves density per-field: per-chat > defaults > undefined (PR-C3)", () => {
+    // per-chat density wins over the default
+    expect(
+      effectiveChatConfig(CHAT, { [CHAT]: { density: "text" } }, { density: "markdown" }).density,
+    ).toBe("text");
+    // no per-chat density → falls through to the default
+    expect(effectiveChatConfig(CHAT, {}, { density: "markdown" }).density).toBe("markdown");
+    // neither set → undefined (the render read points apply the runtime fallback)
+    expect(effectiveChatConfig(CHAT, {}, {}).density).toBeUndefined();
+  });
+});
+
+describe("resolveRenderDensity — p2p gate + group precedence (PR-C3)", () => {
+  it("forces p2p (full-access) to card REGARDLESS of config or binding density", () => {
+    // The invariant that a group default / per-chat density must NEVER lower a
+    // private chat below `card` (M3b, mirrored by densityForRuntime).
+    expect(resolveRenderDensity("full-access", "text", "markdown", "text")).toBe("card");
+    expect(resolveRenderDensity("full-access", undefined, undefined, "text")).toBe("card");
+  });
+
+  it("group/topic precedence: config > binding > groupChatDensity", () => {
+    // per-chat/defaults config wins
+    expect(resolveRenderDensity("approval-required", "text", "markdown", "card")).toBe("text");
+    // no config → the bind-time binding density
+    expect(resolveRenderDensity("approval-required", undefined, "markdown", "card")).toBe(
+      "markdown",
+    );
+    // no config, no binding → the env group default
+    expect(resolveRenderDensity("approval-required", undefined, undefined, "text")).toBe("text");
+  });
+});
+
+describe("density literal parity — contract ↔ bot RenderDensity", () => {
+  it("FEISHU_RENDER_DENSITIES equals the renderer's RENDER_DENSITIES set", () => {
+    // The web editor renders `FEISHU_RENDER_DENSITIES` (contracts) while the bot
+    // renders per `RenderDensity` (eventRenderer). If one drifts, the editor could
+    // write a density the bot can't render (or vice-versa). Assert the two literal
+    // SETS are identical (order-independent).
+    expect([...FEISHU_RENDER_DENSITIES].sort()).toEqual([...RENDER_DENSITIES].sort());
   });
 });

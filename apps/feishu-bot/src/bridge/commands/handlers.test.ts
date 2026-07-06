@@ -204,6 +204,7 @@ const makeHarness = (options: HarnessOptions = {}): Effect.Effect<Harness> =>
               workspaces: options.workspaces,
               commands: options.commands,
               toolPolicy: undefined,
+              density: undefined,
             } satisfies EffectiveChatConfig),
           ),
       },

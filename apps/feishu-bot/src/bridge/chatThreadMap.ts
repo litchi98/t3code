@@ -113,6 +113,28 @@ export const densityForRuntime = (
 ): RenderDensity => (runtimeMode === "full-access" ? "card" : groupChatDensity);
 
 /**
+ * M-3 PR-C3: resolve a chat's effective render density, layering the per-chat /
+ * `feishuChatDefaults` config over the legacy fallbacks — but keeping p2p
+ * (`full-access`) ALWAYS `card`. The full-access gate sits ABOVE the config so an
+ * inherited group default can never lower a private chat below `card` (the M3b
+ * invariant, mirrored by `densityForRuntime`, and promised by the contract +
+ * editor copy). For a group/topic chat the precedence is
+ * `configDensity (per-chat > defaults) → bindingDensity → groupChatDensity`.
+ *
+ * Pure so the bot's `resolveDensity` (which supplies the live config/binding reads)
+ * stays a thin wrapper and this precedence — especially the p2p gate — is unit
+ * tested. `configDensity` is `effectiveChatConfig(chatId).density`; `bindingDensity`
+ * is the bind-time stored `binding.density`.
+ */
+export const resolveRenderDensity = (
+  runtimeMode: RuntimeMode,
+  configDensity: RenderDensity | undefined,
+  bindingDensity: RenderDensity | undefined,
+  groupChatDensity: RenderDensity,
+): RenderDensity =>
+  runtimeMode === "full-access" ? "card" : (configDensity ?? bindingDensity ?? groupChatDensity);
+
+/**
  * M3a: the chat-key anchor for a Feishu inbound message.
  *
  * Returns the `larkThreadId` fragment that should be passed to

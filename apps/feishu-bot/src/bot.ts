@@ -32,6 +32,7 @@ import {
   type OrchestrationThreadActivity,
   type OrchestrationThreadStreamItem,
   ProjectId,
+  type RuntimeMode,
   type ServerProvider,
   ThreadId,
   type TurnId,
@@ -107,11 +108,12 @@ import {
   deriveThreadId,
   ensureThreadForChat,
   refusesFullAccessTakeover,
+  resolveRenderDensity,
   runtimeModeForChatType,
   splitChatKey,
 } from "./bridge/chatThreadMap.ts";
 import { deriveCommandId } from "./bridge/commandId.ts";
-import { renderThreadCard } from "./bridge/eventRenderer.ts";
+import { type RenderDensity, renderThreadCard } from "./bridge/eventRenderer.ts";
 import { observeThread, type ThreadObservation } from "./bridge/session.ts";
 import { type MergedDispatch, TurnQueue, turnQueueLayer } from "./bridge/turnQueue.ts";
 import { OutboundQueue, outboundQueueLayer } from "./bridge/outbound.ts";
@@ -508,6 +510,44 @@ const runBoundSession = (
     // p2p (`full-access`) is always `card`; only an explicit
     // `FEISHU_GROUP_CHAT_DENSITY` lowers a group/topic below `card`.
     const groupChatDensity = config.feishu.groupChatDensity;
+
+    // M-3 PR-C3: resolve the effective render density for a chat, layering the
+    // per-chat config over the legacy fallbacks. Server-managed spawn scrubs
+    // `FEISHU_GROUP_CHAT_DENSITY`, so the web per-chat/defaults `density` field is
+    // now the live control surface for GROUP/topic chats. Precedence (mirrors the
+    // web's `effectiveConfig` so what the editor shows == what the bot renders):
+    //   0. p2p (`full-access`) is ALWAYS `card` — a hard M3b invariant that
+    //      per-chat / `feishuChatDefaults` density must NOT lower (the private-chat
+    //      section is not configurable here; the contract + editor copy promise it).
+    //      This gate mirrors `densityForRuntime`'s full-access force and must sit
+    //      ABOVE the config so an inherited group default can't leak into a p2p chat.
+    //   1. per-chat / defaults `density` (`effectiveChatConfig`, keyed by BARE
+    //      chatId — the authz grain — so split the composite chatKey first);
+    //   2. the bind-time `binding.density` (legacy stored value);
+    //   3. `densityForRuntime(runtimeMode, groupChatDensity)` (env default).
+    // Requires the REAL thread `runtimeMode` (p2p ⇒ full-access) — callers pass the
+    // live thread's mode, NOT the synthetic placeholder's, or the p2p gate misfires.
+    // Every render read point derives density through here so an override wins on the
+    // *stable terminal* card. `chatKey` is the ambient composite key
+    // (`chatId[:larkThreadId]`); bind-time STORE points keep computing
+    // `densityForRuntime` directly — this is a read-time overlay only.
+    const resolveDensity = (
+      chatKey: string,
+      runtimeMode: RuntimeMode,
+    ): Effect.Effect<RenderDensity> =>
+      Effect.gen(function* () {
+        // Fast p2p path: `full-access` is always `card` (see `resolveRenderDensity`),
+        // so skip the config/binding reads entirely for private chats.
+        if (runtimeMode === "full-access") return "card";
+        const { chatId: bareChatId } = splitChatKey(chatKey);
+        const configDensity = effectiveChatConfig(
+          bareChatId,
+          yield* Ref.get(chatConfigsRef),
+          yield* Ref.get(chatDefaultsRef),
+        ).density;
+        const binding = yield* bindings.get(chatKey);
+        return resolveRenderDensity(runtimeMode, configDensity, binding?.density, groupChatDensity);
+      });
 
     // E④: composite chatKey → operator open id, captured from each inbound message.
     // `chatOperators` records the most recent sender per composite key (chatId or
@@ -1517,9 +1557,10 @@ const runBoundSession = (
           operators.get(chatId) ?? (Option.isSome(handleOpt) ? handleOpt.value.operatorOpenId : "");
 
         const interaction = yield* buildInteraction(chatId, snapshotThread, operatorOpenId);
+        const density = yield* resolveDensity(chatId, snapshotThread.runtimeMode);
         const card = renderThreadCard(snapshotThread, {
           streaming: false,
-          density: densityForRuntime(snapshotThread.runtimeMode, groupChatDensity),
+          density,
           ...(interaction ? { interaction } : {}),
         }).card;
 
@@ -1838,14 +1879,21 @@ const runBoundSession = (
             captureCurrentTurnId(thread).pipe(
               Effect.andThen(Ref.get(currentTurnIdRef)),
               Effect.flatMap((currentTurnId) =>
-                buildInteraction(chatId, thread, operatorOverride).pipe(
-                  Effect.flatMap((interaction) =>
+                // M-3 PR-C3: resolve density per tick from the REAL `thread.runtimeMode`
+                // (p2p ⇒ full-access ⇒ card, via `resolveDensity`'s gate) so a per-chat
+                // override lands AND the p2p-always-card invariant holds — the synthetic
+                // placeholder's runtimeMode must never decide the live card's density.
+                Effect.all({
+                  interaction: buildInteraction(chatId, thread, operatorOverride),
+                  density: resolveDensity(chatId, thread.runtimeMode),
+                }).pipe(
+                  Effect.flatMap(({ interaction, density }) =>
                     handle
                       .update(
                         renderThreadCard(thread, {
                           streaming: true,
                           currentTurnId,
-                          density: densityForRuntime(thread.runtimeMode, groupChatDensity),
+                          density,
                           ...(interaction ? { interaction } : {}),
                         }).card,
                       )
@@ -1892,12 +1940,15 @@ const runBoundSession = (
         if (finalThread !== null) {
           const interaction = yield* buildInteraction(chatId, finalThread, operatorOverride);
           const currentTurnId = yield* Ref.get(currentTurnIdRef);
+          // M-3 PR-C3: resolve density from the REAL terminal thread's runtimeMode
+          // (same p2p-safe overlay as the per-tick render) for the stable final card.
+          const density = yield* resolveDensity(chatId, finalThread.runtimeMode);
           yield* handle
             .update(
               renderThreadCard(finalThread, {
                 streaming: false,
                 currentTurnId,
-                density: densityForRuntime(finalThread.runtimeMode, groupChatDensity),
+                density,
                 ...(interaction ? { interaction } : {}),
               }).card,
             )
@@ -2072,14 +2123,12 @@ const runBoundSession = (
             // the turn reaches a terminal state (the `cardDone` released below). A
             // failed start must NOT crash the fiber — skip the render and exit; the
             // watcher re-triggers on the next frame if the turn is still running.
-            // M3b: prefer the binding's bind-time density so the placeholder first
-            // frame matches the real frame (no card→low-noise jump); fall back to the
-            // runtimeMode-derived density for legacy bindings without stored density.
-            // The same binding read supplies the topic reply anchor below.
+            // M-3 PR-C3: resolve the placeholder first-frame density through the same
+            // per-chat > binding > runtime overlay the real frames use, so a per-chat
+            // override matches from the very first frame (no card→low-noise jump). The
+            // binding read below still supplies the topic reply anchor.
             const binding = yield* bindings.get(chatId);
-            const placeholderDensity =
-              binding?.density ??
-              densityForRuntime(placeholderThread.runtimeMode, groupChatDensity);
+            const placeholderDensity = yield* resolveDensity(chatId, placeholderThread.runtimeMode);
             const initial = renderThreadCard(placeholderThread, {
               streaming: true,
               density: placeholderDensity,
@@ -2164,12 +2213,10 @@ const runBoundSession = (
       Effect.gen(function* () {
         const cardDone = yield* Deferred.make<void>();
         yield* Effect.gen(function* () {
-          // M3b: prefer the binding's bind-time density so the placeholder first
-          // frame matches the real frame (no density jump); fall back to the
-          // runtimeMode-derived density for legacy bindings without stored density.
-          const binding = yield* bindings.get(chatId);
-          const placeholderDensity =
-            binding?.density ?? densityForRuntime(placeholderThread.runtimeMode, groupChatDensity);
+          // M-3 PR-C3: resolve the placeholder first-frame density through the same
+          // per-chat > binding > runtime overlay the real frames use (no density jump
+          // when a per-chat override lowers this chat below `card`).
+          const placeholderDensity = yield* resolveDensity(chatId, placeholderThread.runtimeMode);
           const initial = renderThreadCard(placeholderThread, {
             streaming: true,
             density: placeholderDensity,
@@ -3120,9 +3167,10 @@ const runBoundSession = (
           if (interaction === undefined) {
             return;
           }
+          const density = yield* resolveDensity(chatKey, snapshotThread.runtimeMode);
           const card = renderThreadCard(snapshotThread, {
             streaming: false,
-            density: densityForRuntime(snapshotThread.runtimeMode, groupChatDensity),
+            density,
             interaction,
           }).card;
           yield* gateway.updateCard(messageId, card);
@@ -3410,41 +3458,47 @@ const runBoundSession = (
           return new Map(map).set(chatKey, forChat);
         });
 
-        const echoResolved = (): Effect.Effect<void> => {
-          const operatorOpenId = evt.operator.openId;
-          const ctx: InteractionContext = {
-            // The token's `c`/`scope` is the real Feishu chatId (matched at verify
-            // against `evt.chatId`); the topic id rides in `larkThreadId` so any
-            // *other* still-pending request re-signed on this echo card stays
-            // topic-bound. Omitted for p2p / non-topic (token unchanged pre-M3a).
-            chatId: evt.chatId,
-            threadId,
-            operatorOpenId,
-            runtimeMode: shell.runtimeMode,
-            auth,
-            ttlMs: CALLBACK_TOKEN_TTL_MS,
-            ...(parsed.larkThreadId !== undefined ? { larkThreadId: parsed.larkThreadId } : {}),
-          };
-          const resolvedNotice = new Map<string, ResolvedNoticeEntry>([[parsed.requestId, entry]]);
-          const elements = renderInteractionSection(
-            pendingApprovals,
-            pendingUserInputs,
-            staleRequestIdsOf(activities),
-            resolvedNotice,
-            ctx,
-          );
-          const card = renderThreadCard(snapshotThread, {
-            streaming: false,
-            density: densityForRuntime(snapshotThread.runtimeMode, groupChatDensity),
-            interaction: { elements },
-          }).card;
-          return gateway.updateCard(evt.messageId, card).pipe(
-            Effect.tapError((error) =>
-              Console.error(`[feishu-bot] card echo failed for ${evt.messageId}: ${error.message}`),
-            ),
-            Effect.ignore,
-          );
-        };
+        const echoResolved = (): Effect.Effect<void> =>
+          Effect.gen(function* () {
+            const operatorOpenId = evt.operator.openId;
+            const ctx: InteractionContext = {
+              // The token's `c`/`scope` is the real Feishu chatId (matched at verify
+              // against `evt.chatId`); the topic id rides in `larkThreadId` so any
+              // *other* still-pending request re-signed on this echo card stays
+              // topic-bound. Omitted for p2p / non-topic (token unchanged pre-M3a).
+              chatId: evt.chatId,
+              threadId,
+              operatorOpenId,
+              runtimeMode: shell.runtimeMode,
+              auth,
+              ttlMs: CALLBACK_TOKEN_TTL_MS,
+              ...(parsed.larkThreadId !== undefined ? { larkThreadId: parsed.larkThreadId } : {}),
+            };
+            const resolvedNotice = new Map<string, ResolvedNoticeEntry>([
+              [parsed.requestId, entry],
+            ]);
+            const elements = renderInteractionSection(
+              pendingApprovals,
+              pendingUserInputs,
+              staleRequestIdsOf(activities),
+              resolvedNotice,
+              ctx,
+            );
+            const density = yield* resolveDensity(chatKey, snapshotThread.runtimeMode);
+            const card = renderThreadCard(snapshotThread, {
+              streaming: false,
+              density,
+              interaction: { elements },
+            }).card;
+            yield* gateway.updateCard(evt.messageId, card).pipe(
+              Effect.tapError((error) =>
+                Console.error(
+                  `[feishu-bot] card echo failed for ${evt.messageId}: ${error.message}`,
+                ),
+              ),
+              Effect.ignore,
+            );
+          });
 
         // Approval (plain button) echoes immediately. A user-input *form* submit
         // is gated by Feishu's ~1s client-side form lock (FORM_SETTLE_MS); a
@@ -3721,9 +3775,10 @@ const runBoundSession = (
             snapshotThread,
             handle.operatorOpenId,
           );
+          const density = yield* resolveDensity(chatId, snapshotThread.runtimeMode);
           const card = renderThreadCard(snapshotThread, {
             streaming: false,
-            density: densityForRuntime(snapshotThread.runtimeMode, groupChatDensity),
+            density,
             ...(interaction ? { interaction } : {}),
           }).card;
           // #10: reflect the ACTUAL outcome of the card push. `updateCard` failures

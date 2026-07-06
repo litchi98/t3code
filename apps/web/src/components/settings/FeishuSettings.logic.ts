@@ -1,4 +1,4 @@
-import type { FeishuChatConfig } from "@t3tools/contracts";
+import { FEISHU_RENDER_DENSITIES, type FeishuChatConfig } from "@t3tools/contracts";
 
 /**
  * Pure helpers for the Feishu per-chat approval editor (M-2 PR2c).
@@ -44,6 +44,30 @@ export const APPROVAL_MODE_LABELS: Record<ApprovalMode, string> = {
   designated: "指定审批人",
   all: "任意群成员",
 };
+
+/** The render density values (M-3 PR-C3), non-optional form of `FeishuChatConfig.density`. */
+export type RenderDensity = NonNullable<FeishuChatConfig["density"]>;
+
+/**
+ * The densities in display order (segmented control), from the SAME contract list
+ * the bot's `RENDER_DENSITIES` is parity-checked against — one source, so the
+ * editor can never offer a density the bot can't render.
+ */
+export const DENSITY_MODES: readonly RenderDensity[] = FEISHU_RENDER_DENSITIES;
+
+export const DENSITY_LABELS: Record<RenderDensity, string> = {
+  card: "卡片",
+  markdown: "Markdown",
+  text: "纯文本",
+};
+
+/**
+ * Built-in group render density when neither the chat nor the defaults set one.
+ * Mirrors the bot's `densityForRuntime` group default (`card`) so "what the editor
+ * shows == what the bot renders". (p2p is always `card` in the bot, but p2p chats
+ * are not configurable here — the group section only.)
+ */
+export const DEFAULT_GROUP_DENSITY: RenderDensity = "card";
 
 /** Sentinel select value for a per-chat entry that inherits the default mode. */
 export const INHERIT_MODE = "inherit" as const;
@@ -103,7 +127,11 @@ export const isChatConfigEmpty = (config: FeishuChatConfig): boolean =>
   (config.approvers === undefined || config.approvers.length === 0) &&
   config.workspaces === undefined &&
   config.commands === undefined &&
-  config.toolPolicy === undefined;
+  config.toolPolicy === undefined &&
+  // PR-C3 red line: a chat whose ONLY override is `density` is a REAL override and
+  // must NOT be dropped, or `writeChatConfig`'s drop-empty would silently delete it
+  // and the per-chat density could never persist.
+  config.density === undefined;
 
 /** Apply a mode selection to a single config. `inherit` clears mode + approvers. */
 export const setConfigApprovalMode = (
@@ -169,6 +197,23 @@ export const toggleConfigWorkspace = (
   projectId: string,
 ): FeishuChatConfig =>
   setConfigWorkspaces(config, toggleApprover(config.workspaces ?? [], projectId));
+
+/**
+ * Set (or clear) the render density on a config (per-chat or defaults). Passing
+ * `undefined` REMOVES the field (per-chat: inherit the default; defaults: fall back
+ * to the built-in `card`); a value is a real override kept in the map. Unlike
+ * commands/workspaces there is no empty-list case — density is a single literal.
+ */
+export const setConfigDensity = (
+  config: FeishuChatConfig,
+  density: RenderDensity | undefined,
+): FeishuChatConfig => {
+  if (density === undefined) {
+    const { density: _dropped, ...rest } = config;
+    return normalizeConfig(rest);
+  }
+  return normalizeConfig({ ...config, density });
+};
 
 /**
  * Describe what commands a chat with NO own `commands` override inherits, faithful
@@ -257,7 +302,10 @@ export const toggleDefaultsApprover = (
 // `apps/feishu-bot/src/bridge/chatConfig.ts`): every field falls back
 // INDEPENDENTLY, `configs[chatId]?.field ?? defaults.field ?? built-in`. The web
 // MUST NOT re-derive a second fallback — one source of truth so "what the editor
-// shows == what the bot enforces". (Density lands in PR-C3, so it is absent here.)
+// shows == what the bot enforces". PR-C3 adds `density`: the web built-in group
+// default is `card`, matching the bot's `densityForRuntime` group default (the
+// bot's binding-density tier is a bot-only fallback that only applies when neither
+// per-chat nor defaults set density, so it never diverges from what the web shows).
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Built-in approval mode when neither the chat nor the defaults set one (mirrors the bot). */
@@ -287,6 +335,8 @@ export interface EffectiveConfig {
   readonly commands: EffectiveField<ReadonlyArray<string> | undefined>;
   /** `undefined` = unrestricted (every workspace allowed); `[]` = no workspace authorized. */
   readonly workspaces: EffectiveField<ReadonlyArray<string> | undefined>;
+  /** Resolved render density; built-in group default is `card`. */
+  readonly density: EffectiveField<RenderDensity>;
 }
 
 const fieldSource = (own: unknown, def: unknown): ConfigSource =>
@@ -319,6 +369,10 @@ export const effectiveConfig = (
     workspaces: {
       value: perChat?.workspaces ?? defaults.workspaces,
       source: fieldSource(perChat?.workspaces, defaults.workspaces),
+    },
+    density: {
+      value: perChat?.density ?? defaults.density ?? DEFAULT_GROUP_DENSITY,
+      source: fieldSource(perChat?.density, defaults.density),
     },
   };
 };
@@ -368,6 +422,9 @@ export const restingChatSummary = (effective: EffectiveConfig, overridden: boole
   if (effective.workspaces.source === "chat") {
     parts.push(`工作区 ${workspacesSummary(effective.workspaces.value)}`);
   }
+  if (effective.density.source === "chat") {
+    parts.push(`密度 ${DENSITY_LABELS[effective.density.value]}`);
+  }
   return parts.join(" · ");
 };
 
@@ -388,4 +445,5 @@ export const defaultsSummary = (
   },
   { key: "命令", value: commandsSummary(defaults.commands) },
   { key: "工作区", value: workspacesSummary(defaults.workspaces) },
+  { key: "密度", value: DENSITY_LABELS[defaults.density ?? DEFAULT_GROUP_DENSITY] },
 ];

@@ -11,7 +11,9 @@
  * so this stays unit-testable and the gate keeps a thin Effect wrapper.
  *
  * PR2b consumes `approvalMode` + `approvers` (three-state authz). `workspaces` /
- * `commands` / `toolPolicy` are surfaced here but consumed later (M-3).
+ * `commands` / `toolPolicy` are surfaced here but consumed later (M-3). PR-C3 adds
+ * `density` — surfaced here so the bot's `resolveDensity` reads per-chat > defaults
+ * first, then falls back to the bind-time binding density / runtime default.
  */
 import type { FeishuChatConfig } from "@t3tools/contracts";
 
@@ -29,6 +31,11 @@ export interface EffectiveChatConfig {
   readonly workspaces: ReadonlyArray<string> | undefined;
   readonly commands: ReadonlyArray<string> | undefined;
   readonly toolPolicy: FeishuChatConfig["toolPolicy"];
+  // PR-C3: `undefined` = "not configured" here; the render read points (via
+  // `resolveDensity`) apply the further binding / runtime-mode fallback, which is
+  // why the built-in `card` is NOT baked in at this layer (it depends on the
+  // chat's runtimeMode — p2p is always `card`).
+  readonly density: FeishuChatConfig["density"];
 }
 
 /**
@@ -49,5 +56,6 @@ export const effectiveChatConfig = (
     workspaces: pick("workspaces"),
     commands: pick("commands"),
     toolPolicy: pick("toolPolicy"),
+    density: pick("density"),
   };
 };
