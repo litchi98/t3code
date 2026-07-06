@@ -247,3 +247,145 @@ export const toggleDefaultsApprover = (
   openId: string,
 ): FeishuChatConfig =>
   normalizeConfig({ ...defaults, approvers: toggleApprover(defaults.approvers ?? [], openId) });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Effective config (resting-state summaries + the drawer's effective-preview card)
+//
+// The list-row灰字 and the drawer preview both show a chat's RESOLVED config —
+// "what the bot enforces". Both consume the SAME `effectiveConfig` here, which is
+// a byte-faithful mirror of the bot's `effectiveChatConfig` (see
+// `apps/feishu-bot/src/bridge/chatConfig.ts`): every field falls back
+// INDEPENDENTLY, `configs[chatId]?.field ?? defaults.field ?? built-in`. The web
+// MUST NOT re-derive a second fallback — one source of truth so "what the editor
+// shows == what the bot enforces". (Density lands in PR-C3, so it is absent here.)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Built-in approval mode when neither the chat nor the defaults set one (mirrors the bot). */
+export const DEFAULT_APPROVAL_MODE: ApprovalMode = "initiator";
+
+/** Where a resolved field's value came from, mirroring the three fallback tiers. */
+export type ConfigSource = "chat" | "default" | "builtin";
+
+/** Human labels for a field's source tier, for the drawer's `[本群]/[默认]/[内置]` badges. */
+export const SOURCE_LABELS: Record<ConfigSource, string> = {
+  chat: "本群",
+  default: "默认",
+  builtin: "内置",
+};
+
+/** A resolved field: its effective value plus which tier it was taken from. */
+export interface EffectiveField<T> {
+  readonly value: T;
+  readonly source: ConfigSource;
+}
+
+/** A chat's fully-resolved config (per M-3 PR-C2 dimensions; density arrives in PR-C3). */
+export interface EffectiveConfig {
+  readonly approvalMode: EffectiveField<ApprovalMode>;
+  readonly approvers: EffectiveField<ReadonlyArray<string>>;
+  /** `undefined` = unrestricted (every command allowed); `[]` = only the floor commands. */
+  readonly commands: EffectiveField<ReadonlyArray<string> | undefined>;
+  /** `undefined` = unrestricted (every workspace allowed); `[]` = no workspace authorized. */
+  readonly workspaces: EffectiveField<ReadonlyArray<string> | undefined>;
+}
+
+const fieldSource = (own: unknown, def: unknown): ConfigSource =>
+  own !== undefined ? "chat" : def !== undefined ? "default" : "builtin";
+
+/**
+ * Resolve a chat's effective config by field-level fallback, faithful to the bot's
+ * `effectiveChatConfig`. `configs[chatId]` absent (a clean, un-overridden chat) is
+ * fine — every field then resolves from `defaults` or the built-in.
+ */
+export const effectiveConfig = (
+  chatId: string,
+  configs: FeishuChatConfigMap,
+  defaults: FeishuChatConfig,
+): EffectiveConfig => {
+  const perChat = configs[chatId];
+  return {
+    approvalMode: {
+      value: perChat?.approvalMode ?? defaults.approvalMode ?? DEFAULT_APPROVAL_MODE,
+      source: fieldSource(perChat?.approvalMode, defaults.approvalMode),
+    },
+    approvers: {
+      value: perChat?.approvers ?? defaults.approvers ?? [],
+      source: fieldSource(perChat?.approvers, defaults.approvers),
+    },
+    commands: {
+      value: perChat?.commands ?? defaults.commands,
+      source: fieldSource(perChat?.commands, defaults.commands),
+    },
+    workspaces: {
+      value: perChat?.workspaces ?? defaults.workspaces,
+      source: fieldSource(perChat?.workspaces, defaults.workspaces),
+    },
+  };
+};
+
+/**
+ * True when a chat carries a real override (so its list row shows the "changed"
+ * signal rather than the quiet inherited灰字). An entry present in the map is
+ * always non-empty (`writeChatConfig` drops empties), but a hand-edited
+ * settings.json could leave an empty entry — so gate on `!isChatConfigEmpty`.
+ */
+export const isChatOverridden = (config: FeishuChatConfig | undefined): boolean =>
+  config !== undefined && !isChatConfigEmpty(config);
+
+/** Compact label for an effective approval mode (with approver count when designated). */
+export const approvalSummary = (mode: ApprovalMode, approverCount: number): string =>
+  mode === "designated"
+    ? `${APPROVAL_MODE_LABELS.designated} · ${approverCount} 人`
+    : APPROVAL_MODE_LABELS[mode];
+
+/** Compact label for a command allowlist: `undefined`→全部, `[]`→仅基础, list→N 项. */
+export const commandsSummary = (commands: ReadonlyArray<string> | undefined): string =>
+  commands === undefined ? "全部" : commands.length === 0 ? "仅基础" : `${commands.length} 项`;
+
+/** Compact label for a workspace allowlist: `undefined`→全部, `[]`→未授权, list→N 个. */
+export const workspacesSummary = (workspaces: ReadonlyArray<string> | undefined): string =>
+  workspaces === undefined
+    ? "全部"
+    : workspaces.length === 0
+      ? "未授权"
+      : `${workspaces.length} 个`;
+
+/**
+ * One-line resting summary for a chat's list row. A clean chat reads
+ * "继承默认 · <effective approval>"; an overridden chat leads with its effective
+ * approval and appends only the dimensions IT overrides (commands/workspaces),
+ * so the row communicates the real enforced state at a glance without opening the
+ * drawer. Both branches show effective values only (owner-always弱化: no
+ * "+授权人" tail).
+ */
+export const restingChatSummary = (effective: EffectiveConfig, overridden: boolean): string => {
+  const approval = approvalSummary(effective.approvalMode.value, effective.approvers.value.length);
+  if (!overridden) return `继承默认 · ${approval}`;
+  const parts = [approval];
+  if (effective.commands.source === "chat") {
+    parts.push(`命令 ${commandsSummary(effective.commands.value)}`);
+  }
+  if (effective.workspaces.source === "chat") {
+    parts.push(`工作区 ${workspacesSummary(effective.workspaces.value)}`);
+  }
+  return parts.join(" · ");
+};
+
+/**
+ * The default-config baseline entry's own compact summary (keyed dimensions). The
+ * defaults are explicit values (not resolved against anything), so this reads them
+ * directly — absent command/workspace lists mean "全部", the built-in baseline.
+ */
+export const defaultsSummary = (
+  defaults: FeishuChatConfig,
+): ReadonlyArray<{ readonly key: string; readonly value: string }> => [
+  {
+    key: "审批",
+    value: approvalSummary(
+      defaults.approvalMode ?? DEFAULT_APPROVAL_MODE,
+      (defaults.approvers ?? []).length,
+    ),
+  },
+  { key: "命令", value: commandsSummary(defaults.commands) },
+  { key: "工作区", value: workspacesSummary(defaults.workspaces) },
+];

@@ -6,15 +6,19 @@ import type {
   FeishuChatMember,
 } from "@t3tools/contracts";
 import { FEISHU_COMMAND_REGISTRY, FEISHU_CONFIGURABLE_COMMANDS } from "@t3tools/contracts";
-import { LinkIcon, PlusIcon, UsersIcon, XIcon } from "lucide-react";
-import { useCallback, useRef, useState } from "react";
+import { ChevronRightIcon, CopyIcon, LinkIcon, PlusIcon, UsersIcon, XIcon } from "lucide-react";
+import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 
+import { cn } from "~/lib/utils";
 import { useProjects } from "~/state/entities";
 import { usePrimaryEnvironment } from "~/state/environments";
 import { useEnvironmentQuery } from "~/state/query";
 import { serverEnvironment } from "~/state/server";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { usePrimarySettings, useUpdatePrimarySettings } from "../../hooks/useSettings";
+import { RightPanelSheet } from "../RightPanelSheet";
+import { Badge } from "../ui/badge";
+import { SheetTitle } from "../ui/sheet";
 import { Button } from "../ui/button";
 import { Checkbox } from "../ui/checkbox";
 import { Input } from "../ui/input";
@@ -25,20 +29,29 @@ import {
   APPROVAL_MODES,
   chatModeSelection,
   type ChatModeSelection,
+  commandsSummary,
+  type ConfigSource,
   deepEqual,
   defaultsModeSelection,
+  defaultsSummary,
   describeInheritedCommands,
   describeInheritedWorkspaces,
+  type EffectiveConfig,
+  effectiveConfig,
   type FeishuChatConfigMap,
   INHERIT_MODE,
+  isChatOverridden,
+  restingChatSummary,
   setConfigApprovalMode,
   setConfigCommands,
   setConfigWorkspaces,
   setDefaultsApprovalMode,
+  SOURCE_LABELS,
   toggleConfigApprover,
   toggleConfigCommand,
   toggleConfigWorkspace,
   toggleDefaultsApprover,
+  workspacesSummary,
   writeChatConfig,
 } from "./FeishuSettings.logic";
 import { SettingsPageContainer, SettingsSection } from "./settingsLayout";
@@ -232,6 +245,21 @@ function useOptimisticSetting<T>(
   return [pending ?? serverValue, commit];
 }
 
+/** Which config the drawer is editing: one group override, or the shared defaults. */
+type DrawerTarget =
+  | { readonly kind: "chat"; readonly chatId: string }
+  | { readonly kind: "defaults" };
+
+/**
+ * Master-detail per-chat config: a group section whose card lists a "默认配置"
+ * baseline entry plus one quiet resting-summary row per group. Clicking a row (or
+ * the baseline) slides out a right-hand drawer with that config's dimension
+ * editors. The section owns BOTH optimistic overlays (`feishuChatConfigs` and
+ * `feishuChatDefaults`) so the baseline summary, per-chat resting summaries, and
+ * the drawer editors all read one consistent in-flight value — and so the drawer
+ * renders the LIVE config (never a snapshot frozen at click time, which would show
+ * stale/empty after a hard refresh; see the hydration note on `useOptimisticSetting`).
+ */
 function FeishuChatConfigSection() {
   const environmentId = usePrimaryEnvironment()?.environmentId ?? null;
   const { data, error, isPending } = useEnvironmentQuery(
@@ -239,16 +267,7 @@ function FeishuChatConfigSection() {
   );
 
   const serverConfigs = usePrimarySettings((s) => s.feishuChatConfigs) as FeishuChatConfigMap;
-  // The default config a chat with no per-chat override inherits. Read here (not
-  // just inside the defaults editor) so each per-chat card can show its TRUE
-  // inherited command/workspace state — the bot resolves per-chat-absent fields
-  // against these defaults, so a card must not claim "allows all" when the default
-  // itself restricts. (Informational only; a one-round-trip lag vs the defaults
-  // editor's own optimistic value is harmless for hint text.)
   const serverDefaults = usePrimarySettings((s) => s.feishuChatDefaults);
-  // The binding owner is always allowed to approve (owner-always overlay), so
-  // their roster checkbox is shown pre-checked and locked, not toggleable.
-  const bindingOwnerOpenId = usePrimarySettings((s) => s.feishuBinding?.ownerOpenId);
   const update = useUpdatePrimarySettings();
   const writeConfigs = useCallback(
     (next: FeishuChatConfigMap) => update({ feishuChatConfigs: next }),
@@ -261,6 +280,11 @@ function FeishuChatConfigSection() {
     },
     [commitConfigs],
   );
+  const writeDefaults = useCallback(
+    (next: FeishuChatConfig) => update({ feishuChatDefaults: next }),
+    [update],
+  );
+  const [defaults, commitDefaults] = useOptimisticSetting(serverDefaults, writeDefaults);
 
   // Workspace-allowlist options: the projects on THIS (primary) environment — the
   // one the bot is bound to. `useProjects()` aggregates every environment, so
@@ -275,185 +299,508 @@ function FeishuChatConfigSection() {
   // always fall back to the initiator/owner path, so there is nothing to configure.
   const chats = (data?.chats ?? []).filter((chat) => chat.chatMode !== "p2p");
 
+  // The drawer stores only its TARGET (a chatId or the defaults sentinel), never a
+  // config snapshot — the content re-reads `configs`/`defaults` live on every
+  // render. `lastTarget` retains the target through the close transition so the
+  // drawer body doesn't blank out mid-animation.
+  const [drawerTarget, setDrawerTarget] = useState<DrawerTarget | null>(null);
+  const lastTargetRef = useRef<DrawerTarget | null>(null);
+  if (drawerTarget) lastTargetRef.current = drawerTarget;
+  const activeTarget = drawerTarget ?? lastTargetRef.current;
+  const closeDrawer = useCallback(() => setDrawerTarget(null), []);
+
+  const activeChat =
+    activeTarget?.kind === "chat"
+      ? chats.find((chat) => chat.chatId === activeTarget.chatId)
+      : undefined;
+
   return (
-    <SettingsSection title="飞书审批配置" icon={<UsersIcon className="size-3" />}>
-      <div className="space-y-2 px-4 py-3 text-xs text-muted-foreground/80 sm:px-5">
-        <p>
-          控制飞书审批卡片可由谁点击审批。审批模式分三档:
-          <strong className="font-medium text-foreground/90">仅发起人</strong>(默认)、
-          <strong className="font-medium text-foreground/90">指定审批人</strong>、
-          <strong className="font-medium text-foreground/90">任意群成员</strong>。绑定飞书 Bot
-          的授权人始终可审批,无需在此列出。
-        </p>
-        <p>
-          先设默认,再按需为单个群覆盖:每个群可单独限制{" "}
-          <strong className="font-medium text-foreground/90">可用命令</strong>与
-          <strong className="font-medium text-foreground/90">可用工作区</strong>
-          。在群里发{" "}
-          <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px] text-foreground">
-            /whoami
-          </code>{" "}
-          可获取自己的 open_id。绑定的授权人不受这些限制约束。
-        </p>
-      </div>
+    <SettingsSection
+      title={`群聊${chats.length > 0 ? ` · ${chats.length}` : ""}`}
+      icon={<UsersIcon className="size-3" />}
+    >
+      {/* Clip the list to the card's inner radius: the baseline entry carries a
+          persistent background and rows tint on hover, so their square corners would
+          otherwise poke past the section's rounded (overflow-visible) border. */}
+      <div className="overflow-hidden rounded-[calc(var(--radius-2xl)-1px)]">
+        <BaselineEntry defaults={defaults} onEdit={() => setDrawerTarget({ kind: "defaults" })} />
 
-      <div className="border-t border-border/60 px-4 py-3 sm:px-5">
-        <FeishuDefaultsEditor projects={projects} />
-      </div>
-
-      <div className="border-t border-border/60 px-4 py-3 sm:px-5">
-        <h4 className="mb-2 font-medium text-foreground/90 text-xs">分群覆盖</h4>
         {environmentId === null ? (
-          <p className="text-xs text-muted-foreground">未连接环境。</p>
+          <p className="border-t border-border/60 px-4 py-3 text-xs text-muted-foreground sm:px-5">
+            未连接环境。
+          </p>
         ) : isPending ? (
-          <p className="text-xs text-muted-foreground">加载群列表…</p>
+          <p className="border-t border-border/60 px-4 py-3 text-xs text-muted-foreground sm:px-5">
+            加载群列表…
+          </p>
         ) : error ? (
-          <p className="text-xs text-destructive">群列表加载失败:{error}</p>
+          <p className="border-t border-border/60 px-4 py-3 text-xs text-destructive sm:px-5">
+            群列表加载失败:{error}
+          </p>
         ) : chats.length === 0 ? (
-          <p className="text-xs text-muted-foreground">
+          <p className="border-t border-border/60 px-4 py-3 text-xs text-muted-foreground sm:px-5">
             暂无群聊。Bot 加入群聊后会自动同步到这里。
           </p>
         ) : (
-          <div className="space-y-3">
-            {chats.map((chat) => (
-              <FeishuChatConfigCard
-                key={chat.chatId}
-                chat={chat}
-                config={configs[chat.chatId]}
-                bindingOwnerOpenId={bindingOwnerOpenId}
-                projects={projects}
-                defaultCommands={serverDefaults.commands}
-                defaultWorkspaces={serverDefaults.workspaces}
-                onCommit={commitChat}
-              />
-            ))}
-          </div>
+          chats.map((chat) => (
+            <ChatRestingRow
+              key={chat.chatId}
+              chat={chat}
+              effective={effectiveConfig(chat.chatId, configs, defaults)}
+              overridden={isChatOverridden(configs[chat.chatId])}
+              onOpen={() => setDrawerTarget({ kind: "chat", chatId: chat.chatId })}
+            />
+          ))
         )}
       </div>
+
+      <RightPanelSheet open={drawerTarget !== null} onClose={closeDrawer}>
+        {activeTarget?.kind === "defaults" ? (
+          <DefaultsDrawer
+            defaults={defaults}
+            projects={projects}
+            onCommit={commitDefaults}
+            onClose={closeDrawer}
+          />
+        ) : activeTarget?.kind === "chat" ? (
+          <ChatConfigDrawer
+            chatId={activeTarget.chatId}
+            chat={activeChat}
+            config={configs[activeTarget.chatId]}
+            effective={effectiveConfig(activeTarget.chatId, configs, defaults)}
+            defaults={defaults}
+            projects={projects}
+            onCommit={(updater) => commitChat(activeTarget.chatId, updater)}
+            onClose={closeDrawer}
+          />
+        ) : null}
+      </RightPanelSheet>
     </SettingsSection>
   );
 }
 
 /**
- * Default-config editor (`feishuChatDefaults`); always shows an explicit approval
- * mode. Commands/workspaces here are the baseline every un-overridden chat
- * inherits; absent = unrestricted (the built-in default).
+ * The default-config baseline entry pinned to the top of the group section — a
+ * distinct object (not a group row) that every un-overridden chat inherits.
+ * Clicking it opens the same drawer, in defaults mode.
  */
-function FeishuDefaultsEditor({ projects }: { projects: ReadonlyArray<WorkspaceOption> }) {
-  const serverDefaults = usePrimarySettings((s) => s.feishuChatDefaults);
-  const update = useUpdatePrimarySettings();
-  const writeDefaults = useCallback(
-    (next: FeishuChatConfig) => update({ feishuChatDefaults: next }),
-    [update],
-  );
-  const [draft, commit] = useOptimisticSetting(serverDefaults, writeDefaults);
-  const mode = defaultsModeSelection(draft);
-
+function BaselineEntry({ defaults, onEdit }: { defaults: FeishuChatConfig; onEdit: () => void }) {
+  const summary = defaultsSummary(defaults);
   return (
-    <div className="space-y-2">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div className="min-w-0">
-          <p className="font-medium text-foreground/90 text-xs">默认审批模式</p>
-          <p className="text-[11px] text-muted-foreground/80">未单独配置的群聊都用这个模式。</p>
+    <button
+      type="button"
+      onClick={onEdit}
+      className="flex w-full items-center gap-3 bg-muted/40 px-4 py-3 text-left transition-colors hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-5"
+    >
+      <div className="min-w-0 flex-1 space-y-1">
+        <div className="flex items-center gap-2">
+          <Badge variant="secondary" size="sm">
+            基线
+          </Badge>
+          <span className="font-medium text-[13px] text-foreground/90">默认配置</span>
+          <span className="text-[11px] text-muted-foreground/70">所有群的默认基线</span>
         </div>
-        <ModeSelect
-          value={mode}
-          includeInherit={false}
-          ariaLabel="默认审批模式"
-          onChange={(selection) => {
-            if (selection === INHERIT_MODE) return;
-            commit((current) => setDefaultsApprovalMode(current, selection));
-          }}
-        />
+        <p className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-muted-foreground/80">
+          {summary.map((item, index) => (
+            <span key={item.key} className="inline-flex items-center gap-1">
+              {index > 0 ? (
+                <span className="text-muted-foreground/30" aria-hidden>
+                  ·
+                </span>
+              ) : null}
+              <span className="text-muted-foreground/60">{item.key}</span>
+              <span className="text-foreground/80">{item.value}</span>
+            </span>
+          ))}
+        </p>
       </div>
-      {mode === "designated" ? (
-        <ApproversEditor
-          approvers={draft.approvers ?? []}
-          idPrefix="feishu-default-approvers"
-          onToggle={(openId) => commit((current) => toggleDefaultsApprover(current, openId))}
-        />
-      ) : null}
-      <CommandsEditor commands={draft.commands} offHint="不限制,允许全部命令。" onChange={commit} />
-      <WorkspacesEditor
-        workspaces={draft.workspaces}
-        projects={projects}
-        offHint="不限制,允许全部工作区。"
-        onChange={commit}
-      />
+      <span className="inline-flex shrink-0 items-center gap-1 text-[11px] text-muted-foreground">
+        编辑默认
+        <ChevronRightIcon className="size-3.5" />
+      </span>
+    </button>
+  );
+}
+
+/**
+ * One group's quiet resting-summary row (static blueprint). A clean chat reads a
+ * muted "继承默认 · <mode>"; an overridden chat is marked with a small accent dot
+ * and shows the dimensions it overrides. Clicking opens the detail drawer. The full
+ * coverage fingerprint (per-dimension ○◐● + covered-dimension chips) is deferred.
+ */
+function ChatRestingRow({
+  chat,
+  effective,
+  overridden,
+  onOpen,
+}: {
+  chat: FeishuChatDirectoryEntry;
+  effective: EffectiveConfig;
+  overridden: boolean;
+  onOpen: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className="flex w-full items-center gap-3 border-t border-border/60 px-4 py-3 text-left transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring sm:px-5"
+    >
+      <div className="min-w-0 flex-1 space-y-1">
+        <div className="flex items-center gap-2">
+          {overridden ? (
+            <span className="size-1.5 shrink-0 rounded-full bg-primary/70" aria-label="已覆盖" />
+          ) : null}
+          <span className="truncate font-medium text-[13px] text-foreground">
+            {chat.name || chat.chatId}
+          </span>
+          {chat.chatMode === "topic" ? (
+            <Badge variant="secondary" size="sm">
+              话题
+            </Badge>
+          ) : null}
+        </div>
+        <p
+          className={cn(
+            "truncate text-xs",
+            overridden ? "text-muted-foreground/90" : "text-muted-foreground/70",
+          )}
+        >
+          {restingChatSummary(effective, overridden)}
+        </p>
+      </div>
+      <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
+    </button>
+  );
+}
+
+/** Drawer chrome: sticky header (title + meta) with a close button, over a scrollable body. */
+function DrawerShell({
+  title,
+  meta,
+  onClose,
+  children,
+}: {
+  title: string;
+  meta: ReactNode;
+  onClose: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="flex items-start justify-between gap-3 border-b border-border/60 px-5 py-4">
+        <div className="min-w-0 space-y-1.5">
+          {/* SheetTitle renders the base-ui Dialog.Title, wiring the popup's
+              aria-labelledby so the drawer has an accessible name. */}
+          <SheetTitle className="truncate text-base leading-snug">{title}</SheetTitle>
+          {meta}
+        </div>
+        <Button
+          size="icon-sm"
+          variant="ghost"
+          aria-label="关闭"
+          onClick={onClose}
+          className="shrink-0"
+        >
+          <XIcon className="size-4" />
+        </Button>
+      </div>
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-5 py-4">{children}</div>
     </div>
   );
 }
 
 /**
- * One group's override card — fully controlled by `FeishuChatConfigSection`,
- * which owns the draft map. `onCommit` takes an updater over THIS chat's current
- * config so the section can apply it against the freshest accumulated draft.
+ * Copy `text` to the clipboard, returning whether it actually succeeded. Prefers
+ * the async Clipboard API but falls back to a hidden-textarea `execCommand` for
+ * non-secure contexts (the app is routinely served over plain-HTTP LAN IPs, where
+ * `navigator.clipboard` is undefined) and when the async write rejects.
  */
-function FeishuChatConfigCard({
+async function copyToClipboard(text: string): Promise<boolean> {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // fall through to the execCommand path
+    }
+  }
+  try {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(textarea);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+/** A "复制 ID" button that copies the raw chatId and confirms ONLY on a real copy. */
+function CopyIdButton({ value }: { value: string }) {
+  const [copied, setCopied] = useState(false);
+  // Clear the confirmation on a timer, and tear it down on unmount / re-copy so no
+  // setState fires after the drawer closes.
+  useEffect(() => {
+    if (!copied) return;
+    const id = setTimeout(() => setCopied(false), 1500);
+    return () => clearTimeout(id);
+  }, [copied]);
+  return (
+    <Button
+      size="xs"
+      variant="ghost"
+      className="-ml-0.5 h-5 gap-1 px-1.5 text-[11px] text-muted-foreground"
+      onClick={() => {
+        void copyToClipboard(value).then((ok) => {
+          if (ok) setCopied(true);
+        });
+      }}
+    >
+      <CopyIcon className="size-3" />
+      {copied ? "已复制" : "复制 ID"}
+    </Button>
+  );
+}
+
+/**
+ * Drawer body for a single group override. Renders the effective-preview card
+ * (resolved "what the bot enforces" via the shared `effectiveConfig`) above the
+ * four dimension editors — flat (the collapse-one-at-a-time grid is deferred). All
+ * config values are read LIVE from the section's optimistic overlay via props, so a
+ * hard refresh mid-edit never freezes a stale snapshot into the drawer.
+ */
+function ChatConfigDrawer({
+  chatId,
   chat,
   config,
-  bindingOwnerOpenId,
+  effective,
+  defaults,
   projects,
-  defaultCommands,
-  defaultWorkspaces,
   onCommit,
+  onClose,
 }: {
-  chat: FeishuChatDirectoryEntry;
+  chatId: string;
+  chat: FeishuChatDirectoryEntry | undefined;
   config: FeishuChatConfig | undefined;
-  bindingOwnerOpenId?: string | undefined;
+  effective: EffectiveConfig;
+  defaults: FeishuChatConfig;
   projects: ReadonlyArray<WorkspaceOption>;
-  defaultCommands: ReadonlyArray<string> | undefined;
-  defaultWorkspaces: ReadonlyArray<string> | undefined;
-  onCommit: (chatId: string, updater: (config: FeishuChatConfig) => FeishuChatConfig) => void;
+  onCommit: (updater: (config: FeishuChatConfig) => FeishuChatConfig) => void;
+  onClose: () => void;
 }) {
+  const name = chat?.name || chatId;
+  const memberCount = chat ? (chat.memberCount ?? chat.members.length) : undefined;
   const mode = chatModeSelection(config);
-  const memberCount = chat.memberCount ?? chat.members.length;
-  // A card is fully controlled by the section; every editor emits an updater over
-  // THIS chat's current config, applied against the freshest accumulated draft.
-  const change = useCallback(
-    (updater: (current: FeishuChatConfig) => FeishuChatConfig) => onCommit(chat.chatId, updater),
-    [onCommit, chat.chatId],
-  );
 
   return (
-    <div className="rounded-lg border border-border/60 p-3">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-        <div className="min-w-0">
-          <p className="truncate font-medium text-foreground/90 text-sm">
-            {chat.name || chat.chatId}
-          </p>
-          <p className="truncate text-[11px] text-muted-foreground/80">
-            {memberCount} 名成员 · <span className="font-mono">{chat.chatId}</span>
-          </p>
+    <DrawerShell
+      title={name}
+      onClose={onClose}
+      meta={
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+          {chat?.chatMode === "topic" ? (
+            <Badge variant="secondary" size="sm">
+              话题群
+            </Badge>
+          ) : null}
+          {memberCount !== undefined ? (
+            <>
+              <span>{memberCount} 人</span>
+              <span className="text-muted-foreground/40" aria-hidden>
+                ·
+              </span>
+            </>
+          ) : null}
+          <span className="truncate font-mono">{chatId}</span>
+          <CopyIdButton value={chatId} />
         </div>
-        <ModeSelect
-          value={mode}
-          includeInherit
-          ariaLabel={`${chat.name || chat.chatId} 审批模式`}
-          onChange={(selection) => change((current) => setConfigApprovalMode(current, selection))}
+      }
+    >
+      <EffectivePreviewCard effective={effective} members={chat?.members ?? []} />
+
+      <div className="space-y-3">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0">
+            <p className="font-medium text-foreground/90 text-xs">审批模式</p>
+            <p className="text-[11px] text-muted-foreground/80">谁可以点击审批卡片放行。</p>
+          </div>
+          <ModeSelect
+            value={mode}
+            includeInherit
+            ariaLabel={`${name} 审批模式`}
+            onChange={(selection) =>
+              onCommit((current) => setConfigApprovalMode(current, selection))
+            }
+          />
+        </div>
+        {mode === "designated" ? (
+          <ApproversEditor
+            approvers={config?.approvers ?? []}
+            members={chat?.members ?? []}
+            idPrefix={`feishu-chat-${chatId}`}
+            onToggle={(openId) => onCommit((current) => toggleConfigApprover(current, openId))}
+          />
+        ) : null}
+        <CommandsEditor
+          commands={config?.commands}
+          offHint={describeInheritedCommands(defaults.commands)}
+          onChange={onCommit}
+        />
+        <WorkspacesEditor
+          workspaces={config?.workspaces}
+          projects={projects}
+          offHint={describeInheritedWorkspaces(defaults.workspaces)}
+          onChange={onCommit}
         />
       </div>
-      {mode === "designated" ? (
-        <ApproversEditor
-          approvers={config?.approvers ?? []}
-          members={chat.members}
-          bindingOwnerOpenId={bindingOwnerOpenId}
-          idPrefix={`feishu-chat-${chat.chatId}`}
-          onToggle={(openId) => change((current) => toggleConfigApprover(current, openId))}
+    </DrawerShell>
+  );
+}
+
+/**
+ * Drawer body for the shared defaults (`feishuChatDefaults`); always an explicit
+ * approval mode, no "inherit" option. Commands/workspaces here are the baseline
+ * every un-overridden chat inherits; absent = unrestricted (the built-in default).
+ */
+function DefaultsDrawer({
+  defaults,
+  projects,
+  onCommit,
+  onClose,
+}: {
+  defaults: FeishuChatConfig;
+  projects: ReadonlyArray<WorkspaceOption>;
+  onCommit: (updater: (config: FeishuChatConfig) => FeishuChatConfig) => void;
+  onClose: () => void;
+}) {
+  const mode = defaultsModeSelection(defaults);
+  return (
+    <DrawerShell
+      title="默认配置"
+      onClose={onClose}
+      meta={
+        <span className="text-xs text-muted-foreground">所有未单独覆盖的群都继承这些设置。</span>
+      }
+    >
+      <div className="space-y-3">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0">
+            <p className="font-medium text-foreground/90 text-xs">默认审批模式</p>
+            <p className="text-[11px] text-muted-foreground/80">未单独配置的群聊都用这个模式。</p>
+          </div>
+          <ModeSelect
+            value={mode}
+            includeInherit={false}
+            ariaLabel="默认审批模式"
+            onChange={(selection) => {
+              if (selection === INHERIT_MODE) return;
+              onCommit((current) => setDefaultsApprovalMode(current, selection));
+            }}
+          />
+        </div>
+        {mode === "designated" ? (
+          <ApproversEditor
+            approvers={defaults.approvers ?? []}
+            idPrefix="feishu-default-approvers"
+            onToggle={(openId) => onCommit((current) => toggleDefaultsApprover(current, openId))}
+          />
+        ) : null}
+        <CommandsEditor
+          commands={defaults.commands}
+          offHint="不限制,允许全部命令。"
+          onChange={onCommit}
         />
-      ) : null}
-      <CommandsEditor
-        commands={config?.commands}
-        offHint={describeInheritedCommands(defaultCommands)}
-        onChange={change}
-      />
-      <WorkspacesEditor
-        workspaces={config?.workspaces}
-        projects={projects}
-        offHint={describeInheritedWorkspaces(defaultWorkspaces)}
-        onChange={change}
-      />
+        <WorkspacesEditor
+          workspaces={defaults.workspaces}
+          projects={projects}
+          offHint="不限制,允许全部工作区。"
+          onChange={onCommit}
+        />
+      </div>
+    </DrawerShell>
+  );
+}
+
+/**
+ * The drawer's effective-preview card: a chat's fully-resolved config with each
+ * dimension's source tier (`[本群]/[默认]/[内置]`). Values come from the shared
+ * `effectiveConfig` (the SAME resolver the bot uses), so "what the editor shows ==
+ * what the bot enforces". owner-always is deliberately not surfaced here (no
+ * "+授权人" tail); density lands in PR-C3.
+ */
+function EffectivePreviewCard({
+  effective,
+  members,
+}: {
+  effective: EffectiveConfig;
+  members: ReadonlyArray<FeishuChatMember>;
+}) {
+  const isDesignated = effective.approvalMode.value === "designated";
+  const approverText =
+    effective.approvers.value.length === 0
+      ? "仅授权人"
+      : effective.approvers.value
+          .map((openId) => members.find((member) => member.openId === openId)?.name ?? openId)
+          .join("、");
+  const rows: ReadonlyArray<{
+    readonly key: string;
+    readonly value: string;
+    readonly source?: ConfigSource;
+  }> = [
+    {
+      key: "审批",
+      value: APPROVAL_MODE_LABELS[effective.approvalMode.value],
+      source: effective.approvalMode.source,
+    },
+    ...(isDesignated ? [{ key: "可批准", value: approverText }] : []),
+    {
+      key: "命令",
+      value: commandsSummary(effective.commands.value),
+      source: effective.commands.source,
+    },
+    {
+      key: "工作区",
+      value: workspacesSummary(effective.workspaces.value),
+      source: effective.workspaces.source,
+    },
+  ];
+
+  return (
+    <div className="rounded-lg border border-border/60 bg-muted/20 p-3">
+      <p className="mb-2 font-medium text-[11px] text-muted-foreground/60 uppercase tracking-[0.06em]">
+        生效预览 · 继承 + 覆盖解析后
+      </p>
+      <dl className="space-y-1.5">
+        {rows.map((row) => (
+          <div key={row.key} className="flex items-start justify-between gap-3 text-xs">
+            <dt className="shrink-0 text-muted-foreground/70">{row.key}</dt>
+            <dd className="flex min-w-0 flex-wrap items-center justify-end gap-1.5 text-right text-foreground/90">
+              <span className="min-w-0 break-words">{row.value}</span>
+              {row.source ? <SourceBadge source={row.source} /> : null}
+            </dd>
+          </div>
+        ))}
+      </dl>
     </div>
+  );
+}
+
+/** A `[本群]/[默认]/[内置]` source tag; the own-override tier is primary-tinted, inherited is muted. */
+function SourceBadge({ source }: { source: ConfigSource }) {
+  return (
+    <span
+      className={cn(
+        "shrink-0 rounded px-1 py-0.5 text-[10px]",
+        source === "chat" ? "bg-primary/12 text-primary" : "bg-muted text-muted-foreground",
+      )}
+    >
+      {SOURCE_LABELS[source]}
+    </span>
   );
 }
 
@@ -494,26 +841,27 @@ function ModeSelect({
 /**
  * Designated-approver picker. When a group roster (`members`) is available, it
  * shows a checkbox per member labelled by display name (open_id on hover, or as
- * the label when the name is absent). The binding owner (`bindingOwnerOpenId`),
- * if on the roster, is shown pre-checked and LOCKED — they always approve via the
- * owner-always overlay, so unchecking them would be a no-op; they are not written
- * into `approvers`. Any approver open_id not on the roster (or when no roster
- * exists — e.g. the defaults editor) is shown as a removable chip, and a free-text
- * input adds off-roster open_ids. Emits per-open_id toggles; the caller owns the
- * map write.
+ * the label when the name is absent). Any approver open_id not on the roster (or
+ * when no roster exists — e.g. the defaults editor) is shown as a removable chip,
+ * and a free-text input adds off-roster open_ids. Emits per-open_id toggles; the
+ * caller owns the map write.
+ *
+ * owner-always is deliberately NOT surfaced here (design decision #5, PR-C2): the
+ * binding owner appears as an ordinary roster member — no locked/pre-checked guard
+ * rail, no owner-exemption footnote. The one owner-always explanation lives only in
+ * the p2p section (PR-C3). (Checking the owner writes a harmless redundant entry;
+ * the bot approves them via the owner-always overlay regardless.)
  */
 function ApproversEditor({
   approvers,
   onToggle,
   idPrefix,
   members,
-  bindingOwnerOpenId,
 }: {
   approvers: ReadonlyArray<string>;
   onToggle: (openId: string) => void;
   idPrefix: string;
   members?: ReadonlyArray<FeishuChatMember>;
-  bindingOwnerOpenId?: string | undefined;
 }) {
   const [input, setInput] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -540,48 +888,32 @@ function ApproversEditor({
   return (
     <div className="mt-2 space-y-2 rounded-md border border-border/60 bg-muted/20 p-2.5">
       <p className="text-[11px] text-muted-foreground/80">
-        指定群内可审批的成员(可多选)。未额外勾选时仅绑定的授权人可审批;授权人凭 owner-always
-        始终可审批,已默认勾选且不可取消。
+        指定群内可审批的成员(可多选);仅勾选的成员能点击审批放行,其余人点击无效。
       </p>
       {roster.length > 0 ? (
         <div className="grid gap-1 sm:grid-cols-2">
-          {roster.map((member) => {
-            const isOwner = member.openId === bindingOwnerOpenId;
-            return (
-              <label
-                key={member.openId}
-                title={member.openId}
+          {roster.map((member) => (
+            <label
+              key={member.openId}
+              title={member.openId}
+              className="flex min-w-0 cursor-pointer items-center gap-2 rounded-sm px-1 py-1 hover:bg-accent/50"
+            >
+              <Checkbox
+                checked={selected.has(member.openId)}
+                onCheckedChange={() => onToggle(member.openId)}
+                aria-label={`审批人 ${member.name ?? member.openId}`}
+              />
+              <span
                 className={
-                  isOwner
-                    ? "flex min-w-0 items-center gap-2 rounded-sm px-1 py-1"
-                    : "flex min-w-0 cursor-pointer items-center gap-2 rounded-sm px-1 py-1 hover:bg-accent/50"
+                  member.name
+                    ? "min-w-0 flex-1 truncate text-[11px] text-foreground/90"
+                    : "min-w-0 flex-1 truncate font-mono text-[11px] text-foreground/90"
                 }
               >
-                <Checkbox
-                  checked={isOwner || selected.has(member.openId)}
-                  disabled={isOwner}
-                  onCheckedChange={() => {
-                    if (!isOwner) onToggle(member.openId);
-                  }}
-                  aria-label={`审批人 ${member.name ?? member.openId}${isOwner ? "(授权人)" : ""}`}
-                />
-                <span
-                  className={
-                    member.name
-                      ? "min-w-0 flex-1 truncate text-[11px] text-foreground/90"
-                      : "min-w-0 flex-1 truncate font-mono text-[11px] text-foreground/90"
-                  }
-                >
-                  {member.name ?? member.openId}
-                </span>
-                {isOwner ? (
-                  <span className="shrink-0 rounded bg-primary/12 px-1 py-0.5 text-[10px] text-primary">
-                    授权人
-                  </span>
-                ) : null}
-              </label>
-            );
-          })}
+                {member.name ?? member.openId}
+              </span>
+            </label>
+          ))}
         </div>
       ) : null}
       {extras.length > 0 ? (

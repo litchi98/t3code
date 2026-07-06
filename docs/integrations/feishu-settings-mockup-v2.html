@@ -1,0 +1,3526 @@
+<!doctype html>
+<html lang="zh" class="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>飞书设置页 · v2(t3code 风格 + 抽屉)</title>
+<style>
+/* ============================================================================
+   t3code · Feishu 设置页 · 共享设计基础 (_foundation.css)
+   1:1 照抄 apps/web 真实设计系统。安静 · 克制 · 高密度 · hairline。
+   主题机制:根元素挂 `.dark` class(非 media / 非 data-theme)。
+   纯 CSS,无 Tailwind 运行时 —— 组件用语义类名 + 状态修饰类(.is-*)。
+   ============================================================================ */
+
+/* ---------------------------------------------------------------------------
+   0. 极简 reset(Artifact 外壳已有 reset;此处补 box-sizing + 排版基线)
+   --------------------------------------------------------------------------- */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+/* ---------------------------------------------------------------------------
+   1. Design tokens —— LIGHT(:root)
+   照抄 GROUND_TRUTH 的确切 hex / rgba 值。
+   --------------------------------------------------------------------------- */
+:root {
+  color-scheme: light;
+
+  /* 圆角(--radius 0.625rem = 10px) */
+  --radius: 0.625rem;
+  --radius-sm: calc(var(--radius) - 4px); /* 6px  小徽标 */
+  --radius-md: calc(var(--radius) - 2px); /* 8px  */
+  --radius-lg: var(--radius); /* 10px 控件 */
+  --radius-2xl: calc(var(--radius) + 8px); /* 18px 卡片/对话框/抽屉 */
+
+  /* 字体 */
+  --font-sans: "DM Sans Variable", "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    system-ui, sans-serif;
+  --font-mono: "SF Mono", "SFMono-Regular", "JetBrains Mono", Consolas, Menlo, monospace;
+
+  /* 颜色 —— LIGHT */
+  --background: #ffffff;
+  --foreground: #262626;
+  --card: #ffffff;
+  --card-foreground: #262626;
+  --popover: #ffffff;
+  --popover-foreground: #262626;
+
+  --primary: #1b4ed8;
+  --primary-foreground: #ffffff;
+
+  --secondary: rgba(0, 0, 0, 0.04);
+  --secondary-foreground: #262626;
+  --muted: rgba(0, 0, 0, 0.04);
+  --muted-foreground: #5c5c5c;
+  --accent: rgba(0, 0, 0, 0.04);
+  --accent-foreground: #262626;
+
+  --border: rgba(0, 0, 0, 0.08);
+  --input: rgba(0, 0, 0, 0.1);
+  --ring: #1b4ed8;
+
+  --destructive: #ef4444;
+  --destructive-foreground: #c10007;
+  --info: #2b7fff;
+  --info-foreground: #1447e6;
+  --success: #00bc7d;
+  --success-foreground: #007a55;
+  --warning: #fe9a00;
+  --warning-foreground: #bb4d00;
+
+  /* 招牌质感:hairline 顶部内高光 + 阴影(随主题切换) */
+  --hairline: inset 0 1px rgba(0, 0, 0, 0.04);
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.08), 0 2px 8px rgba(0, 0, 0, 0.05);
+
+  /* soft status pill 的混合百分比(light 8% / dark 16%) */
+  --soft-mix: 8%;
+
+  /* 滚动条 thumb */
+  --scrollbar-thumb: rgba(0, 0, 0, 0.15);
+  --scrollbar-thumb-hover: rgba(0, 0, 0, 0.25);
+
+  /* primary 上的内高光(白 16%) */
+  --btn-inner-highlight: inset 0 1px rgba(255, 255, 255, 0.16);
+}
+
+/* ---------------------------------------------------------------------------
+   2. Design tokens —— DARK(.dark 覆盖)
+   --------------------------------------------------------------------------- */
+.dark {
+  color-scheme: dark;
+
+  --background: #161616;
+  --foreground: #f5f5f5;
+  --card: #1b1b1b;
+  --card-foreground: #f5f5f5;
+  --popover: #1b1b1b;
+  --popover-foreground: #f5f5f5;
+
+  --primary: #366bfb;
+  --primary-foreground: #ffffff;
+
+  --secondary: rgba(255, 255, 255, 0.04);
+  --secondary-foreground: #f5f5f5;
+  --muted: rgba(255, 255, 255, 0.04);
+  --muted-foreground: #8a8a8a;
+  --accent: rgba(255, 255, 255, 0.04);
+  --accent-foreground: #f5f5f5;
+
+  --border: rgba(255, 255, 255, 0.06);
+  --input: rgba(255, 255, 255, 0.08);
+  --ring: #366bfb;
+
+  --destructive: #ef4444;
+  --destructive-foreground: #f87171;
+  --info: #2b7fff;
+  --info-foreground: #60a5fa;
+  --success: #00bc7d;
+  --success-foreground: #34d399;
+  --warning: #fe9a00;
+  --warning-foreground: #fbbf24;
+
+  --hairline: inset 0 -1px rgba(255, 255, 255, 0.06);
+  --shadow-xs: none;
+  --shadow-sm: none;
+  --shadow-lg: 0 16px 40px rgba(0, 0, 0, 0.5), 0 2px 10px rgba(0, 0, 0, 0.4);
+
+  --soft-mix: 16%;
+
+  --scrollbar-thumb: rgba(255, 255, 255, 0.1);
+  --scrollbar-thumb-hover: rgba(255, 255, 255, 0.18);
+}
+
+/* ---------------------------------------------------------------------------
+   3. Body / 招牌噪声 overlay / 滚动条
+   --------------------------------------------------------------------------- */
+body {
+  margin: 0;
+  padding: 0;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--foreground);
+  background-color: var(--background);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* 分形噪声 overlay(锦上添花,opacity 0.035) */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  pointer-events: none;
+  opacity: 0.035;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+  background-size: 256px 256px;
+}
+
+pre,
+code,
+.mono {
+  font-family: var(--font-mono);
+}
+
+/* 细滚动条(6px) */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+
+/* ---------------------------------------------------------------------------
+   4. 通用文本 / 布局 helper(替代 Tailwind 原子类)
+   --------------------------------------------------------------------------- */
+.text-muted {
+  color: var(--muted-foreground);
+}
+.text-fg {
+  color: var(--foreground);
+}
+.text-danger {
+  color: var(--destructive-foreground);
+}
+.text-xs {
+  font-size: 12px;
+}
+.text-11 {
+  font-size: 11px;
+}
+.text-13 {
+  font-size: 13px;
+}
+.text-sm {
+  font-size: 14px;
+}
+.font-medium {
+  font-weight: 500;
+}
+.font-semibold {
+  font-weight: 600;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.col {
+  display: flex;
+  flex-direction: column;
+}
+.between {
+  justify-content: space-between;
+}
+.wrap {
+  flex-wrap: wrap;
+}
+.grow {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.gap-1 {
+  gap: 4px;
+}
+.gap-2 {
+  gap: 8px;
+}
+.gap-3 {
+  gap: 12px;
+}
+
+/* ---------------------------------------------------------------------------
+   5. 按钮 —— .btn + variant/size 修饰
+   base: inline-flex gap-2 rounded-lg border font-medium 14px h-8
+   --------------------------------------------------------------------------- */
+.btn {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  white-space: nowrap;
+  height: 32px;
+  padding: 0 11px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-lg);
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+  outline: none;
+  transition: background-color 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease,
+    color 0.2s ease;
+}
+.btn:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+.btn:disabled,
+.btn.is-disabled {
+  pointer-events: none;
+  opacity: 0.64;
+}
+.btn svg,
+.btn .icon {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  pointer-events: none;
+}
+
+/* primary(默认) */
+.btn--primary {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: var(--primary-foreground);
+  box-shadow: var(--btn-inner-highlight), var(--shadow-xs);
+}
+.btn--primary:hover {
+  background: color-mix(in oklab, var(--primary) 90%, black);
+}
+
+/* outline */
+.btn--outline {
+  border-color: var(--input);
+  background: var(--popover);
+  color: var(--foreground);
+  box-shadow: var(--hairline), var(--shadow-xs);
+}
+.btn--outline:hover {
+  background: color-mix(in oklab, var(--accent) 50%, transparent);
+}
+.btn--outline svg,
+.btn--outline .icon {
+  color: var(--muted-foreground);
+}
+
+/* ghost */
+.btn--ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--foreground);
+}
+.btn--ghost:hover,
+.btn--ghost.is-active {
+  background: var(--accent);
+}
+.btn--ghost svg,
+.btn--ghost .icon {
+  color: var(--muted-foreground);
+}
+
+/* destructive */
+.btn--destructive {
+  border-color: var(--destructive);
+  background: var(--destructive);
+  color: #ffffff;
+  box-shadow: var(--btn-inner-highlight), var(--shadow-xs);
+}
+.btn--destructive:hover {
+  background: color-mix(in oklab, var(--destructive) 90%, black);
+}
+
+/* destructive-outline(危险的次要动作) */
+.btn--destructive-outline {
+  border-color: var(--input);
+  background: var(--popover);
+  color: var(--destructive-foreground);
+  box-shadow: var(--hairline), var(--shadow-xs);
+}
+.btn--destructive-outline:hover {
+  border-color: color-mix(in oklab, var(--destructive) 32%, transparent);
+  background: color-mix(in oklab, var(--destructive) 4%, transparent);
+}
+
+/* sizes */
+.btn--lg {
+  height: 36px;
+  padding: 0 13px;
+}
+.btn--sm {
+  height: 28px;
+  gap: 6px;
+  padding: 0 9px;
+  font-size: 13px;
+}
+.btn--xs {
+  height: 24px;
+  gap: 4px;
+  padding: 0 7px;
+  font-size: 12px;
+  border-radius: var(--radius-md);
+}
+.btn--icon {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+}
+.btn--icon-sm {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+}
+.btn--icon-xs {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border-radius: var(--radius-md);
+}
+
+/* ---------------------------------------------------------------------------
+   6. 输入 / textarea —— .input(圆角 lg,border-input,bg-background,hairline)
+   focus: border-ring + ring-[3px] ring/24
+   --------------------------------------------------------------------------- */
+.input,
+.textarea {
+  display: inline-flex;
+  width: 100%;
+  min-width: 0;
+  height: 30px;
+  padding: 0 11px;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  background: var(--background);
+  color: var(--foreground);
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 30px;
+  outline: none;
+  box-shadow: var(--hairline), var(--shadow-xs);
+  transition: box-shadow 0.2s ease, border-color 0.2s ease;
+}
+.dark .input,
+.dark .textarea {
+  background: color-mix(in oklab, var(--input) 32%, transparent);
+}
+.textarea {
+  height: auto;
+  min-height: 72px;
+  padding: 8px 11px;
+  line-height: 1.5;
+  resize: vertical;
+}
+.input::placeholder,
+.textarea::placeholder {
+  color: color-mix(in oklab, var(--muted-foreground) 72%, transparent);
+}
+.input:focus-visible,
+.textarea:focus-visible,
+.input:focus,
+.textarea:focus {
+  border-color: var(--ring);
+  box-shadow: var(--hairline), 0 0 0 3px color-mix(in oklab, var(--ring) 24%, transparent);
+}
+.input:disabled,
+.textarea:disabled,
+.input.is-disabled {
+  opacity: 0.64;
+  pointer-events: none;
+}
+/* aria-invalid / 错误态 */
+.input.is-invalid,
+.textarea.is-invalid {
+  border-color: color-mix(in oklab, var(--destructive) 36%, transparent);
+}
+.input.is-invalid:focus-visible,
+.textarea.is-invalid:focus-visible {
+  border-color: color-mix(in oklab, var(--destructive) 64%, transparent);
+  box-shadow: var(--hairline), 0 0 0 3px color-mix(in oklab, var(--destructive) 16%, transparent);
+}
+
+/* ---------------------------------------------------------------------------
+   7. Select —— trigger 同输入 + 右 chevron opacity-50;popup rounded-lg border
+   静态版:.select(trigger) / .select-popup / .select-item
+   --------------------------------------------------------------------------- */
+.select {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  min-width: 144px;
+  min-height: 32px;
+  padding: 0 11px;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  background: var(--background);
+  color: var(--foreground);
+  font-family: inherit;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+  user-select: none;
+  outline: none;
+  box-shadow: var(--hairline), var(--shadow-xs);
+  transition: box-shadow 0.2s ease, border-color 0.2s ease;
+}
+.dark .select {
+  background: color-mix(in oklab, var(--input) 32%, transparent);
+}
+.select:focus-visible {
+  border-color: var(--ring);
+  box-shadow: var(--hairline), 0 0 0 3px color-mix(in oklab, var(--ring) 24%, transparent);
+}
+.select__value {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.select__value.is-placeholder {
+  color: color-mix(in oklab, var(--muted-foreground) 72%, transparent);
+}
+/* chevron */
+.select__chevron {
+  width: 12px;
+  height: 12px;
+  margin-right: -4px;
+  opacity: 0.5;
+  flex-shrink: 0;
+}
+/* ghost select(工具条内联) */
+.select--ghost {
+  border-color: transparent;
+  background: transparent;
+  color: color-mix(in oklab, var(--muted-foreground) 70%, transparent);
+  box-shadow: none;
+}
+.select--ghost:hover {
+  background: var(--accent);
+  color: color-mix(in oklab, var(--foreground) 80%, transparent);
+}
+
+/* select 弹层 */
+.select-popup {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--popover);
+  color: var(--foreground);
+  box-shadow: var(--hairline), var(--shadow-lg);
+  padding: 4px;
+  min-width: 12rem;
+}
+.select-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  padding: 4px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  cursor: default;
+  color: var(--foreground);
+}
+.select-item:hover,
+.select-item.is-highlighted {
+  background: var(--accent);
+  color: var(--accent-foreground);
+}
+.select-item.is-selected {
+  font-weight: 500;
+}
+.select-separator {
+  height: 1px;
+  margin: 4px 8px;
+  background: var(--border);
+}
+
+/* ---------------------------------------------------------------------------
+   8. Checkbox —— size-4.5 rounded-[.25rem] border-input;选中 bg-primary 白勾
+   .checkbox 用状态类 .is-checked / .is-indeterminate 冻结
+   --------------------------------------------------------------------------- */
+.checkbox {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: 1px solid var(--input);
+  border-radius: 0.25rem; /* 4px */
+  background: var(--background);
+  box-shadow: var(--hairline), var(--shadow-xs);
+  outline: none;
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease, box-shadow 0.2s ease;
+}
+.dark .checkbox {
+  background: color-mix(in oklab, var(--input) 32%, transparent);
+}
+.checkbox:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+.checkbox__check {
+  width: 13px;
+  height: 13px;
+  color: var(--primary-foreground);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.checkbox.is-checked,
+.checkbox.is-indeterminate {
+  background: var(--primary);
+  border-color: var(--primary);
+  box-shadow: none;
+}
+.checkbox.is-checked .checkbox__check,
+.checkbox.is-indeterminate .checkbox__check {
+  opacity: 1;
+}
+.checkbox.is-disabled {
+  opacity: 0.64;
+  pointer-events: none;
+}
+
+/* ---------------------------------------------------------------------------
+   9. Switch —— track rounded-full,checked bg-primary / unchecked bg-input
+   thumb 圆 bg-background;状态类 .is-on
+   --------------------------------------------------------------------------- */
+.switch {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  width: 30px;
+  height: 18px;
+  padding: 1px;
+  border-radius: 9999px;
+  background: var(--input);
+  cursor: pointer;
+  outline: none;
+  transition: background-color 0.2s ease, box-shadow 0.2s ease;
+}
+.switch:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+.switch__thumb {
+  display: block;
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  background: var(--background);
+  box-shadow: var(--shadow-sm), 0 1px 2px rgba(0, 0, 0, 0.15);
+  transform: translateX(0);
+  transition: transform 0.15s ease;
+}
+.switch.is-on {
+  background: var(--primary);
+}
+.switch.is-on .switch__thumb {
+  transform: translateX(12px);
+}
+.switch.is-disabled {
+  opacity: 0.64;
+  pointer-events: none;
+}
+
+/* ---------------------------------------------------------------------------
+   10. Segmented(密度三档 / 审批三态)—— ToggleGroup 连接按钮组
+   相邻按钮连成一条,选中项 bg-accent;.segmented > .segmented__item.is-selected
+   --------------------------------------------------------------------------- */
+.segmented {
+  display: inline-flex;
+  width: fit-content;
+}
+.segmented__item {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--input);
+  background: var(--background);
+  color: var(--muted-foreground);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  outline: none;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+.dark .segmented__item {
+  background: color-mix(in oklab, var(--input) 32%, transparent);
+}
+.segmented__item:not(:first-child) {
+  border-left: 0;
+  margin-left: 0;
+}
+.segmented__item:first-child {
+  border-top-left-radius: var(--radius-lg);
+  border-bottom-left-radius: var(--radius-lg);
+}
+.segmented__item:last-child {
+  border-top-right-radius: var(--radius-lg);
+  border-bottom-right-radius: var(--radius-lg);
+}
+.segmented__item:hover {
+  color: var(--foreground);
+  background: color-mix(in oklab, var(--accent) 60%, transparent);
+}
+.segmented__item.is-selected {
+  background: var(--accent);
+  color: var(--foreground);
+  font-weight: 600;
+}
+.segmented__item:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: -1px;
+  z-index: 1;
+}
+.segmented__item:disabled,
+.segmented__item.is-disabled {
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+/* ---------------------------------------------------------------------------
+   11. Card —— rounded-2xl border bg-card + hairline;header/content p-6
+   --------------------------------------------------------------------------- */
+.card {
+  position: relative;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-2xl);
+  background: var(--card);
+  color: var(--card-foreground);
+  box-shadow: var(--hairline), var(--shadow-sm);
+}
+.card__header {
+  padding: 24px;
+  border-bottom: 1px solid color-mix(in oklab, var(--border) 60%, transparent);
+}
+.card__title {
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.card__content {
+  padding: 24px;
+}
+
+/* ---------------------------------------------------------------------------
+   12. Badge / soft status pill
+   badge: rounded-sm border font-medium;soft pill: color-mix 8%/16% + *-foreground
+   --------------------------------------------------------------------------- */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 18px;
+  min-width: 18px;
+  padding: 0 5px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+}
+.badge--primary {
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+.badge--outline {
+  border-color: var(--input);
+  background: var(--background);
+  color: var(--foreground);
+}
+.dark .badge--outline {
+  background: color-mix(in oklab, var(--input) 32%, transparent);
+}
+.badge--secondary {
+  background: var(--secondary);
+  color: var(--secondary-foreground);
+}
+
+/* soft status pill(info / success / warning / error / primary / neutral) */
+.soft-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 20px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+}
+.soft-pill svg,
+.soft-pill .icon {
+  width: 12px;
+  height: 12px;
+}
+.soft-pill--success {
+  background: color-mix(in oklab, var(--success) var(--soft-mix), transparent);
+  color: var(--success-foreground);
+}
+.soft-pill--info {
+  background: color-mix(in oklab, var(--info) var(--soft-mix), transparent);
+  color: var(--info-foreground);
+}
+.soft-pill--warning {
+  background: color-mix(in oklab, var(--warning) var(--soft-mix), transparent);
+  color: var(--warning-foreground);
+}
+.soft-pill--error {
+  background: color-mix(in oklab, var(--destructive) var(--soft-mix), transparent);
+  color: var(--destructive-foreground);
+}
+.soft-pill--primary {
+  background: color-mix(in oklab, var(--primary) var(--soft-mix), transparent);
+  color: var(--primary);
+}
+.dark .soft-pill--primary {
+  color: color-mix(in oklab, var(--primary) 80%, white);
+}
+.soft-pill--neutral {
+  background: var(--muted);
+  color: var(--muted-foreground);
+}
+
+/* 状态圆点(前缀小圆) */
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 9999px;
+  background: currentColor;
+  flex-shrink: 0;
+}
+
+/* ---------------------------------------------------------------------------
+   13. 分隔线
+   --------------------------------------------------------------------------- */
+.divider {
+  height: 1px;
+  border: 0;
+  margin: 0;
+  background: var(--border);
+}
+.divider--60 {
+  background: color-mix(in oklab, var(--border) 60%, transparent);
+}
+.divider--v {
+  width: 1px;
+  height: auto;
+  align-self: stretch;
+  background: var(--border);
+}
+
+/* ---------------------------------------------------------------------------
+   14. 设置外壳 —— 左侧栏导航 + 顶部 header bar + 内容容器
+   --------------------------------------------------------------------------- */
+.settings-shell {
+  display: flex;
+  height: 100vh;
+  min-height: 100vh;
+  overflow: hidden;
+  background: var(--background);
+}
+
+/* 左侧栏 */
+.settings-sidebar {
+  display: flex;
+  flex-direction: column;
+  width: 15rem;
+  min-width: 15rem;
+  border-right: 1px solid var(--border);
+  background: var(--background);
+}
+.settings-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 8px;
+  list-style: none;
+  margin: 0;
+}
+.settings-nav__item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  color: color-mix(in oklab, var(--muted-foreground) 70%, transparent);
+  cursor: pointer;
+  text-align: left;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.settings-nav__item svg,
+.settings-nav__item .icon {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  color: color-mix(in oklab, var(--muted-foreground) 60%, transparent);
+}
+.settings-nav__item:hover {
+  color: color-mix(in oklab, var(--foreground) 80%, transparent);
+  background: color-mix(in oklab, var(--accent) 60%, transparent);
+}
+.settings-nav__item.is-active {
+  color: var(--foreground);
+  font-weight: 500;
+  background: var(--accent);
+}
+.settings-nav__item.is-active svg,
+.settings-nav__item.is-active .icon {
+  color: var(--foreground);
+}
+/* 侧栏底部(返回等) */
+.settings-sidebar__footer {
+  margin-top: auto;
+  padding: 8px;
+  border-top: 1px solid var(--border);
+}
+
+/* 主区 */
+.settings-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+/* 顶部 header bar */
+.settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 41px;
+  min-height: 41px;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--background);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--foreground);
+}
+/* 内容容器(overflow-y-auto p-8) */
+.settings-page {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 32px;
+}
+.settings-page__inner {
+  display: flex;
+  flex-direction: column;
+  gap: 32px;
+  width: 100%;
+  max-width: 48rem; /* 768px = max-w-3xl */
+  margin: 0 auto;
+}
+
+/* SettingsSection —— eyebrow + 卡片 body */
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.settings-section__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 4px;
+}
+.settings-section__eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: color-mix(in oklab, var(--foreground) 50%, transparent);
+}
+/* eyebrow 前置竖 tick(12px bg-border) */
+.settings-section__tick {
+  display: inline-block;
+  width: 12px;
+  height: 1px;
+  background: var(--border);
+}
+.settings-section__card {
+  position: relative;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-2xl);
+  background: var(--card);
+  color: var(--card-foreground);
+  box-shadow: var(--hairline), var(--shadow-sm);
+  overflow: hidden;
+}
+
+/* SettingsRow —— border-t border-border/60(first 无),px-5 py-3.5 */
+.settings-row {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 20px;
+  border-top: 1px solid color-mix(in oklab, var(--border) 60%, transparent);
+}
+.settings-row:first-child {
+  border-top: 0;
+}
+@media (min-width: 640px) {
+  .settings-row {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+  }
+}
+.settings-row__main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.settings-row__titleline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 20px;
+}
+.settings-row__title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--foreground);
+}
+.settings-row__desc {
+  margin: 0;
+  font-size: 12px;
+  color: color-mix(in oklab, var(--muted-foreground) 80%, transparent);
+}
+.settings-row__status {
+  padding-top: 2px;
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+.settings-row__control {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+/* 重置 = ghost 图标按钮(5x5, muted → foreground) */
+.settings-reset {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted-foreground);
+  cursor: pointer;
+}
+.settings-reset:hover {
+  color: var(--foreground);
+  background: var(--accent);
+}
+.settings-reset svg,
+.settings-reset .icon {
+  width: 12px;
+  height: 12px;
+}
+/* 行内展开区(SettingsRow 带 children 时嵌一层内容) */
+.settings-row__expand {
+  width: 100%;
+  padding-top: 4px;
+}
+
+/* ---------------------------------------------------------------------------
+   15. 右抽屉(Sheet / RightPanelSheet)
+   backdrop bg-background/60 blur;panel 右滑 min(42vw,28rem) min 20rem
+   --------------------------------------------------------------------------- */
+.sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: color-mix(in oklab, var(--background) 60%, transparent);
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
+  animation: sheet-fade 0.2s ease both;
+}
+.sheet-viewport {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  justify-content: flex-end;
+  pointer-events: none;
+}
+.sheet-panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: min(42vw, 28rem);
+  min-width: 20rem;
+  max-width: 100%;
+  height: 100%;
+  max-height: 100%;
+  background: var(--popover);
+  color: var(--popover-foreground);
+  border-left: 1px solid var(--border);
+  box-shadow: var(--hairline), var(--shadow-lg);
+  pointer-events: auto;
+  animation: sheet-slide-in 0.2s ease-in-out both;
+}
+@keyframes sheet-fade {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes sheet-slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(8px);
+  }
+}
+.sheet-header {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 24px;
+}
+.sheet-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1;
+}
+.sheet-description {
+  margin: 0;
+  font-size: 14px;
+  color: var(--muted-foreground);
+}
+.sheet-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 24px 24px;
+}
+.sheet-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 16px 24px;
+  border-top: 1px solid var(--border);
+  background: color-mix(in oklab, var(--muted) 72%, transparent);
+}
+.sheet-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+}
+
+/* ---------------------------------------------------------------------------
+   16. 覆盖指纹(coverage fingerprint)—— ○◐● + 维度 chip
+   表达每个配置维度的覆盖态:none(空环) / partial(半) / full(实心 primary)
+   --------------------------------------------------------------------------- */
+.coverage-fingerprint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+/* 单个覆盖点(可配 glyph,或纯 CSS 圆) */
+.cov-dot {
+  position: relative;
+  width: 12px;
+  height: 12px;
+  border-radius: 9999px;
+  border: 1.5px solid color-mix(in oklab, var(--muted-foreground) 55%, transparent);
+  background: transparent;
+  flex-shrink: 0;
+}
+.cov-dot--none {
+  /* ○ 空环 —— 默认样式即空环 */
+}
+.cov-dot--partial {
+  /* ◐ 半填充 */
+  background: linear-gradient(90deg, var(--primary) 0 50%, transparent 50% 100%);
+  border-color: var(--primary);
+}
+.cov-dot--full {
+  /* ● 实心 */
+  background: var(--primary);
+  border-color: var(--primary);
+}
+
+/* 维度 chip(命令 / workspace / 审批 / 护栏 / 模型 …)带覆盖态着色 */
+.dimension-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 9999px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted-foreground);
+  background: var(--muted);
+  white-space: nowrap;
+}
+.dimension-chip .cov-dot {
+  width: 9px;
+  height: 9px;
+  border-width: 1.25px;
+}
+/* chip 覆盖态:被本群覆盖 → primary tint 强调 */
+.dimension-chip.is-overridden {
+  border-color: color-mix(in oklab, var(--primary) 30%, var(--border));
+  background: color-mix(in oklab, var(--primary) var(--soft-mix), transparent);
+  color: var(--primary);
+}
+.dark .dimension-chip.is-overridden {
+  color: color-mix(in oklab, var(--primary) 80%, white);
+}
+/* chip 继承默认 → 中性 */
+.dimension-chip.is-inherited {
+  color: var(--muted-foreground);
+}
+
+/* ---------------------------------------------------------------------------
+   17. 来源徽标(source-badge)—— 三态:本群覆盖 / 继承默认 / 内置回退
+   强调色是靛蓝(primary),不用琥珀。覆盖态 primary soft,余者中性/faint。
+   --------------------------------------------------------------------------- */
+.source-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 18px;
+  padding: 0 7px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+}
+.source-badge::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 9999px;
+  background: currentColor;
+  flex-shrink: 0;
+}
+/* [本群] 本群覆盖 —— primary/靛蓝 soft(在品牌色上强调,克制) */
+.source-badge--chat {
+  background: color-mix(in oklab, var(--primary) var(--soft-mix), transparent);
+  color: var(--primary);
+}
+.dark .source-badge--chat {
+  color: color-mix(in oklab, var(--primary) 82%, white);
+}
+/* [默认] 继承默认 —— 中性 muted */
+.source-badge--default {
+  background: var(--muted);
+  color: var(--muted-foreground);
+}
+.source-badge--default::before {
+  background: color-mix(in oklab, var(--muted-foreground) 60%, transparent);
+}
+/* [内置] 内置回退 —— 最淡:透明底 + 边框 outline */
+.source-badge--builtin {
+  background: transparent;
+  border-color: var(--border);
+  color: color-mix(in oklab, var(--muted-foreground) 85%, transparent);
+}
+.source-badge--builtin::before {
+  background: color-mix(in oklab, var(--muted-foreground) 45%, transparent);
+}
+
+/* ---------------------------------------------------------------------------
+   18. 护栏轨道(lock-row)—— 一行护栏项:锁图标 + 标题/说明 + 右侧开关/状态
+   --------------------------------------------------------------------------- */
+.lock-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: color-mix(in oklab, var(--muted) 50%, transparent);
+}
+.lock-row + .lock-row {
+  margin-top: 8px;
+}
+.lock-row__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  border-radius: var(--radius-md);
+  background: var(--muted);
+  color: var(--muted-foreground);
+}
+.lock-row__icon svg,
+.lock-row__icon .icon {
+  width: 15px;
+  height: 15px;
+}
+.lock-row__body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.lock-row__title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--foreground);
+}
+.lock-row__desc {
+  margin: 0;
+  font-size: 12px;
+  color: color-mix(in oklab, var(--muted-foreground) 85%, transparent);
+}
+.lock-row__control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+/* 已锁定态:强调轨道(primary 细描边)——护栏生效 */
+.lock-row.is-locked {
+  border-color: color-mix(in oklab, var(--primary) 28%, var(--border));
+  background: color-mix(in oklab, var(--primary) 5%, transparent);
+}
+.lock-row.is-locked .lock-row__icon {
+  background: color-mix(in oklab, var(--primary) var(--soft-mix), transparent);
+  color: var(--primary);
+}
+.dark .lock-row.is-locked .lock-row__icon {
+  color: color-mix(in oklab, var(--primary) 82%, white);
+}
+
+/* ---------------------------------------------------------------------------
+   19. 生效预览卡(effective preview)—— 解析后的最终配置 + 每项来源
+   --------------------------------------------------------------------------- */
+.effective-preview {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: color-mix(in oklab, var(--muted) 60%, transparent);
+  overflow: hidden;
+}
+.effective-preview__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid color-mix(in oklab, var(--border) 60%, transparent);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: color-mix(in oklab, var(--foreground) 55%, transparent);
+}
+.effective-preview__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-top: 1px solid color-mix(in oklab, var(--border) 50%, transparent);
+}
+.effective-preview__row:first-of-type {
+  border-top: 0;
+}
+.effective-preview__key {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  flex-shrink: 0;
+}
+.effective-preview__val {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--foreground);
+  text-align: right;
+}
+.effective-preview__val .mono {
+  font-size: 12px;
+}
+
+/* ---------------------------------------------------------------------------
+   20. 行内危险警示(inline danger)—— destructive soft banner
+   --------------------------------------------------------------------------- */
+.inline-danger {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in oklab, var(--destructive) 20%, transparent);
+  border-radius: var(--radius-lg);
+  background: color-mix(in oklab, var(--destructive) var(--soft-mix), transparent);
+  color: var(--destructive-foreground);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.inline-danger__icon {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+}
+.inline-danger__title {
+  font-weight: 600;
+}
+/* warning 变体(次一级警示) */
+.inline-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in oklab, var(--warning) 24%, transparent);
+  border-radius: var(--radius-lg);
+  background: color-mix(in oklab, var(--warning) var(--soft-mix), transparent);
+  color: var(--warning-foreground);
+  font-size: 12px;
+  line-height: 1.5;
+}
+/* info 变体(提示) */
+.inline-info {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in oklab, var(--info) 22%, transparent);
+  border-radius: var(--radius-lg);
+  background: color-mix(in oklab, var(--info) var(--soft-mix), transparent);
+  color: var(--info-foreground);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* ---------------------------------------------------------------------------
+   21. diff 预览 —— 等宽块 + 增/删/上下文行着色
+   --------------------------------------------------------------------------- */
+.diff-preview {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: color-mix(in oklab, var(--muted) 40%, var(--card));
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.diff-preview__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--muted);
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+.diff-preview__body {
+  padding: 6px 0;
+  overflow-x: auto;
+}
+.diff-line {
+  display: block;
+  padding: 0 12px 0 28px;
+  position: relative;
+  white-space: pre;
+  color: var(--foreground);
+}
+.diff-line::before {
+  position: absolute;
+  left: 10px;
+  color: var(--muted-foreground);
+}
+.diff-line--add {
+  background: color-mix(in oklab, var(--success) var(--soft-mix), transparent);
+  color: var(--success-foreground);
+}
+.diff-line--add::before {
+  content: "+";
+  color: var(--success-foreground);
+}
+.diff-line--del {
+  background: color-mix(in oklab, var(--destructive) var(--soft-mix), transparent);
+  color: var(--destructive-foreground);
+}
+.diff-line--del::before {
+  content: "-";
+  color: var(--destructive-foreground);
+}
+.diff-line--ctx::before {
+  content: " ";
+}
+
+/* ---------------------------------------------------------------------------
+   22. 主题切换按钮(ghost 图标按钮)
+   --------------------------------------------------------------------------- */
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-lg);
+  background: transparent;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+.theme-toggle:hover {
+  background: var(--accent);
+  color: var(--foreground);
+}
+.theme-toggle:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+.theme-toggle svg,
+.theme-toggle .icon {
+  width: 17px;
+  height: 17px;
+}
+
+/* ===========================================================================
+   稿件外壳(mockup 文档层)—— 与 t3code 设计系统同源的 token,不覆盖组件类
+   =========================================================================== */
+html { scroll-behavior: smooth; }
+body { min-height: 100vh; }
+
+.doc-header {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px 20px;
+  flex-wrap: wrap;
+  padding: 13px 24px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in oklab, var(--background) 84%, transparent);
+  -webkit-backdrop-filter: saturate(1.4) blur(12px);
+  backdrop-filter: saturate(1.4) blur(12px);
+}
+.doc-header__titles { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.doc-title {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.doc-title__tag {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 7px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in oklab, var(--primary) var(--soft-mix), transparent);
+  color: var(--primary);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.dark .doc-title__tag { color: color-mix(in oklab, var(--primary) 82%, white); }
+.doc-subtitle { margin: 0; font-size: 12px; color: var(--muted-foreground); }
+.doc-header__actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+
+.doc-nav { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.doc-nav a {
+  display: inline-flex;
+  align-items: center;
+  height: 26px;
+  padding: 0 9px;
+  border-radius: 9999px;
+  border: 1px solid var(--border);
+  background: var(--muted);
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 500;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+.doc-nav a:hover {
+  color: var(--foreground);
+  border-color: color-mix(in oklab, var(--primary) 30%, var(--border));
+  background: color-mix(in oklab, var(--primary) var(--soft-mix), transparent);
+}
+
+/* 主题切换:图标 + 文案随主题态切换 */
+.doc-theme-toggle .tt-sun,
+.doc-theme-toggle .tt-light-label { display: none; }
+:root:not(.dark) .doc-theme-toggle .tt-moon,
+:root:not(.dark) .doc-theme-toggle .tt-dark-label { display: none; }
+:root:not(.dark) .doc-theme-toggle .tt-sun { display: inline-block; }
+:root:not(.dark) .doc-theme-toggle .tt-light-label { display: inline; }
+
+/* ===== 文档正文:纵向堆叠 6 屏 ===== */
+.doc-body {
+  width: 100%;
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 30px 24px 72px;
+  display: flex;
+  flex-direction: column;
+  gap: 42px;
+}
+
+.screen { display: flex; flex-direction: column; gap: 12px; scroll-margin-top: 92px; }
+.screen__label { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; padding: 0 4px; }
+.screen__eyebrow {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--primary);
+}
+.dark .screen__eyebrow { color: color-mix(in oklab, var(--primary) 82%, white); }
+.screen__title { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; color: var(--foreground); }
+.screen__desc { font-size: 12px; color: var(--muted-foreground); }
+
+/* 屏「窗口」外框 —— 与 web 卡片同质感 */
+.screen-frame {
+  display: flex;
+  flex-direction: column;
+  height: 824px;
+  max-height: 88vh;
+  min-height: 560px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-2xl);
+  background: var(--background);
+  box-shadow: var(--hairline), var(--shadow-lg);
+  overflow: hidden;
+}
+.screen-frame__chrome {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 34px;
+  min-height: 34px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in oklab, var(--muted) 55%, var(--background));
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+.screen-frame__dots { display: inline-flex; gap: 6px; }
+.screen-frame__dots i {
+  display: block;
+  width: 10px;
+  height: 10px;
+  border-radius: 9999px;
+  background: color-mix(in oklab, var(--muted-foreground) 28%, transparent);
+}
+.screen-frame__name { font-weight: 500; letter-spacing: 0.01em; }
+
+/* 关键:stage 建立 transform 定位上下文,让内部 position:fixed 的抽屉
+   backdrop/panel 相对本屏定位,而非整页视口,从而互不干扰 */
+.screen-frame__stage {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  transform: translateZ(0);
+}
+/* 片段里的外壳按视口高度写死,框内改为占满 stage */
+.screen-frame__stage .settings-shell { height: 100%; min-height: 0; }
+/* 抽屉浮层限定在本屏 stage 内 */
+.screen-frame__stage .sheet-backdrop,
+.screen-frame__stage .sheet-viewport { position: absolute; }
+
+@media (max-width: 720px) {
+  .screen-frame { height: 640px; max-height: 82vh; }
+  .doc-body { padding: 22px 14px 56px; }
+}
+</style>
+</head>
+<body>
+<header class="doc-header">
+  <div class="doc-header__titles">
+    <h1 class="doc-title">飞书设置页 · v2<span class="doc-title__tag">v2</span></h1>
+    <p class="doc-subtitle">v2 · 贴合 t3code 设计系统 · overlay 右抽屉</p>
+  </div>
+  <div class="doc-header__actions">
+    <nav class="doc-nav">
+      <a href="#screen-1">1 · 静息</a>
+      <a href="#screen-2">2 · 群详情</a>
+      <a href="#screen-3">3 · 命令</a>
+      <a href="#screen-4">4 · 批量</a>
+      <a href="#screen-5">5 · 门闸</a>
+    </nav>
+    <button class="btn btn--outline btn--sm doc-theme-toggle" aria-label="切换亮/暗主题">
+      <svg class="tt-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+      <svg class="tt-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+      <span class="tt-dark-label">暗色</span><span class="tt-light-label">亮色</span>
+    </button>
+  </div>
+</header>
+
+<main class="doc-body">
+      <section class="screen" id="screen-1">
+        <div class="screen__label">
+          <span class="screen__eyebrow">屏 1</span>
+          <span class="screen__title">静息态 · 抽屉关闭</span>
+          <span class="screen__desc">设置外壳:左栏导航 + header + 群列表 + 独立私聊分区(覆盖指纹 ○◐●)。</span>
+        </div>
+        <div class="screen-frame">
+          <div class="screen-frame__chrome">
+            <span class="screen-frame__dots"><i></i><i></i><i></i></span>
+            <span class="screen-frame__name">设置 · 飞书</span>
+          </div>
+          <div class="screen-frame__stage">
+<!-- ══════════════════════════════════════════════════════════════════════════
+     屏 1 · 飞书设置页 主体(静息态 · 抽屉关闭)
+     设置外壳(左栏导航 + header + 右内容 max-w-3xl)+ 三个 SettingsSection
+     ══════════════════════════════════════════════════════════════════════════ -->
+<div class="settings-shell">
+
+  <!-- ── 左侧栏导航 ────────────────────────────────────────────────────── -->
+  <aside class="settings-sidebar">
+    <nav class="settings-nav">
+      <button class="settings-nav__item">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg>
+        <span>General</span>
+      </button>
+      <button class="settings-nav__item">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/></svg>
+        <span>Keybindings</span>
+      </button>
+      <button class="settings-nav__item">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M12 8V4M9 2h6M9 14h.01M15 14h.01M2 13h2M20 13h2"/></svg>
+        <span>Providers</span>
+      </button>
+      <button class="settings-nav__item">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9M18 9V6M18 9h-3"/></svg>
+        <span>Source Control</span>
+      </button>
+      <button class="settings-nav__item">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1.5 1.5M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1.5-1.5"/></svg>
+        <span>Connections</span>
+      </button>
+      <button class="settings-nav__item is-active">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 8.5-7 10-4-1.5-7-5.5-7-10V6z"/></svg>
+        <span>飞书</span>
+      </button>
+      <button class="settings-nav__item">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8M10 12h4"/></svg>
+        <span>Archive</span>
+      </button>
+    </nav>
+    <div class="settings-sidebar__footer">
+      <button class="settings-nav__item">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+        <span>Back</span>
+      </button>
+    </div>
+  </aside>
+
+  <!-- ── 右主区 ───────────────────────────────────────────────────────── -->
+  <div class="settings-main">
+    <header class="settings-header">
+      <span>设置</span>
+      <button class="theme-toggle"  aria-label="切换主题">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+      </button>
+    </header>
+
+    <div class="settings-page">
+      <div class="settings-page__inner">
+
+        <!-- ══ Section 1 · 飞书 Bot 绑定 ══════════════════════════════════ -->
+        <section class="settings-section">
+          <div class="settings-section__head">
+            <h2 class="settings-section__eyebrow"><span class="settings-section__tick"></span>Bot 绑定</h2>
+          </div>
+          <div class="settings-section__card">
+            <div class="settings-row">
+              <div class="settings-row__main">
+                <div class="row gap-3">
+                  <!-- bot 头像 -->
+                  <span style="width:38px;height:38px;border-radius:var(--radius-md);background:color-mix(in oklab,var(--primary) 12%,transparent);color:var(--primary);display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;box-shadow:var(--hairline);">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M12 8V4M9 2h6M9 14h.01M15 14h.01"/></svg>
+                  </span>
+                  <div class="col" style="gap:3px;">
+                    <span class="font-semibold text-13">t3code 机器人</span>
+                    <span class="text-xs mono text-muted">App&nbsp;cli_a1b2c3</span>
+                  </div>
+                </div>
+              </div>
+              <div class="settings-row__control" style="gap:14px;">
+                <!-- 授权人 -->
+                <div class="row" style="gap:6px;">
+                  <span class="text-xs text-muted">授权人</span>
+                  <span style="width:20px;height:20px;border-radius:9999px;background:color-mix(in oklab,var(--primary) 15%,transparent);color:var(--primary);display:inline-flex;align-items:center;justify-content:center;font-size:10px;font-weight:600;flex-shrink:0;">张</span>
+                  <span class="text-13 font-medium">张伟</span>
+                </div>
+                <button class="btn btn--outline btn--sm">管理绑定</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ══ Section 2 · 私聊(独立平铺 · 仅密度可配)══════════════════ -->
+        <section class="settings-section">
+          <div class="settings-section__head">
+            <h2 class="settings-section__eyebrow"><span class="settings-section__tick"></span>私聊 · 1</h2>
+            <span class="soft-pill soft-pill--neutral">owner-only 准入</span>
+          </div>
+          <div class="settings-section__card">
+            <div class="settings-row">
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <h3 class="settings-row__title">🔒 张伟</h3>
+                  <span class="text-xs text-muted mono">ou_9f…</span>
+                  <span class="soft-pill soft-pill--primary"><span class="status-dot"></span>owner</span>
+                </div>
+                <p class="settings-row__desc">私聊仅授权人可用 —— 审批 / 命令 / 工作区由 <span class="mono">owner-always</span> 规则免配,仅「消息密度」可个性化。</p>
+              </div>
+              <div class="settings-row__control">
+                <div class="segmented">
+                  <button class="segmented__item is-selected">卡片</button>
+                  <button class="segmented__item">Markdown</button>
+                  <button class="segmented__item">纯文本</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ══ Section 3 · 群聊 · 41 ══════════════════════════════════════ -->
+        <section class="settings-section">
+          <div class="settings-section__head">
+            <h2 class="settings-section__eyebrow"><span class="settings-section__tick"></span>群聊 · 41</h2>
+            <div class="row" style="gap:6px;">
+              <span class="soft-pill soft-pill--neutral" style="cursor:pointer;">8 已覆盖</span>
+              <span class="soft-pill soft-pill--warning" style="cursor:pointer;">2 松于默认</span>
+              <span class="soft-pill soft-pill--error" style="cursor:pointer;">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0zM12 9v4M12 17h.01"/></svg>
+                1 需修
+              </span>
+            </div>
+          </div>
+
+          <div class="settings-section__card">
+
+            <!-- 置顶:默认配置基线(所有群的默认基线,非群列表里的某个群)-->
+            <div class="settings-row" style="background:color-mix(in oklab,var(--muted) 55%,transparent);border-bottom:1px solid var(--border);cursor:pointer;">
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <span class="badge badge--secondary">基线</span>
+                  <h3 class="settings-row__title">默认配置</h3>
+                  <span class="text-11 text-muted">所有群的默认基线</span>
+                </div>
+                <p class="settings-row__desc" style="display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center;">
+                  <span><span class="text-muted">审批</span> 仅发起人</span>
+                  <span style="opacity:.4;">·</span>
+                  <span><span class="text-muted">命令</span> 全部</span>
+                  <span style="opacity:.4;">·</span>
+                  <span><span class="text-muted">工作区</span> 全部</span>
+                  <span style="opacity:.4;">·</span>
+                  <span><span class="text-muted">密度</span> <span class="mono" style="font-size:12px;">card</span></span>
+                </p>
+                <div class="settings-row__status">应用于 34 个未覆盖的群</div>
+              </div>
+              <div class="settings-row__control">
+                <button class="btn btn--ghost btn--sm">
+                  编辑默认
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>
+                </button>
+              </div>
+            </div>
+
+            <!-- 工具条:搜索 + 筛选 segmented -->
+            <div style="padding:12px 16px;display:flex;flex-direction:column;gap:10px;border-bottom:1px solid color-mix(in oklab,var(--border) 60%,transparent);">
+              <div style="position:relative;">
+                <svg style="position:absolute;left:11px;top:50%;transform:translateY(-50%);width:14px;height:14px;color:color-mix(in oklab,var(--muted-foreground) 70%,transparent);pointer-events:none;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+                <input class="input" style="padding-left:33px;" placeholder="搜索群名…">
+              </div>
+              <div class="segmented">
+                <button class="segmented__item is-selected">全部</button>
+                <button class="segmented__item">已覆盖</button>
+                <button class="segmented__item">继承</button>
+                <button class="segmented__item">松于默认</button>
+              </div>
+            </div>
+
+            <!-- 群行:覆盖 · 后端研发群 -->
+            <div class="between" style="padding:13px 20px;cursor:pointer;transition:background-color .15s ease;background:var(--accent);">
+              <div class="col" style="gap:6px;min-width:0;">
+                <div class="row" style="gap:8px;">
+                  <span class="font-medium text-13" style="letter-spacing:-.01em;">后端研发群</span>
+                  <span class="badge badge--secondary">话题</span>
+                  <div class="coverage-fingerprint" title="审批 · 命令 已覆盖">
+                    <span class="cov-dot cov-dot--full"></span>
+                    <span class="cov-dot cov-dot--full"></span>
+                    <span class="cov-dot cov-dot--none"></span>
+                    <span class="cov-dot cov-dot--none"></span>
+                  </div>
+                </div>
+                <p class="text-xs text-muted" style="margin:0;">指定审批人 · 3 人 · 命令 4 项</p>
+              </div>
+              <svg style="width:16px;height:16px;color:var(--muted-foreground);flex-shrink:0;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>
+            </div>
+
+            <!-- 群行:覆盖 · 支付网关群 -->
+            <div class="between" style="padding:13px 20px;cursor:pointer;transition:background-color .15s ease;border-top:1px solid color-mix(in oklab,var(--border) 60%,transparent);">
+              <div class="col" style="gap:6px;min-width:0;">
+                <div class="row" style="gap:8px;">
+                  <span class="font-medium text-13" style="letter-spacing:-.01em;">支付网关群</span>
+                  <span class="badge badge--secondary">话题</span>
+                  <div class="coverage-fingerprint" title="工作区 已覆盖">
+                    <span class="cov-dot cov-dot--none"></span>
+                    <span class="cov-dot cov-dot--none"></span>
+                    <span class="cov-dot cov-dot--full"></span>
+                    <span class="cov-dot cov-dot--none"></span>
+                  </div>
+                  <span class="soft-pill soft-pill--warning">松于默认</span>
+                </div>
+                <p class="text-xs text-muted" style="margin:0;">工作区 2 项 · 其余继承默认</p>
+              </div>
+              <svg style="width:16px;height:16px;color:var(--muted-foreground);flex-shrink:0;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>
+            </div>
+
+            <!-- 干净群(静息态)· 前端项目群 -->
+            <div class="between" style="padding:13px 20px;cursor:pointer;transition:background-color .15s ease;border-top:1px solid color-mix(in oklab,var(--border) 60%,transparent);">
+              <div class="col" style="gap:4px;min-width:0;">
+                <span class="font-medium text-13" style="letter-spacing:-.01em;">前端项目群</span>
+                <span class="text-xs" style="color:color-mix(in oklab,var(--muted-foreground) 72%,transparent);">继承默认 · 仅发起人</span>
+              </div>
+            </div>
+
+            <!-- 干净群 · 设计评审群 -->
+            <div class="between" style="padding:13px 20px;cursor:pointer;transition:background-color .15s ease;border-top:1px solid color-mix(in oklab,var(--border) 60%,transparent);">
+              <div class="col" style="gap:4px;min-width:0;">
+                <span class="font-medium text-13" style="letter-spacing:-.01em;">设计评审群</span>
+                <span class="text-xs" style="color:color-mix(in oklab,var(--muted-foreground) 72%,transparent);">继承默认 · 仅发起人</span>
+              </div>
+            </div>
+
+            <!-- 干净群 · 运维值班群 -->
+            <div class="between" style="padding:13px 20px;cursor:pointer;transition:background-color .15s ease;border-top:1px solid color-mix(in oklab,var(--border) 60%,transparent);">
+              <div class="col" style="gap:4px;min-width:0;">
+                <span class="font-medium text-13" style="letter-spacing:-.01em;">运维值班群</span>
+                <span class="text-xs" style="color:color-mix(in oklab,var(--muted-foreground) 72%,transparent);">继承默认 · 仅发起人</span>
+              </div>
+            </div>
+
+          </div>
+        </section>
+
+      </div>
+    </div>
+  </div>
+</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="screen" id="screen-2">
+        <div class="screen__label">
+          <span class="screen__eyebrow">屏 2</span>
+          <span class="screen__title">群详情抽屉 · 审批维度展开</span>
+          <span class="screen__desc">右抽屉 overlay:生效预览 + 三态审批 + 成员勾选。</span>
+        </div>
+        <div class="screen-frame">
+          <div class="screen-frame__chrome">
+            <span class="screen-frame__dots"><i></i><i></i><i></i></span>
+            <span class="screen-frame__name">设置 · 飞书 › 后端研发群</span>
+          </div>
+          <div class="screen-frame__stage">
+<!-- ============================================================================
+     屏 2 · 右抽屉:群详情(审批维度展开)
+     暗背景(模糊的主设置页剪影) + 右侧滑出 Sheet 抽屉
+     ============================================================================ -->
+
+<!-- ───────────────────────── 背景:主设置页(将被 backdrop 变暗+模糊)───────────────────────── -->
+<div class="settings-shell" aria-hidden="true">
+  <aside class="settings-sidebar">
+    <nav class="settings-nav">
+      <button class="settings-nav__item"><span class="icon">⚙</span><span>General</span></button>
+      <button class="settings-nav__item"><span class="icon">⌨</span><span>Keybindings</span></button>
+      <button class="settings-nav__item"><span class="icon">🤖</span><span>Providers</span></button>
+      <button class="settings-nav__item"><span class="icon">🌿</span><span>Source Control</span></button>
+      <button class="settings-nav__item"><span class="icon">🔗</span><span>Connections</span></button>
+      <button class="settings-nav__item is-active"><span class="icon">🛡</span><span>飞书</span></button>
+      <button class="settings-nav__item"><span class="icon">🗄</span><span>Archive</span></button>
+    </nav>
+    <div class="settings-sidebar__footer">
+      <button class="settings-nav__item">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg>
+        <span>Back</span>
+      </button>
+    </div>
+  </aside>
+
+  <div class="settings-main">
+    <header class="settings-header">
+      <span>设置</span>
+      <button class="theme-toggle" aria-label="切换主题">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+      </button>
+    </header>
+
+    <div class="settings-page">
+      <div class="settings-page__inner">
+
+        <!-- 群与私聊 section(剪影) -->
+        <section class="settings-section">
+          <div class="settings-section__head">
+            <h2 class="settings-section__eyebrow"><span class="settings-section__tick"></span>群聊 · 41</h2>
+            <div class="row gap-1">
+              <span class="soft-pill soft-pill--neutral"><span class="status-dot"></span>8 已覆盖</span>
+              <span class="soft-pill soft-pill--warning"><span class="status-dot"></span>2 松于默认</span>
+              <span class="soft-pill soft-pill--warning">⚠ 1</span>
+            </div>
+          </div>
+
+          <div class="settings-section__card">
+            <!-- 工具条:搜索 + 筛选 chips -->
+            <div class="row between" style="gap:12px;padding:12px 16px;border-bottom:1px solid color-mix(in oklab, var(--border) 60%, transparent);">
+              <div class="row grow" style="position:relative;max-width:220px;">
+                <span style="position:absolute;left:10px;display:inline-flex;color:var(--muted-foreground);pointer-events:none;">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+                </span>
+                <input class="input" style="padding-left:30px;height:32px;" placeholder="搜索群名或 chat_id…" />
+              </div>
+              <div class="row gap-1">
+                <button class="btn btn--xs btn--outline">全部</button>
+                <button class="btn btn--xs btn--ghost">已覆盖</button>
+                <button class="btn btn--xs btn--ghost">继承</button>
+                <button class="btn btn--xs btn--ghost">私聊</button>
+                <button class="btn btn--xs btn--ghost">松于默认</button>
+              </div>
+            </div>
+
+            <!-- 群行:后端研发(正在编辑 → 高亮选中) -->
+            <div class="row between" style="gap:12px;padding:12px 16px;box-shadow:inset 2px 0 0 var(--primary);background:color-mix(in oklab, var(--primary) 5%, transparent);">
+              <div class="row grow" style="gap:10px;">
+                <span style="width:26px;height:26px;border-radius:8px;background:color-mix(in oklab, var(--primary) 16%, transparent);color:var(--primary);display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;flex-shrink:0;">后</span>
+                <div class="col" style="gap:3px;min-width:0;">
+                  <div class="row" style="gap:6px;">
+                    <span class="text-13 font-semibold text-fg">后端研发群</span>
+                    <span class="badge badge--secondary">话题群</span>
+                    <span class="coverage-fingerprint"><span class="cov-dot cov-dot--full"></span><span class="cov-dot cov-dot--full"></span><span class="cov-dot cov-dot--none"></span></span>
+                  </div>
+                  <div class="row wrap" style="gap:4px;">
+                    <span class="dimension-chip is-overridden"><span class="cov-dot cov-dot--full"></span>审批</span>
+                    <span class="dimension-chip is-overridden"><span class="cov-dot cov-dot--full"></span>命令</span>
+                    <span class="dimension-chip is-overridden"><span class="cov-dot cov-dot--full"></span>工作区</span>
+                  </div>
+                </div>
+              </div>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--muted-foreground)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>
+            </div>
+
+            <!-- 群行:产品设计(已覆盖) -->
+            <div class="row between" style="gap:12px;padding:12px 16px;border-top:1px solid color-mix(in oklab, var(--border) 60%, transparent);">
+              <div class="row grow" style="gap:10px;">
+                <span style="width:26px;height:26px;border-radius:8px;background:color-mix(in oklab, var(--muted-foreground) 14%, transparent);color:var(--muted-foreground);display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;flex-shrink:0;">产</span>
+                <div class="col" style="gap:3px;min-width:0;">
+                  <div class="row" style="gap:6px;">
+                    <span class="text-13 font-semibold text-fg">产品设计群</span>
+                    <span class="badge badge--secondary">话题群</span>
+                    <span class="coverage-fingerprint"><span class="cov-dot cov-dot--full"></span><span class="cov-dot cov-dot--none"></span><span class="cov-dot cov-dot--none"></span></span>
+                  </div>
+                  <p class="text-xs text-muted" style="margin:0;">指定审批人 · 4 项命令 · 继承工作区</p>
+                </div>
+              </div>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--muted-foreground)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>
+            </div>
+
+            <!-- 群行:数据平台(干净·继承)—— 静息态无控件 -->
+            <div class="row between" style="gap:12px;padding:12px 16px;border-top:1px solid color-mix(in oklab, var(--border) 60%, transparent);">
+              <div class="row grow" style="gap:10px;">
+                <span style="width:26px;height:26px;border-radius:8px;background:color-mix(in oklab, var(--muted-foreground) 14%, transparent);color:var(--muted-foreground);display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;flex-shrink:0;">数</span>
+                <div class="row" style="gap:8px;min-width:0;">
+                  <span class="text-13 font-medium text-fg">数据平台群</span>
+                  <span class="text-xs text-muted">继承默认 · 仅发起人</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- 群行:前端体验(干净·继承) -->
+            <div class="row between" style="gap:12px;padding:12px 16px;border-top:1px solid color-mix(in oklab, var(--border) 60%, transparent);">
+              <div class="row grow" style="gap:10px;">
+                <span style="width:26px;height:26px;border-radius:8px;background:color-mix(in oklab, var(--muted-foreground) 14%, transparent);color:var(--muted-foreground);display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;flex-shrink:0;">前</span>
+                <div class="row" style="gap:8px;min-width:0;">
+                  <span class="text-13 font-medium text-fg">前端体验群</span>
+                  <span class="text-xs text-muted">继承默认 · 仅发起人</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- 私聊分组 -->
+            <div class="row between" style="gap:12px;padding:12px 16px;border-top:1px solid color-mix(in oklab, var(--border) 60%, transparent);">
+              <div class="row grow" style="gap:10px;">
+                <span style="width:26px;height:26px;border-radius:8px;background:color-mix(in oklab, var(--muted-foreground) 14%, transparent);color:var(--muted-foreground);display:inline-flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0;">🔒</span>
+                <div class="row" style="gap:8px;min-width:0;">
+                  <span class="text-13 font-medium text-fg">私聊 · 张伟</span>
+                  <span class="badge badge--outline">owner</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ───────────────────────── overlay:backdrop + 右抽屉 ───────────────────────── -->
+<div class="sheet-backdrop"></div>
+<div class="sheet-viewport">
+  <aside class="sheet-panel">
+    <button class="sheet-close btn btn--icon btn--ghost" aria-label="关闭">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+    </button>
+
+    <!-- Sheet header:群名 + 元信息 + 复制ID -->
+    <div class="sheet-header">
+      <h2 class="sheet-title">后端研发群</h2>
+      <div class="row wrap" style="gap:8px;">
+        <span class="soft-pill soft-pill--neutral">话题群</span>
+        <span class="text-xs text-muted">32 人</span>
+        <span class="text-xs text-muted">·</span>
+        <span class="mono text-xs text-muted">oc_88…d1</span>
+        <button class="btn btn--xs btn--ghost" style="margin-left:-2px;">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          复制 ID
+        </button>
+      </div>
+    </div>
+
+    <!-- Sheet body -->
+    <div class="sheet-body">
+      <div class="col" style="gap:22px;">
+
+        <!-- 生效预览卡 -->
+        <section class="settings-section">
+          <div class="settings-section__head">
+            <h2 class="settings-section__eyebrow"><span class="settings-section__tick"></span>生效预览</h2>
+          </div>
+          <div class="effective-preview">
+            <div class="effective-preview__head">继承 + 覆盖解析后</div>
+            <div class="effective-preview__row">
+              <span class="effective-preview__key">审批模式</span>
+              <span class="effective-preview__val wrap" style="flex-wrap:wrap;justify-content:flex-end;">指定审批人<span class="source-badge source-badge--chat">本群</span></span>
+            </div>
+            <div class="effective-preview__row">
+              <span class="effective-preview__key">可批准</span>
+              <span class="effective-preview__val wrap" style="flex-wrap:wrap;justify-content:flex-end;">李娜、王强</span>
+            </div>
+            <div class="effective-preview__row">
+              <span class="effective-preview__key">命令</span>
+              <span class="effective-preview__val wrap" style="flex-wrap:wrap;justify-content:flex-end;">4 项 ＋ 基础<span class="source-badge source-badge--chat">本群</span></span>
+            </div>
+            <div class="effective-preview__row">
+              <span class="effective-preview__key">工作区</span>
+              <span class="effective-preview__val wrap" style="flex-wrap:wrap;justify-content:flex-end;">2 个已授权<span class="source-badge source-badge--chat">本群</span></span>
+            </div>
+            <div class="effective-preview__row">
+              <span class="effective-preview__key">密度</span>
+              <span class="effective-preview__val wrap" style="flex-wrap:wrap;justify-content:flex-end;">卡片<span class="source-badge source-badge--default">默认</span></span>
+            </div>
+          </div>
+        </section>
+
+        <!-- 配置维度网格(任一时刻只展开一维) -->
+        <section class="settings-section">
+          <div class="settings-section__head">
+            <h2 class="settings-section__eyebrow"><span class="settings-section__tick"></span>配置维度</h2>
+            <span class="text-11 text-muted">同一时刻只展开一维</span>
+          </div>
+
+          <div class="settings-section__card">
+
+            <!-- 审批(展开) -->
+            <div class="settings-row" style="flex-wrap:wrap;background:color-mix(in oklab, var(--muted) 30%, transparent);">
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <h3 class="settings-row__title">审批</h3>
+                  <span class="source-badge source-badge--chat">本群</span>
+                </div>
+                <p class="settings-row__desc">指定审批人 · 李娜、王强</p>
+              </div>
+              <div class="settings-row__control">
+                <button class="settings-reset" title="重置为默认">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
+                </button>
+                <button class="btn btn--icon-sm btn--ghost" aria-label="折叠">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg>
+                </button>
+              </div>
+
+              <!-- 展开区 -->
+              <div class="settings-row__expand">
+                <div class="col" style="gap:14px;">
+
+                  <!-- 三态单选 -->
+                  <div class="col gap-2">
+                    <div class="segmented">
+                      <button class="segmented__item">
+                        <span style="width:9px;height:9px;border-radius:9999px;border:1.5px solid currentColor;flex-shrink:0;"></span>仅发起人
+                      </button>
+                      <button class="segmented__item is-selected">
+                        <span style="width:9px;height:9px;border-radius:9999px;background:var(--primary);border:1.5px solid var(--primary);flex-shrink:0;"></span>指定审批人
+                      </button>
+                      <button class="segmented__item">
+                        <span style="width:9px;height:9px;border-radius:9999px;border:1.5px solid currentColor;flex-shrink:0;"></span>任意群成员
+                      </button>
+                    </div>
+                    <p class="text-xs text-muted" style="margin:0;">只有勾选的成员能批 agent 的写文件 / 跑命令,其余人点按钮无效。</p>
+                  </div>
+
+                  <!-- 从群成员中指定 -->
+                  <div class="col gap-2">
+                    <div class="row" style="gap:10px;">
+                      <hr class="divider divider--60 grow" />
+                      <span class="text-11 text-muted font-medium" style="white-space:nowrap;">从群成员中指定</span>
+                      <hr class="divider divider--60 grow" />
+                    </div>
+
+                    <div class="col">
+                      <label class="row between" style="gap:10px;padding:6px 2px;cursor:pointer;">
+                        <span class="row" style="gap:10px;">
+                          <span class="checkbox is-checked"><svg class="checkbox__check" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3" fill="none"><path d="M5.252 12.7 10.2 18.63 18.748 5.37"/></svg></span>
+                          <span style="width:22px;height:22px;border-radius:9999px;background:color-mix(in oklab, var(--primary) 16%, transparent);color:var(--primary);display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;flex-shrink:0;">李</span>
+                          <span class="text-13 font-medium text-fg">李娜</span>
+                        </span>
+                        <span class="text-11 text-muted">已选为审批人</span>
+                      </label>
+
+                      <label class="row between" style="gap:10px;padding:6px 2px;cursor:pointer;">
+                        <span class="row" style="gap:10px;">
+                          <span class="checkbox is-checked"><svg class="checkbox__check" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3" fill="none"><path d="M5.252 12.7 10.2 18.63 18.748 5.37"/></svg></span>
+                          <span style="width:22px;height:22px;border-radius:9999px;background:color-mix(in oklab, var(--muted-foreground) 16%, transparent);color:var(--muted-foreground);display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;flex-shrink:0;">王</span>
+                          <span class="text-13 font-medium text-fg">王强</span>
+                        </span>
+                        <span class="text-11 text-muted">已选为审批人</span>
+                      </label>
+
+                      <label class="row between" style="gap:10px;padding:6px 2px;cursor:pointer;">
+                        <span class="row" style="gap:10px;">
+                          <span class="checkbox"><svg class="checkbox__check" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3" fill="none"><path d="M5.252 12.7 10.2 18.63 18.748 5.37"/></svg></span>
+                          <span style="width:22px;height:22px;border-radius:9999px;background:color-mix(in oklab, var(--muted-foreground) 12%, transparent);color:var(--muted-foreground);display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;flex-shrink:0;">陈</span>
+                          <span class="text-13 font-medium text-fg">陈昊</span>
+                        </span>
+                      </label>
+                    </div>
+
+                    <!-- 名录外 open_id -->
+                    <div class="col gap-1" style="margin-top:4px;">
+                      <input class="input" placeholder="粘贴名录外成员的 open_id,回车添加(如 ou_9f…)" />
+                      <p class="text-xs text-muted" style="margin:0;">名录外 open_id 不在本群名录中,保存时逐个校验;无效项将跳过。</p>
+                    </div>
+                  </div>
+
+                </div>
+              </div>
+            </div>
+
+            <!-- 命令(折叠) -->
+            <div class="settings-row">
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <h3 class="settings-row__title">命令</h3>
+                  <span class="source-badge source-badge--chat">本群</span>
+                </div>
+                <p class="settings-row__desc">4 项 ＋ 基础命令(/help /whoami 始终可用)</p>
+              </div>
+              <div class="settings-row__control">
+                <button class="settings-reset" title="重置为默认">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
+                </button>
+                <button class="btn btn--icon-sm btn--ghost" aria-label="展开">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                </button>
+              </div>
+            </div>
+
+            <!-- 工作区(折叠) -->
+            <div class="settings-row">
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <h3 class="settings-row__title">工作区</h3>
+                  <span class="source-badge source-badge--chat">本群</span>
+                </div>
+                <p class="settings-row__desc">2 个已授权 · agent 仅能进入这些目录</p>
+              </div>
+              <div class="settings-row__control">
+                <button class="settings-reset" title="重置为默认">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
+                </button>
+                <button class="btn btn--icon-sm btn--ghost" aria-label="展开">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                </button>
+              </div>
+            </div>
+
+            <!-- 密度(继承默认) -->
+            <div class="settings-row">
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <h3 class="settings-row__title">密度</h3>
+                  <span class="source-badge source-badge--default">默认</span>
+                </div>
+                <p class="settings-row__desc">卡片(继承默认)</p>
+              </div>
+              <div class="settings-row__control">
+                <button class="btn btn--xs btn--ghost">覆盖</button>
+                <button class="btn btn--icon-sm btn--ghost" aria-label="展开">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                </button>
+              </div>
+            </div>
+
+          </div>
+        </section>
+
+      </div>
+    </div>
+
+    <!-- Sheet footer -->
+    <div class="sheet-footer">
+      <button class="btn btn--outline">取消</button>
+      <button class="btn btn--primary">保存覆盖</button>
+    </div>
+  </aside>
+</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="screen" id="screen-3">
+        <div class="screen__label">
+          <span class="screen__eyebrow">屏 3</span>
+          <span class="screen__title">命令白名单抽屉 · floor 锁</span>
+          <span class="screen__desc">命令维度展开:仅允许勾选 + 基础命令防自锁 + 禁用后果警示。</span>
+        </div>
+        <div class="screen-frame">
+          <div class="screen-frame__chrome">
+            <span class="screen-frame__dots"><i></i><i></i><i></i></span>
+            <span class="screen-frame__name">设置 · 飞书 › 后端研发 · 命令</span>
+          </div>
+          <div class="screen-frame__stage">
+<!-- ============================================================================
+     屏 3 · 右抽屉:命令白名单(floor 锁 + 禁用后果)
+     暗背景 = 飞书设置页外壳(模糊/压暗) + 右侧浮层抽屉展示「命令维度展开态」
+     ============================================================================ -->
+
+<!-- ─────────────────────────── 背景:设置外壳 ─────────────────────────── -->
+<div class="settings-shell">
+  <aside class="settings-sidebar">
+    <nav class="settings-nav">
+      <button class="settings-nav__item"><span aria-hidden="true" style="width:16px;text-align:center;flex-shrink:0;">⚙</span><span>General</span></button>
+      <button class="settings-nav__item"><span aria-hidden="true" style="width:16px;text-align:center;flex-shrink:0;">⌨</span><span>Keybindings</span></button>
+      <button class="settings-nav__item"><span aria-hidden="true" style="width:16px;text-align:center;flex-shrink:0;">🤖</span><span>Providers</span></button>
+      <button class="settings-nav__item"><span aria-hidden="true" style="width:16px;text-align:center;flex-shrink:0;">🌿</span><span>Source Control</span></button>
+      <button class="settings-nav__item"><span aria-hidden="true" style="width:16px;text-align:center;flex-shrink:0;">🔗</span><span>Connections</span></button>
+      <button class="settings-nav__item is-active"><span aria-hidden="true" style="width:16px;text-align:center;flex-shrink:0;">🛡</span><span>飞书</span></button>
+      <button class="settings-nav__item"><span aria-hidden="true" style="width:16px;text-align:center;flex-shrink:0;">🗄</span><span>Archive</span></button>
+    </nav>
+    <div class="settings-sidebar__footer">
+      <button class="settings-nav__item"><span aria-hidden="true" style="width:16px;text-align:center;flex-shrink:0;">←</span><span>Back</span></button>
+    </div>
+  </aside>
+
+  <div class="settings-main">
+    <header class="settings-header">
+      <span>设置</span>
+      <button class="theme-toggle"  aria-label="切换主题">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      </button>
+    </header>
+
+    <div class="settings-page">
+      <div class="settings-page__inner">
+
+        <!-- 绑定 -->
+        <section class="settings-section">
+          <div class="settings-section__head">
+            <h2 class="settings-section__eyebrow"><span class="settings-section__tick"></span>绑定</h2>
+          </div>
+          <div class="settings-section__card">
+            <div class="settings-row">
+              <div class="settings-row__main">
+                <div class="row gap-2">
+                  <span style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:8px;background:color-mix(in oklab,var(--primary) 12%,transparent);font-size:15px;flex-shrink:0;">🤖</span>
+                  <div class="col" style="gap:2px;">
+                    <span class="text-13 font-semibold">t3code 机器人</span>
+                    <span class="text-xs mono text-muted">cli_a3f92e017c8b100d</span>
+                  </div>
+                </div>
+              </div>
+              <div class="settings-row__control">
+                <div class="row gap-2" style="margin-right:4px;">
+                  <span style="display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;border-radius:9999px;background:var(--muted);color:var(--muted-foreground);font-size:11px;font-weight:600;flex-shrink:0;">张</span>
+                  <span class="text-xs text-muted">授权人 张伟</span>
+                </div>
+                <button class="btn btn--outline btn--sm">管理绑定</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 默认配置 -->
+        <section class="settings-section">
+          <div class="settings-section__head">
+            <h2 class="settings-section__eyebrow"><span class="settings-section__tick"></span>默认配置</h2>
+          </div>
+          <div class="settings-section__card">
+            <div class="settings-row">
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <h3 class="settings-row__title">仅发起人 · 全部命令 · 未限工作区 · 卡片</h3>
+                </div>
+                <p class="settings-row__desc">应用于 34 个未覆盖的群。</p>
+              </div>
+              <div class="settings-row__control">
+                <button class="btn btn--outline btn--sm">编辑默认</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 群与私聊 -->
+        <section class="settings-section">
+          <div class="settings-section__head">
+            <h2 class="settings-section__eyebrow"><span class="settings-section__tick"></span>群聊 · 41</h2>
+            <div class="row gap-2">
+              <span class="soft-pill soft-pill--primary"><span class="status-dot"></span>8 已覆盖</span>
+              <span class="soft-pill soft-pill--warning"><span class="status-dot"></span>2 松于默认</span>
+              <span class="soft-pill soft-pill--error"><span class="status-dot"></span>⚠ 1</span>
+            </div>
+          </div>
+          <div class="settings-section__card">
+            <!-- 搜索 + 筛选 -->
+            <div class="settings-row" style="gap:10px;">
+              <div class="settings-row__main">
+                <div class="select" style="min-height:30px;cursor:text;">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="opacity:.5;flex-shrink:0;"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                  <span class="select__value is-placeholder">搜索群名 / open_id…</span>
+                </div>
+              </div>
+              <div class="settings-row__control wrap" style="justify-content:flex-start;">
+                <button class="btn btn--xs btn--outline">全部</button>
+                <button class="btn btn--xs btn--ghost">已覆盖</button>
+                <button class="btn btn--xs btn--ghost">继承</button>
+                <button class="btn btn--xs btn--ghost">私聊</button>
+                <button class="btn btn--xs btn--ghost">松于默认</button>
+              </div>
+            </div>
+
+            <!-- 被编辑的群(高亮:抽屉正在编辑它) -->
+            <div class="settings-row" style="background:color-mix(in oklab,var(--accent) 70%,transparent);">
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <h3 class="settings-row__title">后端研发</h3>
+                  <span class="soft-pill soft-pill--neutral">群聊</span>
+                </div>
+                <div class="row gap-2 wrap" style="margin-top:2px;">
+                  <div class="coverage-fingerprint">
+                    <span class="cov-dot cov-dot--none"></span>
+                    <span class="cov-dot cov-dot--full"></span>
+                    <span class="cov-dot cov-dot--none"></span>
+                    <span class="cov-dot cov-dot--none"></span>
+                  </div>
+                  <span class="dimension-chip is-overridden"><span class="cov-dot cov-dot--full"></span>命令</span>
+                  <span class="text-xs text-muted">仅允许 /status /resume · 已禁用 /workspace</span>
+                </div>
+              </div>
+              <div class="settings-row__control">
+                <button class="btn btn--ghost btn--icon-sm" aria-label="打开">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+                </button>
+              </div>
+            </div>
+
+            <!-- 干净继承的群(静息态无控件) -->
+            <div class="settings-row">
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <h3 class="settings-row__title">设计评审</h3>
+                </div>
+                <p class="settings-row__desc">继承默认 · 仅发起人 · 全部命令</p>
+              </div>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <h3 class="settings-row__title">运维值班</h3>
+                </div>
+                <p class="settings-row__desc">继承默认 · 仅发起人 · 全部命令</p>
+              </div>
+            </div>
+
+            <!-- 私聊分组 -->
+            <div class="settings-row">
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <h3 class="settings-row__title">🔒 私聊 张伟</h3>
+                  <span class="soft-pill soft-pill--primary">owner</span>
+                </div>
+                <p class="settings-row__desc">仅密度可配 · 审批 / 命令 / 工作区免配</p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ─────────────────────── 前景:右抽屉(命令维度展开态)─────────────────────── -->
+<div class="sheet-backdrop"></div>
+<div class="sheet-viewport">
+  <aside class="sheet-panel">
+    <button class="sheet-close btn btn--icon btn--ghost" aria-label="关闭">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+
+    <div class="sheet-header">
+      <h2 class="sheet-title">后端研发 · 命令白名单</h2>
+      <p class="sheet-description">覆盖默认命令策略,收敛本群可用的斜杠命令。</p>
+    </div>
+
+    <div class="sheet-body">
+
+      <!-- 生效预览(命令维度聚焦) -->
+      <div class="effective-preview" style="margin-bottom:20px;">
+        <div class="effective-preview__head">生效命令策略</div>
+        <div class="effective-preview__row">
+          <span class="effective-preview__key">模式</span>
+          <span class="effective-preview__val">仅允许勾选的命令<span class="source-badge source-badge--chat">本群</span></span>
+        </div>
+        <div class="effective-preview__row">
+          <span class="effective-preview__key">可用命令</span>
+          <span class="effective-preview__val"><span class="mono">/help /whoami /status /resume</span> · 4 项</span>
+        </div>
+      </div>
+
+      <!-- 命令模式 -->
+      <section class="settings-section" style="margin-bottom:20px;">
+        <div class="settings-section__head">
+          <h2 class="settings-section__eyebrow"><span class="settings-section__tick"></span>命令模式</h2>
+          <button class="settings-reset" aria-label="重置为默认">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+          </button>
+        </div>
+        <div class="settings-section__card">
+          <div class="settings-row">
+            <div class="settings-row__main">
+              <div class="settings-row__titleline">
+                <h3 class="settings-row__title">哪些斜杠命令可在本群使用</h3>
+                <span class="source-badge source-badge--chat">本群</span>
+              </div>
+              <p class="settings-row__desc">「全部命令」沿用平台内置集;「仅允许勾选」收敛到你选定的白名单。</p>
+            </div>
+            <div class="settings-row__control">
+              <div class="segmented">
+                <button class="segmented__item"><span class="cov-dot cov-dot--none"></span>全部命令</button>
+                <button class="segmented__item is-selected"><span class="cov-dot cov-dot--full"></span>仅允许勾选</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 护栏轨道:基础命令(floor 锁,防自锁) -->
+      <div style="margin-bottom:20px;">
+        <div class="lock-row is-locked">
+          <span class="lock-row__icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          </span>
+          <div class="lock-row__body">
+            <p class="lock-row__title">基础命令 · 防自锁</p>
+            <p class="lock-row__desc">始终可用,不可关闭 —— 防止误配把成员锁在门外。</p>
+          </div>
+          <div class="lock-row__control">
+            <span class="soft-pill soft-pill--primary">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+              <span class="mono">/help</span>
+            </span>
+            <span class="soft-pill soft-pill--primary">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+              <span class="mono">/whoami</span>
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 可选命令清单 -->
+      <section class="settings-section" style="margin-bottom:20px;">
+        <div class="settings-section__head">
+          <h2 class="settings-section__eyebrow"><span class="settings-section__tick"></span>可选命令</h2>
+          <span class="text-11 text-muted">已选 2 / 4</span>
+        </div>
+        <div class="settings-section__card">
+
+          <!-- /workspace 未勾选 → 触发行内危险警示 -->
+          <div class="settings-row" style="flex-wrap:wrap;">
+            <div class="settings-row__main">
+              <div class="settings-row__titleline">
+                <h3 class="settings-row__title mono">/workspace</h3>
+                <span class="soft-pill soft-pill--error"><span class="status-dot"></span>已禁用</span>
+              </div>
+              <p class="settings-row__desc">切换 / 新建工作区,决定任务在哪个项目根运行。</p>
+            </div>
+            <div class="settings-row__control">
+              <span class="checkbox">
+                <svg class="checkbox__check" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3" fill="none"><path d="M5.252 12.7 10.2 18.63 18.748 5.37"/></svg>
+              </span>
+            </div>
+            <div class="settings-row__expand">
+              <div class="inline-danger">
+                <svg class="inline-danger__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                <div>
+                  <span class="inline-danger__title">已禁用 /workspace</span> —— 本群将无法切换工作区,新任务可能因缺少项目根目录而跑不起来。
+                  <div class="row gap-2" style="margin-top:8px;">
+                    <button class="btn btn--destructive-outline btn--sm">仍然禁用</button>
+                    <button class="btn btn--outline btn--sm">重新启用</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- /status 已勾选 -->
+          <div class="settings-row">
+            <div class="settings-row__main">
+              <div class="settings-row__titleline">
+                <h3 class="settings-row__title mono">/status</h3>
+              </div>
+              <p class="settings-row__desc">查看当前会话与运行状态。</p>
+            </div>
+            <div class="settings-row__control">
+              <span class="checkbox is-checked">
+                <svg class="checkbox__check" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3" fill="none"><path d="M5.252 12.7 10.2 18.63 18.748 5.37"/></svg>
+              </span>
+            </div>
+          </div>
+
+          <!-- /resume 已勾选 -->
+          <div class="settings-row">
+            <div class="settings-row__main">
+              <div class="settings-row__titleline">
+                <h3 class="settings-row__title mono">/resume</h3>
+              </div>
+              <p class="settings-row__desc">恢复历史会话继续对话。</p>
+            </div>
+            <div class="settings-row__control">
+              <span class="checkbox is-checked">
+                <svg class="checkbox__check" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3" fill="none"><path d="M5.252 12.7 10.2 18.63 18.748 5.37"/></svg>
+              </span>
+            </div>
+          </div>
+
+          <!-- /model 未勾选 -->
+          <div class="settings-row">
+            <div class="settings-row__main">
+              <div class="settings-row__titleline">
+                <h3 class="settings-row__title mono">/model</h3>
+              </div>
+              <p class="settings-row__desc">切换模型(Opus / Sonnet)。</p>
+            </div>
+            <div class="settings-row__control">
+              <span class="checkbox">
+                <svg class="checkbox__check" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3" fill="none"><path d="M5.252 12.7 10.2 18.63 18.748 5.37"/></svg>
+              </span>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+    </div>
+
+    <div class="sheet-footer">
+      <button class="btn btn--outline">取消</button>
+      <button class="btn btn--primary">保存</button>
+    </div>
+  </aside>
+</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="screen" id="screen-4">
+        <div class="screen__label">
+          <span class="screen__eyebrow">屏 4</span>
+          <span class="screen__title">批量套用抽屉 · tri-state + diff</span>
+          <span class="screen__desc">多选 8 群批量编辑:保持不变 / 继承默认 / 设为值 + 写入前影响预览。</span>
+        </div>
+        <div class="screen-frame">
+          <div class="screen-frame__chrome">
+            <span class="screen-frame__dots"><i></i><i></i><i></i></span>
+            <span class="screen-frame__name">设置 · 飞书 › 批量编辑 · 8 群</span>
+          </div>
+          <div class="screen-frame__stage">
+<!-- ============================================================================
+     屏 4 · 右抽屉:批量套用(tri-state + 写入前 diff)
+     暗背景 = 群与私聊列表(选择模式,已勾 8 群)· 右侧浮层 = 批量编辑器
+     仅复用 _foundation.css 既有类;微调只走 token 变量的行内 style。
+     ============================================================================ -->
+
+<!-- ══════════ 背景:设置外壳(飞书激活)══════════ -->
+<div class="settings-shell">
+
+  <!-- 左侧栏 -->
+  <aside class="settings-sidebar">
+    <nav class="settings-nav">
+      <button class="settings-nav__item">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="17" cy="7" r="3"/><path d="M20 7h-9"/><circle cx="7" cy="17" r="3"/><path d="M14 17H5"/></svg>
+        <span>General</span>
+      </button>
+      <button class="settings-nav__item">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M8 14h8"/></svg>
+        <span>Keybindings</span>
+      </button>
+      <button class="settings-nav__item">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M12 8V4M8 14h.01M16 14h.01"/></svg>
+        <span>Providers</span>
+      </button>
+      <button class="settings-nav__item">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="2"/><circle cx="6" cy="18" r="2"/><circle cx="18" cy="8" r="2"/><path d="M6 8v8M18 10a6 6 0 0 1-6 6H8"/></svg>
+        <span>Source Control</span>
+      </button>
+      <button class="settings-nav__item">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7 0l2-2a5 5 0 0 0-7-7l-1 1"/><path d="M14 11a5 5 0 0 0-7 0l-2 2a5 5 0 0 0 7 7l1-1"/></svg>
+        <span>Connections</span>
+      </button>
+      <button class="settings-nav__item is-active">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6l7-3z"/></svg>
+        <span>飞书</span>
+      </button>
+      <button class="settings-nav__item">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8M10 12h4"/></svg>
+        <span>Archive</span>
+      </button>
+    </nav>
+    <div class="settings-sidebar__footer">
+      <button class="settings-nav__item">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+        <span>Back</span>
+      </button>
+    </div>
+  </aside>
+
+  <!-- 右主区 -->
+  <div class="settings-main">
+    <header class="settings-header">
+      <span>设置</span>
+      <button class="theme-toggle" title="切换主题">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      </button>
+    </header>
+
+    <div class="settings-page">
+      <div class="settings-page__inner">
+
+        <!-- ── Section:绑定 ── -->
+        <section class="settings-section">
+          <div class="settings-section__head">
+            <h2 class="settings-section__eyebrow"><span class="settings-section__tick"></span>绑定</h2>
+          </div>
+          <div class="settings-section__card">
+            <div class="settings-row">
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <span style="display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:var(--radius-md);background:color-mix(in oklab,var(--primary) 12%,transparent);font-size:14px;flex-shrink:0;">🤖</span>
+                  <h3 class="settings-row__title">t3code 机器人</h3>
+                  <span class="soft-pill soft-pill--success"><span class="status-dot"></span>已连接</span>
+                </div>
+                <p class="settings-row__desc">
+                  <span class="mono">cli_a4f2e18d…9c2</span>
+                  &nbsp;·&nbsp;授权人
+                  <span style="display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:9999px;background:color-mix(in oklab,var(--info) 22%,transparent);color:var(--info-foreground);font-size:9px;font-weight:600;vertical-align:-3px;margin:0 2px;">张</span>
+                  张伟
+                </p>
+              </div>
+              <div class="settings-row__control">
+                <button class="btn btn--outline btn--sm">管理绑定</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ── Section:默认配置 ── -->
+        <section class="settings-section">
+          <div class="settings-section__head">
+            <h2 class="settings-section__eyebrow"><span class="settings-section__tick"></span>默认配置</h2>
+          </div>
+          <div class="settings-section__card">
+            <div class="settings-row">
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <h3 class="settings-row__title">未覆盖会话的默认</h3>
+                </div>
+                <p class="settings-row__desc">仅发起人审批 · 5 命令 · 会话工作区 · 卡片密度</p>
+                <div class="settings-row__status">应用于 34 个未覆盖的群</div>
+              </div>
+              <div class="settings-row__control">
+                <button class="btn btn--outline btn--sm">编辑默认</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ── Section:群与私聊(42)── -->
+        <section class="settings-section">
+          <div class="settings-section__head">
+            <h2 class="settings-section__eyebrow"><span class="settings-section__tick"></span>群聊 · 41</h2>
+            <div class="row gap-2">
+              <span class="soft-pill soft-pill--primary" style="cursor:pointer;"><span class="status-dot"></span>8 已覆盖</span>
+              <span class="soft-pill soft-pill--warning" style="cursor:pointer;"><span class="status-dot"></span>2 松于默认</span>
+              <span class="soft-pill soft-pill--error" style="cursor:pointer;">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 9v4M12 17h.01M10.3 4.3 2.6 18a2 2 0 0 0 1.7 3h15.4a2 2 0 0 0 1.7-3L13.7 4.3a2 2 0 0 0-3.4 0z"/></svg>
+                1
+              </span>
+            </div>
+          </div>
+
+          <div class="settings-section__card">
+
+            <!-- 选择模式工具条 -->
+            <div class="settings-row" style="gap:12px;background:color-mix(in oklab,var(--primary) 5%,transparent);">
+              <span class="checkbox is-indeterminate">
+                <svg class="checkbox__check" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3" fill="none"><path d="M6 12h12"/></svg>
+              </span>
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <h3 class="settings-row__title">已选 8 个会话</h3>
+                  <button class="btn btn--ghost btn--xs">清除</button>
+                </div>
+                <p class="settings-row__desc">选中的群将进入批量编辑;私聊已自动排除。</p>
+              </div>
+              <div class="settings-row__control">
+                <button class="btn btn--primary btn--sm">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>
+                  批量编辑
+                </button>
+              </div>
+            </div>
+
+            <!-- 搜索 + 筛选 -->
+            <div class="settings-row" style="gap:10px;align-items:center;">
+              <div class="grow" style="position:relative;display:flex;align-items:center;">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="position:absolute;left:10px;width:15px;height:15px;color:var(--muted-foreground);pointer-events:none;"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+                <input class="input" style="padding-left:31px;" placeholder="搜索会话名或 open_id…">
+              </div>
+              <div class="row wrap gap-2" style="flex-shrink:0;">
+                <button class="btn btn--xs btn--outline" style="border-color:var(--primary);color:var(--primary);background:color-mix(in oklab,var(--primary) 8%,transparent);">全部</button>
+                <button class="btn btn--xs btn--ghost">已覆盖</button>
+                <button class="btn btn--xs btn--ghost">继承</button>
+                <button class="btn btn--xs btn--ghost">私聊</button>
+                <button class="btn btn--xs btn--ghost">松于默认</button>
+              </div>
+            </div>
+
+            <!-- 群行:后端研发(已选·覆盖) -->
+            <div class="settings-row" style="gap:12px;background:color-mix(in oklab,var(--primary) 6%,transparent);box-shadow:inset 2px 0 0 var(--primary);">
+              <span class="checkbox is-checked"><svg class="checkbox__check" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3" fill="none"><path d="M5.252 12.7 10.2 18.63 18.748 5.37"/></svg></span>
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <h3 class="settings-row__title">后端研发</h3>
+                  <span class="badge badge--outline">群聊</span>
+                </div>
+                <p class="settings-row__desc">指定审批人 · 3 命令 · 后端仓库</p>
+              </div>
+              <div class="settings-row__control">
+                <div class="coverage-fingerprint">
+                  <span class="cov-dot cov-dot--full"></span>
+                  <span class="cov-dot cov-dot--full"></span>
+                  <span class="cov-dot cov-dot--none"></span>
+                </div>
+                <span class="dimension-chip is-overridden"><span class="cov-dot cov-dot--full"></span>审批</span>
+              </div>
+            </div>
+
+            <!-- 群行:前端项目群(已选·覆盖·松于默认) -->
+            <div class="settings-row" style="gap:12px;background:color-mix(in oklab,var(--primary) 6%,transparent);box-shadow:inset 2px 0 0 var(--primary);">
+              <span class="checkbox is-checked"><svg class="checkbox__check" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3" fill="none"><path d="M5.252 12.7 10.2 18.63 18.748 5.37"/></svg></span>
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <h3 class="settings-row__title">前端项目群</h3>
+                  <span class="badge badge--outline">群聊</span>
+                </div>
+                <p class="settings-row__desc">全员审批 · 继承命令 · 前端仓库</p>
+              </div>
+              <div class="settings-row__control">
+                <div class="coverage-fingerprint">
+                  <span class="cov-dot cov-dot--full"></span>
+                  <span class="cov-dot cov-dot--none"></span>
+                  <span class="cov-dot cov-dot--none"></span>
+                </div>
+                <span class="soft-pill soft-pill--warning"><span class="status-dot"></span>松于默认</span>
+              </div>
+            </div>
+
+            <!-- 群行:设计评审群(已选·覆盖) -->
+            <div class="settings-row" style="gap:12px;background:color-mix(in oklab,var(--primary) 6%,transparent);box-shadow:inset 2px 0 0 var(--primary);">
+              <span class="checkbox is-checked"><svg class="checkbox__check" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3" fill="none"><path d="M5.252 12.7 10.2 18.63 18.748 5.37"/></svg></span>
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <h3 class="settings-row__title">设计评审群</h3>
+                  <span class="badge badge--outline">群聊</span>
+                </div>
+                <p class="settings-row__desc">仅发起人 · Markdown 密度</p>
+              </div>
+              <div class="settings-row__control">
+                <div class="coverage-fingerprint">
+                  <span class="cov-dot cov-dot--none"></span>
+                  <span class="cov-dot cov-dot--none"></span>
+                  <span class="cov-dot cov-dot--full"></span>
+                </div>
+                <span class="dimension-chip is-overridden"><span class="cov-dot cov-dot--full"></span>密度</span>
+              </div>
+            </div>
+
+            <!-- 群行:数据平台(已选·覆盖) -->
+            <div class="settings-row" style="gap:12px;background:color-mix(in oklab,var(--primary) 6%,transparent);box-shadow:inset 2px 0 0 var(--primary);">
+              <span class="checkbox is-checked"><svg class="checkbox__check" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3" fill="none"><path d="M5.252 12.7 10.2 18.63 18.748 5.37"/></svg></span>
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <h3 class="settings-row__title">数据平台</h3>
+                  <span class="badge badge--outline">群聊</span>
+                </div>
+                <p class="settings-row__desc">指定审批人 · 只读工作区</p>
+              </div>
+              <div class="settings-row__control">
+                <div class="coverage-fingerprint">
+                  <span class="cov-dot cov-dot--full"></span>
+                  <span class="cov-dot cov-dot--none"></span>
+                  <span class="cov-dot cov-dot--partial"></span>
+                </div>
+                <span class="dimension-chip is-overridden"><span class="cov-dot cov-dot--full"></span>审批</span>
+              </div>
+            </div>
+
+            <!-- 群行:增长团队(已选·覆盖) -->
+            <div class="settings-row" style="gap:12px;background:color-mix(in oklab,var(--primary) 6%,transparent);box-shadow:inset 2px 0 0 var(--primary);">
+              <span class="checkbox is-checked"><svg class="checkbox__check" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3" fill="none"><path d="M5.252 12.7 10.2 18.63 18.748 5.37"/></svg></span>
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <h3 class="settings-row__title">增长团队</h3>
+                  <span class="badge badge--outline">群聊</span>
+                </div>
+                <p class="settings-row__desc">全员审批 · 5 命令 · 会话工作区</p>
+              </div>
+              <div class="settings-row__control">
+                <div class="coverage-fingerprint">
+                  <span class="cov-dot cov-dot--full"></span>
+                  <span class="cov-dot cov-dot--full"></span>
+                  <span class="cov-dot cov-dot--full"></span>
+                </div>
+                <span class="dimension-chip is-overridden"><span class="cov-dot cov-dot--full"></span>命令</span>
+              </div>
+            </div>
+
+            <!-- 群行:QA 测试群(未选·干净继承) -->
+            <div class="settings-row" style="gap:12px;">
+              <span class="checkbox"></span>
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <h3 class="settings-row__title">QA 测试群</h3>
+                  <span class="badge badge--outline">群聊</span>
+                </div>
+                <p class="settings-row__desc text-muted">继承默认 · 仅发起人</p>
+              </div>
+            </div>
+
+            <!-- 群行:移动端小组(已选·覆盖) -->
+            <div class="settings-row" style="gap:12px;background:color-mix(in oklab,var(--primary) 6%,transparent);box-shadow:inset 2px 0 0 var(--primary);">
+              <span class="checkbox is-checked"><svg class="checkbox__check" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3" fill="none"><path d="M5.252 12.7 10.2 18.63 18.748 5.37"/></svg></span>
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <h3 class="settings-row__title">移动端小组</h3>
+                  <span class="badge badge--outline">群聊</span>
+                </div>
+                <p class="settings-row__desc">部分审批人 · 4 命令</p>
+              </div>
+              <div class="settings-row__control">
+                <div class="coverage-fingerprint">
+                  <span class="cov-dot cov-dot--partial"></span>
+                  <span class="cov-dot cov-dot--full"></span>
+                  <span class="cov-dot cov-dot--none"></span>
+                </div>
+                <span class="dimension-chip is-overridden"><span class="cov-dot cov-dot--full"></span>命令</span>
+              </div>
+            </div>
+
+            <!-- 群行:基础架构(已选·覆盖·松于默认) -->
+            <div class="settings-row" style="gap:12px;background:color-mix(in oklab,var(--primary) 6%,transparent);box-shadow:inset 2px 0 0 var(--primary);">
+              <span class="checkbox is-checked"><svg class="checkbox__check" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3" fill="none"><path d="M5.252 12.7 10.2 18.63 18.748 5.37"/></svg></span>
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <h3 class="settings-row__title">基础架构</h3>
+                  <span class="badge badge--outline">群聊</span>
+                </div>
+                <p class="settings-row__desc">全员审批 · 含 /workspace</p>
+              </div>
+              <div class="settings-row__control">
+                <div class="coverage-fingerprint">
+                  <span class="cov-dot cov-dot--full"></span>
+                  <span class="cov-dot cov-dot--none"></span>
+                  <span class="cov-dot cov-dot--none"></span>
+                </div>
+                <span class="soft-pill soft-pill--warning"><span class="status-dot"></span>松于默认</span>
+              </div>
+            </div>
+
+            <!-- 群行:产品需求池(未选·干净继承) -->
+            <div class="settings-row" style="gap:12px;">
+              <span class="checkbox"></span>
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <h3 class="settings-row__title">产品需求池</h3>
+                  <span class="badge badge--outline">群聊</span>
+                </div>
+                <p class="settings-row__desc text-muted">继承默认 · 仅发起人 · 卡片密度</p>
+              </div>
+            </div>
+
+            <!-- 群行:运维值班(已选·覆盖) -->
+            <div class="settings-row" style="gap:12px;background:color-mix(in oklab,var(--primary) 6%,transparent);box-shadow:inset 2px 0 0 var(--primary);">
+              <span class="checkbox is-checked"><svg class="checkbox__check" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3" fill="none"><path d="M5.252 12.7 10.2 18.63 18.748 5.37"/></svg></span>
+              <div class="settings-row__main">
+                <div class="settings-row__titleline">
+                  <h3 class="settings-row__title">运维值班</h3>
+                  <span class="badge badge--outline">群聊</span>
+                </div>
+                <p class="settings-row__desc">指定审批人 · 3 命令 · 会话工作区</p>
+              </div>
+              <div class="settings-row__control">
+                <div class="coverage-fingerprint">
+                  <span class="cov-dot cov-dot--full"></span>
+                  <span class="cov-dot cov-dot--full"></span>
+                  <span class="cov-dot cov-dot--none"></span>
+                </div>
+                <span class="dimension-chip is-overridden"><span class="cov-dot cov-dot--full"></span>审批</span>
+              </div>
+            </div>
+
+          </div>
+        </section>
+
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════ Overlay:批量编辑抽屉 ══════════ -->
+<div class="sheet-backdrop"></div>
+<div class="sheet-viewport">
+  <aside class="sheet-panel">
+    <button class="sheet-close btn btn--icon btn--ghost" aria-label="关闭">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg>
+    </button>
+
+    <div class="sheet-header">
+      <h2 class="sheet-title">批量编辑 · 8 群</h2>
+      <p class="sheet-description">逐维度选择「保持不变 / 继承默认 / 设为值」,写入前预览影响。</p>
+    </div>
+
+    <div class="sheet-body">
+
+      <!-- 目标会话摘要 -->
+      <div class="col gap-2" style="margin-bottom:16px;">
+        <div class="row wrap gap-2">
+          <span class="badge badge--secondary">后端研发</span>
+          <span class="badge badge--secondary">前端项目群</span>
+          <span class="badge badge--secondary">设计评审群</span>
+          <span class="badge badge--secondary">数据平台</span>
+          <span class="badge badge--secondary">增长团队</span>
+          <span class="text-xs text-muted">+3 个</span>
+        </div>
+        <p class="text-xs text-muted">仅写入下方标记为「继承默认 / 设为值」的维度,其余维度保持各群原值。</p>
+      </div>
+
+      <!-- ── 维度 1:审批模式(保持不变)── -->
+      <div style="display:flex;flex-direction:column;gap:10px;padding-bottom:16px;">
+        <div class="col" style="gap:2px;">
+          <span class="settings-row__title">审批模式</span>
+          <span class="settings-row__desc">谁可以批准该会话里的工具调用。</span>
+        </div>
+        <div class="segmented">
+          <button class="segmented__item is-selected">保持不变</button>
+          <button class="segmented__item">继承默认</button>
+          <button class="segmented__item">设为值</button>
+        </div>
+      </div>
+
+      <hr class="divider divider--60">
+
+      <!-- ── 维度 2:命令白名单(设为值)── -->
+      <div style="display:flex;flex-direction:column;gap:10px;padding:16px 0;">
+        <div class="col" style="gap:2px;">
+          <span class="settings-row__title">命令白名单</span>
+          <span class="settings-row__desc">允许在会话中执行的斜杠命令集。</span>
+        </div>
+        <div class="segmented">
+          <button class="segmented__item">保持不变</button>
+          <button class="segmented__item">继承默认</button>
+          <button class="segmented__item is-selected">设为值</button>
+        </div>
+
+        <!-- 设为值:来源 + 命令编辑 -->
+        <div class="settings-row__expand">
+          <div style="border:1px solid var(--border);border-radius:var(--radius-lg);overflow:hidden;background:var(--card);">
+            <!-- 来源条 -->
+            <div class="row between" style="padding:8px 12px;border-bottom:1px solid color-mix(in oklab,var(--border) 60%,transparent);">
+              <span class="text-11 text-muted" style="text-transform:uppercase;letter-spacing:0.06em;font-weight:600;">来源</span>
+              <button class="select select--ghost" style="width:auto;min-width:0;min-height:24px;padding:0 6px;">
+                <span class="select__value">剪贴板 · 前端项目群</span>
+                <svg class="select__chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m6 9 6 6 6-6"/></svg>
+              </button>
+            </div>
+
+            <!-- floor:锁定 -->
+            <div class="row between" style="padding:8px 12px;border-top:1px solid color-mix(in oklab,var(--border) 50%,transparent);">
+              <div class="row gap-2">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:13px;height:13px;color:var(--muted-foreground);"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+                <span class="mono text-13">/help</span>
+              </div>
+              <span class="source-badge source-badge--builtin">内置 · 始终允许</span>
+            </div>
+            <div class="row between" style="padding:8px 12px;border-top:1px solid color-mix(in oklab,var(--border) 50%,transparent);">
+              <div class="row gap-2">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:13px;height:13px;color:var(--muted-foreground);"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+                <span class="mono text-13">/whoami</span>
+              </div>
+              <span class="source-badge source-badge--builtin">内置 · 始终允许</span>
+            </div>
+
+            <!-- 可选命令 -->
+            <label class="row between" style="padding:8px 12px;border-top:1px solid color-mix(in oklab,var(--border) 50%,transparent);cursor:pointer;">
+              <span class="mono text-13">/status</span>
+              <span class="checkbox is-checked"><svg class="checkbox__check" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3" fill="none"><path d="M5.252 12.7 10.2 18.63 18.748 5.37"/></svg></span>
+            </label>
+            <label class="row between" style="padding:8px 12px;border-top:1px solid color-mix(in oklab,var(--border) 50%,transparent);cursor:pointer;">
+              <span class="mono text-13">/resume</span>
+              <span class="checkbox is-checked"><svg class="checkbox__check" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3" fill="none"><path d="M5.252 12.7 10.2 18.63 18.748 5.37"/></svg></span>
+            </label>
+            <label class="row between" style="padding:8px 12px;border-top:1px solid color-mix(in oklab,var(--border) 50%,transparent);cursor:pointer;">
+              <span class="mono text-13">/model</span>
+              <span class="checkbox is-checked"><svg class="checkbox__check" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3" fill="none"><path d="M5.252 12.7 10.2 18.63 18.748 5.37"/></svg></span>
+            </label>
+            <label class="row between" style="padding:8px 12px;border-top:1px solid color-mix(in oklab,var(--border) 50%,transparent);cursor:pointer;">
+              <span class="row gap-2">
+                <span class="mono text-13">/workspace</span>
+                <span class="soft-pill soft-pill--warning">高危</span>
+              </span>
+              <span class="checkbox"></span>
+            </label>
+          </div>
+          <p class="text-11 text-muted" style="margin:6px 2px 0;">将写入 <span class="font-medium text-fg">3</span> 条命令(不含内置 floor)。</p>
+        </div>
+      </div>
+
+      <hr class="divider divider--60">
+
+      <!-- ── 维度 3:工作区(保持不变)── -->
+      <div style="display:flex;flex-direction:column;gap:10px;padding:16px 0;">
+        <div class="col" style="gap:2px;">
+          <span class="settings-row__title">工作区</span>
+          <span class="settings-row__desc">会话可访问的项目根目录。</span>
+        </div>
+        <div class="segmented">
+          <button class="segmented__item is-selected">保持不变</button>
+          <button class="segmented__item">继承默认</button>
+          <button class="segmented__item">设为值</button>
+        </div>
+      </div>
+
+      <hr class="divider divider--60">
+
+      <!-- ── 维度 4:密度(设为值)── -->
+      <div style="display:flex;flex-direction:column;gap:10px;padding:16px 0 4px;">
+        <div class="col" style="gap:2px;">
+          <span class="settings-row__title">卡片密度</span>
+          <span class="settings-row__desc">群聊内活动卡片的渲染形态。</span>
+        </div>
+        <div class="segmented">
+          <button class="segmented__item">保持不变</button>
+          <button class="segmented__item">继承默认</button>
+          <button class="segmented__item is-selected">设为值</button>
+        </div>
+        <div class="settings-row__expand">
+          <div class="segmented">
+            <button class="segmented__item">卡片</button>
+            <button class="segmented__item is-selected">Markdown</button>
+            <button class="segmented__item">纯文本</button>
+          </div>
+        </div>
+      </div>
+
+      <hr class="divider" style="margin:8px 0 16px;">
+
+      <!-- ── 影响预览(写入前 diff)── -->
+      <div class="effective-preview" style="margin-bottom:12px;">
+        <div class="effective-preview__head">
+          <span>影响预览 · 写入前</span>
+          <span style="margin-left:auto;text-transform:none;letter-spacing:normal;">
+            <span class="soft-pill soft-pill--primary">6 / 8 群将变更</span>
+          </span>
+        </div>
+        <div class="effective-preview__row">
+          <span class="effective-preview__key">前端项目群</span>
+          <span class="effective-preview__val">
+            命令 <span class="text-muted">继承</span>
+            <span class="text-muted" style="margin:0 2px;">→</span>
+            <span>3 项</span>
+          </span>
+        </div>
+        <div class="effective-preview__row">
+          <span class="effective-preview__key">设计评审群</span>
+          <span class="effective-preview__val">
+            密度 <span class="mono text-muted">card</span>
+            <span class="text-muted" style="margin:0 2px;">→</span>
+            <span class="mono">md</span>
+          </span>
+        </div>
+        <div class="effective-preview__row">
+          <span class="effective-preview__key">基础架构</span>
+          <span class="effective-preview__val">
+            命令 <span class="text-muted">2 项</span>
+            <span class="text-muted" style="margin:0 2px;">→</span>
+            <span>3 项</span>
+          </span>
+        </div>
+        <div class="effective-preview__row" style="justify-content:flex-start;gap:8px;">
+          <button class="btn btn--ghost btn--xs">展开全部 6 项</button>
+          <span class="text-11 text-muted">· 2 群值已相同,将跳过</span>
+        </div>
+      </div>
+
+      <!-- 名录外 open_id 警示 -->
+      <div class="inline-warning">
+        <svg class="inline-danger__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4M12 17h.01M10.3 4.3 2.6 18a2 2 0 0 0 1.7 3h15.4a2 2 0 0 0 1.7-3L13.7 4.3a2 2 0 0 0-3.4 0z"/></svg>
+        <div>
+          <span class="inline-danger__title">名录外成员将跳过</span> 复制的审批人 / 命令含名录外 open_id 时,目标群若无此人将自动跳过该项,并在写入后逐群提示。
+        </div>
+      </div>
+
+    </div>
+
+    <div class="sheet-footer">
+      <button class="btn btn--outline">取消</button>
+      <button class="btn btn--primary">套用到 8 群</button>
+    </div>
+  </aside>
+</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="screen" id="screen-5">
+        <div class="screen__label">
+          <span class="screen__eyebrow">屏 5</span>
+          <span class="screen__title">未绑定门闸 gate</span>
+          <span class="screen__desc">未绑定态:二维码占位 + 扫码绑定 CTA + 绑定后内容 stub。</span>
+        </div>
+        <div class="screen-frame">
+          <div class="screen-frame__chrome">
+            <span class="screen-frame__dots"><i></i><i></i><i></i></span>
+            <span class="screen-frame__name">设置 · 飞书 · 未绑定</span>
+          </div>
+          <div class="screen-frame__stage">
+<!-- ══════════════════════════════════════════════════════════════════════
+     屏 5 · 未绑定门闸(gate)
+     设置外壳(左栏「飞书」激活)+ 右内容区 = 未绑定 gate
+     ══════════════════════════════════════════════════════════════════════ -->
+<div class="settings-shell">
+  <!-- ── 左侧栏:7 项固定顺序,飞书 = 激活 ── -->
+  <aside class="settings-sidebar">
+    <nav class="settings-nav">
+      <button class="settings-nav__item">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/></svg>
+        <span>General</span>
+      </button>
+      <button class="settings-nav__item">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="16" x="2" y="4" rx="2"/><path d="M6 8h.01M10 8h.01M14 8h.01M18 8h.01M8 12h.01M12 12h.01M16 12h.01M7 16h10"/></svg>
+        <span>Keybindings</span>
+      </button>
+      <button class="settings-nav__item">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2M20 14h2M15 13v2M9 13v2"/></svg>
+        <span>Providers</span>
+      </button>
+      <button class="settings-nav__item">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>
+        <span>Source Control</span>
+      </button>
+      <button class="settings-nav__item">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+        <span>Connections</span>
+      </button>
+      <button class="settings-nav__item is-active">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></svg>
+        <span>飞书</span>
+      </button>
+      <button class="settings-nav__item">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="5" x="2" y="3" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/></svg>
+        <span>Archive</span>
+      </button>
+    </nav>
+    <div class="settings-sidebar__footer">
+      <button class="settings-nav__item">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>
+        <span>Back</span>
+      </button>
+    </div>
+  </aside>
+
+  <!-- ── 右主区 ── -->
+  <div class="settings-main">
+    <header class="settings-header">
+      <span>设置</span>
+      <button class="theme-toggle"  aria-label="切换主题">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+      </button>
+    </header>
+
+    <div class="settings-page">
+      <div class="settings-page__inner">
+
+        <!-- 页头:标题 + 未绑定态 -->
+        <div class="col" style="gap:6px;">
+          <div class="row" style="gap:10px;">
+            <h1 style="margin:0;font-size:20px;font-weight:600;letter-spacing:-0.01em;">飞书集成</h1>
+            <span class="soft-pill soft-pill--warning"><span class="status-dot"></span>未绑定</span>
+          </div>
+          <p class="text-13 text-muted" style="margin:0;">在飞书群 <span class="mono" style="font-size:12px;">@机器人</span> 驱动 coding agent —— 需先绑定 Bot 才能启用。</p>
+        </div>
+
+        <!-- ═══ gate 主卡:左二维码占位 + 右说明/CTA ═══ -->
+        <div class="card">
+          <div class="card__content" style="display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start;">
+
+            <!-- 左:CSS/SVG 画的二维码占位(靛蓝/中性网格方块 + 中心 logo) -->
+            <div class="col" style="gap:10px;align-items:center;flex-shrink:0;">
+              <div style="width:172px;height:172px;display:flex;align-items:center;justify-content:center;padding:15px;border:1px solid var(--border);border-radius:var(--radius-lg);background:var(--background);box-shadow:var(--hairline),var(--shadow-xs);">
+                <svg width="142" height="142" viewBox="0 0 29 29" fill="var(--foreground)" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="二维码占位">
+                  <!-- 三个定位角(finder patterns) -->
+                  <!-- TL -->
+                  <rect x="0" y="0" width="7" height="7" rx="1.6"/>
+                  <rect x="1" y="1" width="5" height="5" rx="1" fill="var(--background)"/>
+                  <rect x="2" y="2" width="3" height="3" rx="0.7"/>
+                  <!-- TR -->
+                  <rect x="22" y="0" width="7" height="7" rx="1.6"/>
+                  <rect x="23" y="1" width="5" height="5" rx="1" fill="var(--background)"/>
+                  <rect x="24" y="2" width="3" height="3" rx="0.7"/>
+                  <!-- BL -->
+                  <rect x="0" y="22" width="7" height="7" rx="1.6"/>
+                  <rect x="1" y="23" width="5" height="5" rx="1" fill="var(--background)"/>
+                  <rect x="2" y="24" width="3" height="3" rx="0.7"/>
+
+                  <!-- 数据模块(分离小方,rx 圆角;个别靛蓝强调) -->
+                  <g transform="translate(0.08,0.08)">
+                    <!-- timing:行 y=6 / 列 x=6 -->
+                    <rect x="8" y="6" width=".84" height=".84" rx=".22"/><rect x="10" y="6" width=".84" height=".84" rx=".22"/><rect x="12" y="6" width=".84" height=".84" rx=".22"/><rect x="14" y="6" width=".84" height=".84" rx=".22"/><rect x="16" y="6" width=".84" height=".84" rx=".22"/><rect x="18" y="6" width=".84" height=".84" rx=".22"/><rect x="20" y="6" width=".84" height=".84" rx=".22"/>
+                    <rect x="6" y="8" width=".84" height=".84" rx=".22"/><rect x="6" y="10" width=".84" height=".84" rx=".22"/><rect x="6" y="12" width=".84" height=".84" rx=".22"/><rect x="6" y="14" width=".84" height=".84" rx=".22"/><rect x="6" y="16" width=".84" height=".84" rx=".22"/><rect x="6" y="18" width=".84" height=".84" rx=".22"/><rect x="6" y="20" width=".84" height=".84" rx=".22"/>
+
+                    <!-- 顶部带 -->
+                    <rect x="8" y="0" width=".84" height=".84" rx=".22"/><rect x="9" y="2" width=".84" height=".84" rx=".22"/><rect x="11" y="1" width=".84" height=".84" rx=".22"/><rect x="13" y="3" width=".84" height=".84" rx=".22"/><rect x="15" y="0" width=".84" height=".84" rx=".22" fill="var(--primary)"/><rect x="17" y="2" width=".84" height=".84" rx=".22"/><rect x="19" y="1" width=".84" height=".84" rx=".22"/><rect x="20" y="3" width=".84" height=".84" rx=".22"/><rect x="21" y="5" width=".84" height=".84" rx=".22"/><rect x="8" y="3" width=".84" height=".84" rx=".22"/><rect x="10" y="4" width=".84" height=".84" rx=".22"/><rect x="12" y="5" width=".84" height=".84" rx=".22"/><rect x="14" y="5" width=".84" height=".84" rx=".22"/><rect x="16" y="4" width=".84" height=".84" rx=".22"/><rect x="18" y="5" width=".84" height=".84" rx=".22"/><rect x="20" y="1" width=".84" height=".84" rx=".22"/><rect x="21" y="2" width=".84" height=".84" rx=".22"/>
+
+                    <!-- 左带 -->
+                    <rect x="1" y="8" width=".84" height=".84" rx=".22"/><rect x="3" y="9" width=".84" height=".84" rx=".22"/><rect x="5" y="10" width=".84" height=".84" rx=".22"/><rect x="0" y="11" width=".84" height=".84" rx=".22"/><rect x="2" y="12" width=".84" height=".84" rx=".22"/><rect x="4" y="13" width=".84" height=".84" rx=".22" fill="var(--primary)"/><rect x="1" y="14" width=".84" height=".84" rx=".22"/><rect x="3" y="15" width=".84" height=".84" rx=".22"/><rect x="5" y="16" width=".84" height=".84" rx=".22"/><rect x="0" y="17" width=".84" height=".84" rx=".22"/><rect x="2" y="18" width=".84" height=".84" rx=".22"/><rect x="4" y="19" width=".84" height=".84" rx=".22"/><rect x="1" y="20" width=".84" height=".84" rx=".22"/><rect x="5" y="8" width=".84" height=".84" rx=".22"/><rect x="0" y="9" width=".84" height=".84" rx=".22"/>
+
+                    <!-- 右带 -->
+                    <rect x="23" y="8" width=".84" height=".84" rx=".22"/><rect x="25" y="9" width=".84" height=".84" rx=".22"/><rect x="27" y="10" width=".84" height=".84" rx=".22"/><rect x="22" y="11" width=".84" height=".84" rx=".22"/><rect x="24" y="12" width=".84" height=".84" rx=".22"/><rect x="26" y="13" width=".84" height=".84" rx=".22"/><rect x="28" y="14" width=".84" height=".84" rx=".22" fill="var(--primary)"/><rect x="23" y="15" width=".84" height=".84" rx=".22"/><rect x="25" y="16" width=".84" height=".84" rx=".22"/><rect x="27" y="17" width=".84" height=".84" rx=".22"/><rect x="22" y="18" width=".84" height=".84" rx=".22"/><rect x="24" y="19" width=".84" height=".84" rx=".22"/><rect x="26" y="20" width=".84" height=".84" rx=".22"/><rect x="28" y="9" width=".84" height=".84" rx=".22"/>
+
+                    <!-- 底部带 -->
+                    <rect x="8" y="23" width=".84" height=".84" rx=".22"/><rect x="9" y="25" width=".84" height=".84" rx=".22"/><rect x="11" y="22" width=".84" height=".84" rx=".22"/><rect x="13" y="24" width=".84" height=".84" rx=".22"/><rect x="15" y="23" width=".84" height=".84" rx=".22" fill="var(--primary)"/><rect x="17" y="25" width=".84" height=".84" rx=".22"/><rect x="19" y="22" width=".84" height=".84" rx=".22"/><rect x="21" y="24" width=".84" height=".84" rx=".22"/><rect x="23" y="23" width=".84" height=".84" rx=".22"/><rect x="25" y="25" width=".84" height=".84" rx=".22"/><rect x="27" y="22" width=".84" height=".84" rx=".22"/><rect x="8" y="27" width=".84" height=".84" rx=".22"/><rect x="10" y="26" width=".84" height=".84" rx=".22"/><rect x="12" y="28" width=".84" height=".84" rx=".22"/><rect x="14" y="27" width=".84" height=".84" rx=".22"/><rect x="16" y="26" width=".84" height=".84" rx=".22"/><rect x="18" y="28" width=".84" height=".84" rx=".22"/><rect x="20" y="26" width=".84" height=".84" rx=".22"/><rect x="22" y="27" width=".84" height=".84" rx=".22"/><rect x="24" y="28" width=".84" height=".84" rx=".22"/><rect x="26" y="26" width=".84" height=".84" rx=".22"/><rect x="28" y="24" width=".84" height=".84" rx=".22"/>
+
+                    <!-- 环绕中心 logo 的内圈 -->
+                    <rect x="8" y="9" width=".84" height=".84" rx=".22"/><rect x="8" y="11" width=".84" height=".84" rx=".22"/><rect x="8" y="13" width=".84" height=".84" rx=".22"/><rect x="8" y="15" width=".84" height=".84" rx=".22" fill="var(--primary)"/><rect x="8" y="17" width=".84" height=".84" rx=".22"/><rect x="8" y="19" width=".84" height=".84" rx=".22"/>
+                    <rect x="20" y="9" width=".84" height=".84" rx=".22"/><rect x="20" y="11" width=".84" height=".84" rx=".22"/><rect x="20" y="13" width=".84" height=".84" rx=".22" fill="var(--primary)"/><rect x="20" y="15" width=".84" height=".84" rx=".22"/><rect x="20" y="17" width=".84" height=".84" rx=".22"/><rect x="20" y="19" width=".84" height=".84" rx=".22"/>
+                    <rect x="9" y="8" width=".84" height=".84" rx=".22"/><rect x="11" y="8" width=".84" height=".84" rx=".22"/><rect x="13" y="8" width=".84" height=".84" rx=".22" fill="var(--primary)"/><rect x="15" y="8" width=".84" height=".84" rx=".22"/><rect x="17" y="8" width=".84" height=".84" rx=".22"/><rect x="19" y="8" width=".84" height=".84" rx=".22"/>
+                    <rect x="9" y="20" width=".84" height=".84" rx=".22"/><rect x="11" y="20" width=".84" height=".84" rx=".22"/><rect x="13" y="20" width=".84" height=".84" rx=".22"/><rect x="15" y="20" width=".84" height=".84" rx=".22" fill="var(--primary)"/><rect x="17" y="20" width=".84" height=".84" rx=".22"/><rect x="19" y="20" width=".84" height=".84" rx=".22"/>
+                  </g>
+
+                  <!-- 中心 logo 芯片 -->
+                  <rect x="9.6" y="9.6" width="9.8" height="9.8" rx="2.2" fill="var(--background)"/>
+                  <rect x="10.6" y="10.6" width="7.8" height="7.8" rx="2.4" fill="var(--primary)"/>
+                  <rect x="12.6" y="12.6" width="3.8" height="3.8" rx="1.1" fill="var(--background)"/>
+                  <rect x="13.75" y="13.75" width="1.5" height="1.5" rx=".4" fill="var(--primary)"/>
+                </svg>
+              </div>
+              <p class="text-11 text-muted" style="margin:0;text-align:center;max-width:172px;">示意二维码 · 点右侧按钮生成可扫描的绑定码</p>
+            </div>
+
+            <!-- 右:说明 + 三件事 + CTA -->
+            <div class="col grow" style="gap:16px;min-width:260px;">
+              <div class="col" style="gap:6px;">
+                <h2 style="margin:0;font-size:18px;font-weight:600;line-height:1.3;">先绑定飞书 Bot</h2>
+                <p class="text-13 text-muted" style="margin:0;line-height:1.6;">绑定后团队即可在飞书群 <span class="mono" style="font-size:12px;">@机器人</span> 驱动 coding agent。绑定会做三件事:</p>
+              </div>
+
+              <!-- 三件事清单 -->
+              <ol style="list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:12px;">
+                <li style="display:flex;gap:11px;align-items:flex-start;">
+                  <span style="flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:9999px;font-size:12px;font-weight:600;background:color-mix(in oklab,var(--primary) var(--soft-mix),transparent);color:var(--primary);">1</span>
+                  <div class="col" style="gap:2px;">
+                    <p style="margin:0;font-size:13px;font-weight:600;">关联飞书 App</p>
+                    <p class="text-xs text-muted" style="margin:0;line-height:1.55;">App Secret <span class="font-medium" style="color:var(--foreground);">只存服务端,不回传</span>浏览器。</p>
+                  </div>
+                </li>
+                <li style="display:flex;gap:11px;align-items:flex-start;">
+                  <span style="flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:9999px;font-size:12px;font-weight:600;background:color-mix(in oklab,var(--primary) var(--soft-mix),transparent);color:var(--primary);">2</span>
+                  <div class="col" style="gap:2px;">
+                    <p style="margin:0;font-size:13px;font-weight:600;">记录「授权人」= 扫码人</p>
+                    <p class="text-xs text-muted" style="margin:0;line-height:1.55;">扫码人成为该 Bot 的<span class="font-medium" style="color:var(--foreground);">授权人</span>,负责管理绑定与逐群配置。</p>
+                  </div>
+                </li>
+                <li style="display:flex;gap:11px;align-items:flex-start;">
+                  <span style="flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:9999px;font-size:12px;font-weight:600;background:color-mix(in oklab,var(--primary) var(--soft-mix),transparent);color:var(--primary);">3</span>
+                  <div class="col" style="gap:2px;">
+                    <p style="margin:0;font-size:13px;font-weight:600;">自动列出已加入的群</p>
+                    <p class="text-xs text-muted" style="margin:0;line-height:1.55;">Bot 已加入的群随后出现,可<span class="font-medium" style="color:var(--foreground);">逐群配置</span>权限。</p>
+                  </div>
+                </li>
+              </ol>
+
+              <!-- CTA + 护栏说明 -->
+              <div class="col" style="gap:10px;margin-top:2px;">
+                <button class="btn btn--primary btn--lg" style="align-self:flex-start;">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M7 12h10"/></svg>
+                  扫码绑定飞书 Bot
+                </button>
+                <div class="row" style="gap:6px;color:var(--muted-foreground);">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;"><rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                  <span class="text-11">仅 Bot 管理员可执行绑定 · Secret 全程不落浏览器</span>
+                </div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+
+        <!-- ═══ 虚线占位:绑定后这里显示 ═══ -->
+        <div style="border:1px dashed color-mix(in oklab,var(--border) 140%,transparent);border-radius:var(--radius-2xl);padding:20px;background:color-mix(in oklab,var(--muted) 28%,transparent);">
+          <div class="row between" style="margin-bottom:16px;">
+            <span class="settings-section__eyebrow" style="padding:0;"><span class="settings-section__tick"></span>绑定后这里显示</span>
+            <span class="soft-pill soft-pill--neutral">当前不可用</span>
+          </div>
+
+          <div style="display:flex;gap:14px;flex-wrap:wrap;">
+            <!-- 默认配置 stub -->
+            <div class="col grow" style="gap:10px;min-width:180px;opacity:0.55;">
+              <div class="row" style="gap:8px;">
+                <span style="display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:var(--radius-md);background:var(--muted);color:var(--muted-foreground);flex-shrink:0;">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/></svg>
+                </span>
+                <span class="text-13 font-semibold">默认配置</span>
+              </div>
+              <div class="col" style="gap:6px;">
+                <span style="display:block;height:7px;width:88%;border-radius:4px;background:color-mix(in oklab,var(--muted-foreground) 22%,transparent);"></span>
+                <span style="display:block;height:7px;width:64%;border-radius:4px;background:color-mix(in oklab,var(--muted-foreground) 22%,transparent);"></span>
+              </div>
+            </div>
+
+            <hr class="divider--v" style="align-self:stretch;" />
+
+            <!-- 群列表 stub -->
+            <div class="col grow" style="gap:10px;min-width:180px;opacity:0.55;">
+              <div class="row" style="gap:8px;">
+                <span style="display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:var(--radius-md);background:var(--muted);color:var(--muted-foreground);flex-shrink:0;">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+                </span>
+                <span class="text-13 font-semibold">群列表</span>
+              </div>
+              <div class="col" style="gap:6px;">
+                <span style="display:block;height:7px;width:92%;border-radius:4px;background:color-mix(in oklab,var(--muted-foreground) 22%,transparent);"></span>
+                <span style="display:block;height:7px;width:70%;border-radius:4px;background:color-mix(in oklab,var(--muted-foreground) 22%,transparent);"></span>
+              </div>
+            </div>
+
+            <hr class="divider--v" style="align-self:stretch;" />
+
+            <!-- 逐群权限 stub -->
+            <div class="col grow" style="gap:10px;min-width:180px;opacity:0.55;">
+              <div class="row" style="gap:8px;">
+                <span style="display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:var(--radius-md);background:var(--muted);color:var(--muted-foreground);flex-shrink:0;">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg>
+                </span>
+                <span class="text-13 font-semibold">逐群权限</span>
+              </div>
+              <div class="col" style="gap:6px;">
+                <span style="display:block;height:7px;width:80%;border-radius:4px;background:color-mix(in oklab,var(--muted-foreground) 22%,transparent);"></span>
+                <span style="display:block;height:7px;width:58%;border-radius:4px;background:color-mix(in oklab,var(--muted-foreground) 22%,transparent);"></span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</div>
+          </div>
+        </div>
+      </section>
+</main>
+
+<script>
+  (function () {
+    var root = document.documentElement;
+    document.querySelectorAll('.theme-toggle, .doc-theme-toggle').forEach(function (b) {
+      b.addEventListener('click', function () { root.classList.toggle('dark'); });
+    });
+  })();
+</script>
+</body>
+</html>
