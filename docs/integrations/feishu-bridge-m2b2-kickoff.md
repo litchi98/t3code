@@ -58,7 +58,7 @@
 - `apps/feishu-bot/src/bridge/callbackAuth.ts`:HMAC 验签(token `bridge_cb.v1.<payload>.<sig>`、`verify` 只读 nonce `state`、`computePolicyFingerprint`)。
 - `apps/feishu-bot/src/bridge/interactionCard.ts`:交互卡渲染/解析(approval 按钮组、user-input 统一 form = `select_static`/`multi_select_static`/`input` + 提交,自由输入优先,option description 在问题正文列出)+ `renderInteractionSection(pendingApprovals, pendingUserInputs, staleSet, resolvedNotice, ctx)`。
 - `apps/feishu-bot/src/runtime/persistence.ts`:`CallbackNonceStore`(持久化 nonce,value `{state,exp}` 过期清理)、`AuditStore`(append-only `(operatorOpenId,chatId,threadId,command,ts)`)、**`CardHandleStore`**(`chatId→{messageId,pendingRequestId,lastSequence}`,**M2b-1 已落定 + turn 路径 put,M2b-2 用于重启恢复消费**)。
-- `apps/feishu-bot/src/lark/{channel,index}.ts`:cardAction 监听 + `BridgeHandlers.onCardAction` + `LarkGateway.updateCard(messageId,card)` + `LarkGateway.getUser(openId)`(`rawClient.contact.user.get`,需飞书 `contact:user.base:readonly` scope,已配)。
+- `apps/feishu-bot/src/lark/{channel,index}.ts`:cardAction 监听 + `BridgeHandlers.onCardAction` + `LarkGateway.updateCard(messageId,card)` + `LarkGateway.getUser(openId)`(`rawClient.contact.user.get`,需飞书 `contact:user.base:readonly` scope——**⚠ 更正(2026-07-07):该 scope 实际从未配置**,`binding.ts` provision 清单里没有它;`getUser` 会 403 并回退裸 openId,见 memory `feishu-bridge-binding-display-facts`)。
 - `apps/feishu-bot/src/bot.ts`:`handleCardAction`(验签→校验 rid open→await nonceStore.consume→respondToThread*→audit→updateCard 回显)、`driveTurn`(per-turn streaming card + 每 tick `buildInteraction` 注入交互区 + `currentTurnId` 捕获/传递 + `cardHandles.put`)、`chatResolvedNotices` overlay(per-chat resolved 回显)、`chatOperators`(chatId→senderId)、operator 真名缓存。
 - `apps/feishu-bot/src/processGuard.ts`:进程级安全网(unhandledRejection 存活 / uncaughtException 仅 SDK-IO 错误存活)。
 - `apps/feishu-bot/src/bridge/eventRenderer.ts`:`renderThreadCard` 七分区雏形 + `currentTurnId`/`activeTurnId` turn 作用域过滤(正文/reasoning/工具/error)+ `clampElement` 30KB 字节降级。
@@ -74,7 +74,7 @@
 - **群聊 + 话题 = M3**(design.md:233 明确),M2b-2 仍只私聊。
 
 ## 需要用户提供
-**可验「卡片渲染 v2 + 重启恢复」的 e2e 环境**(沿用 M2b-1 runbook,已记 `feishu-bridge-m2b-impl-facts.md`):单台干净 `T3CODE_HOME` 的 `serve` 自带 web(先 `pnpm --filter @t3tools/web build`)+ 浏览器 + 飞书 bot 同连一台;切 `approval-required` 触发审批/工具/思考密集的 turn,肉眼对照卡片布局;**杀 bot 重启验重启恢复**(awaiting-approval 重渲审批卡)。bot 改代码需重启(`pkill -f 'src/main\.ts'` → 重签 pairing token `--base-dir` → 重起)。飞书 `contact:user.base:readonly` scope 已配。
+**可验「卡片渲染 v2 + 重启恢复」的 e2e 环境**(沿用 M2b-1 runbook,已记 `feishu-bridge-m2b-impl-facts.md`):单台干净 `T3CODE_HOME` 的 `serve` 自带 web(先 `pnpm --filter @t3tools/web build`)+ 浏览器 + 飞书 bot 同连一台;切 `approval-required` 触发审批/工具/思考密集的 turn,肉眼对照卡片布局;**杀 bot 重启验重启恢复**(awaiting-approval 重渲审批卡)。bot 改代码需重启(`pkill -f 'src/main\.ts'` → 重签 pairing token `--base-dir` → 重起)。飞书 `contact:user.base:readonly` scope——**⚠ 更正(2026-07-07):实际未配置**(见上)。
 
 ## 起步:M2b-2 第一动作
 **先派 Plan + 多个并行 Explore sub-agent**,摸清:(a) 现有 `eventRenderer.renderThreadCard` 七分区与工具/思考聚合的确切结构,产出**精简流式 v2 的布局方案 + 字节降级策略**供与用户确认;(b) approval(requestId)如何关联到对应 tool activity(payload/sequence/detail 匹配),以在工具面板渲「✅已授权」;(c) `/resume` 接管卡渲历史的最小接线(一次性 snapshot 渲 N 条);(d) `CardHandleStore` 重启恢复的完整接线(读表→重连→snapshot 校正→重渲审批卡/新发+旧卡失效);(e) `NoticeMemoryStore` 跨重启 dedup 持久化接线;(f) 配置收敛验证(接已配置 server 时 bot 配置面)。产出 M2b-2 任务清单 + **卡片 v2 布局方案**,**与我确认范围(尤其布局取舍)后再动手**。不要直接开写。
