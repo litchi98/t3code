@@ -7,7 +7,7 @@
  *  - {@link makeM18Recovery} builds `recoverPendingApprovalCards`, the M2b-2
  *    restart pass that re-renders outstanding approval cards with freshly-signed
  *    buttons and seeds each chat's dedup baseline (`CardHandle.pendingRequestId`
- *    + `chatOperators` + an early `ensureObserving`) so the shellWatcher's first
+ *    + `feishuInitiators` + an early `ensureObserving`) so the shellWatcher's first
  *    frame cannot race it into a duplicate card.
  *
  * §5.4 red line: the assembly runs `gateway.connect` →
@@ -118,8 +118,14 @@ export interface M18RecoveryDeps {
    * snapshot.
    */
   readonly chatDefaultsRef: Ref.Ref<FeishuChatConfig>;
-  /** Assembly-owned current-operator map; this pass SEEDS it post-restart. */
-  readonly chatOperators: Ref.Ref<ReadonlyMap<string, string>>;
+  /**
+   * Assembly-owned trusted per-thread Feishu-initiator map (`threadId` →
+   * operator open_id); this pass SEEDS it post-restart from the durable handle's
+   * recovered operator so the observe/surface paths sign approval cards for the
+   * recovered initiator across the restart (pin-drift fix). Written only by
+   * turn-establishing Feishu actions (`driveTurn` / `/resume` / M18).
+   */
+  readonly feishuInitiators: Ref.Ref<ReadonlyMap<ThreadId, string>>;
   /** Build signed approval and user-input controls for a thread. */
   readonly buildInteraction: (
     chatKey: string,
@@ -163,7 +169,7 @@ export const makeM18Recovery = (deps: M18RecoveryDeps): M18RecoveryHandle => {
     ownerRef,
     chatConfigsRef,
     chatDefaultsRef,
-    chatOperators,
+    feishuInitiators,
     buildInteraction,
     resolveDensity,
     ensureObserving,
@@ -253,21 +259,20 @@ export const makeM18Recovery = (deps: M18RecoveryDeps): M18RecoveryHandle => {
             );
           }
 
-          // 修法 3: seed the in-process `chatOperators` Ref with the recovered operator.
-          // That Ref is empty right after a restart (it is only written by inbound /
-          // `/resume`), so every render path that resolves the operator from it —
-          // observe (修法 2), 修法 A/B (`surfacePendingApprovalIfNew`), `driveTurn` —
-          // would sign post-restart approval buttons with an empty open id (dead
-          // buttons) until the next inbound message. Planting the durable handle's
-          // operator here means those paths pick up the recovered operator immediately,
-          // so the buttons verify across the restart even when observe lands on a fresh
-          // card (修法 1 starts observe right below). The recovered operator is seeded
-          // per composite key (chatId or chatId:larkThreadId), covering p2p, group,
-          // and topic chats; it is used for follow-on approval requests until the next
-          // inbound message refreshes `chatOperators`.
-          yield* Ref.update(chatOperators, (map) =>
-            new Map(map).set(chatId, handle.operatorOpenId),
-          );
+          // Seed the trusted `feishuInitiators` map with the recovered operator so the
+          // observe fiber started just below (修法 1) — and any follow-on approval that
+          // surfaces on this thread — signs `payload.o` for the recovered initiator
+          // across the restart, instead of an empty open id (dead buttons). The map is
+          // keyed by `threadId` (the observe / surface paths read it by threadId). Only
+          // a non-empty operator is planted; an empty one carries no authority (owner /
+          // designated / all can still approve — the gate ignores `payload.o` there —
+          // and `initiator` mode correctly has no clickable Feishu approver until the
+          // user acts, mirroring the empty-operator handling above).
+          if (handle.operatorOpenId.length > 0) {
+            yield* Ref.update(feishuInitiators, (map) =>
+              new Map(map).set(threadId, handle.operatorOpenId),
+            );
+          }
 
           // #7: bound the one-shot snapshot read. `subscribeThread` is `orDie`'d and
           // retries the subscription forever on an expected failure, so a thread
@@ -316,8 +321,9 @@ export const makeM18Recovery = (deps: M18RecoveryDeps): M18RecoveryHandle => {
           // Still pending (the original request, or a newer approval B): re-render
           // the approval card with freshly-signed buttons and push it onto the same
           // message id. #0/#1(b): re-sign for the operator captured on the handle
-          // (the `chatOperators` Ref is empty right after a restart) so the buttons
-          // verify correctly when clicked; the operator is re-checked at verify time.
+          // (the `feishuInitiators` map may be empty right after a restart, but the
+          // durable handle carries it) so the buttons verify correctly when clicked;
+          // the operator is re-checked at verify time.
           const interaction = yield* buildInteraction(
             chatId,
             snapshotThread,
@@ -346,9 +352,9 @@ export const makeM18Recovery = (deps: M18RecoveryDeps): M18RecoveryHandle => {
             // rendered — the SAME priority `buildInteraction`/`renderInteractionSection`
             // used (approval first, then user-input) — so the resident shellWatcher's
             // single-source dedup (`CardHandle.pendingRequestId`) matches the surfaced
-            // card and does NOT re-send a duplicate (which would also be signed with the
-            // post-restart-empty `chatOperators`, i.e. dead buttons). Reuse the recovered
-            // `messageId` and the persisted `operatorOpenId` (the Ref is still empty).
+            // card and does NOT re-send a duplicate (which would also be signed with an
+            // empty operator post-restart, i.e. dead buttons). Reuse the recovered
+            // `messageId` and the persisted `operatorOpenId` (the map may still be empty).
             const renderedRequestId =
               pendingApprovals[0]?.requestId ?? pendingUserInputs[0]?.requestId ?? null;
             yield* cardHandles

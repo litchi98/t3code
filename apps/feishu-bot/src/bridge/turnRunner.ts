@@ -97,6 +97,14 @@ export interface TurnRunnerDeps {
   readonly genId: <A>(brand: { readonly make: (value: string) => A }) => Effect.Effect<A>;
   /** The resolved `T3_MODEL` override for this session, or `null`. */
   readonly perTurnModelSelection: ModelSelection | null;
+  /**
+   * Assembly-owned trusted per-thread Feishu-initiator map (`threadId` →
+   * operator open_id). `driveTurn` records this Feishu turn's initiator here so a
+   * later observe fiber for the SAME thread signs approval cards for the real
+   * initiator, never a driftable last-sender ref (pin-drift fix). Written only by
+   * turn-establishing Feishu actions (`driveTurn` / `/resume` / M18).
+   */
+  readonly feishuInitiators: Ref.Ref<ReadonlyMap<ThreadId, string>>;
 }
 
 /** Handle returned by {@link makeTurnRunner}. */
@@ -128,6 +136,7 @@ export const makeTurnRunner = (deps: TurnRunnerDeps): Effect.Effect<TurnRunnerHa
       placeholderThread,
       genId,
       perTurnModelSelection,
+      feishuInitiators,
     } = deps;
 
     // Per-chat turn lock: guarantees at most one turn runs for a chat at a time
@@ -214,11 +223,22 @@ export const makeTurnRunner = (deps: TurnRunnerDeps): Effect.Effect<TurnRunnerHa
       // initiator — NOT for whoever last @-mentioned the bot mid-turn (a group
       // hazard: a later `@bot` would otherwise re-sign the buttons to a bystander
       // who could then approve, and lock the real initiator out). `undefined`
-      // (unreachable empty dispatch) falls back to the live Ref. For p2p the
-      // initiator equals the chat owner equals the Ref value → byte-identical.
+      // (unreachable empty dispatch) signs `payload.o` empty → owner-only in
+      // `initiator` mode; there is no last-sender ref to fall back to.
       initiatorOperatorOpenId?: string,
     ): Effect.Effect<void, never, Scope.Scope> =>
       Effect.gen(function* () {
+        // Record this Feishu-initiated turn's initiator into the trusted map, so a
+        // later observe fiber for the SAME thread (a chained subagent, or a follow-on
+        // turn) signs the approval card's `payload.o` for the REAL initiator rather
+        // than a driftable last-sender ref. driveTurn itself pins the initiator
+        // directly; this write is for the observe/surface paths that mirror the thread
+        // afterwards. Only a non-empty initiator carries authority.
+        if (initiatorOperatorOpenId !== undefined && initiatorOperatorOpenId.length > 0) {
+          yield* Ref.update(feishuInitiators, (map) =>
+            new Map(map).set(threadId, initiatorOperatorOpenId),
+          );
+        }
         const cardDone = yield* Deferred.make<void>();
         yield* Effect.gen(function* () {
           // M-3 PR-C3: resolve the placeholder first-frame density through the same

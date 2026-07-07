@@ -326,7 +326,7 @@ describe("effectiveConfig density fallback — mirrors the bot (所见=所判)",
   it("appends a chat-sourced density to the resting summary, not an inherited one", () => {
     // own density override shows in the row
     const own = effectiveConfig(CHAT, { [CHAT]: { density: "text" } }, {});
-    expect(restingChatSummary(own, true)).toBe("仅发起人 · 密度 纯文本");
+    expect(restingChatSummary(own, true)).toBe("仅会话发起者 · 密度 纯文本");
     // inherited density (from defaults) is NOT listed as this chat's override
     const inherited = effectiveConfig(
       CHAT,
@@ -429,7 +429,7 @@ describe("summary labels — compact resting/preview text", () => {
   it("overridden chat drops '继承默认' and appends only its OWN overridden dimensions", () => {
     // only workspaces overridden; approval inherited (initiator built-in)
     const eff = effectiveConfig(CHAT, { [CHAT]: { workspaces: ["p1", "p2"] } }, {});
-    expect(restingChatSummary(eff, true)).toBe("仅发起人 · 工作区 2 个");
+    expect(restingChatSummary(eff, true)).toBe("仅会话发起者 · 工作区 2 个");
     // an inherited commands restriction is NOT listed (only own overrides), so it
     // doesn't masquerade as this chat's override
     const eff2 = effectiveConfig(CHAT, { [CHAT]: { approvalMode: "all" } }, { commands: [] });
@@ -438,7 +438,7 @@ describe("summary labels — compact resting/preview text", () => {
 
   it("defaultsSummary lists审批/命令/工作区/密度 from the explicit defaults", () => {
     expect(defaultsSummary({})).toEqual([
-      { key: "审批", value: "仅发起人" },
+      { key: "审批", value: "仅会话发起者" },
       { key: "命令", value: "全部" },
       { key: "工作区", value: "全部" },
       { key: "密度", value: "卡片" },

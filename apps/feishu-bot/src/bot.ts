@@ -5,6 +5,7 @@ import {
   ModelSelection,
   ORCHESTRATION_WS_METHODS,
   type RuntimeMode,
+  type ThreadId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Console from "effect/Console";
@@ -283,13 +284,32 @@ const runBoundSession = (
         return resolveRenderDensity(runtimeMode, configDensity, binding?.density, groupChatDensity);
       });
 
-    // E④: composite chatKey → operator open id, captured from each inbound message.
-    // `chatOperators` records the most recent sender per composite key (chatId or
-    // chatId:larkThreadId). During a running turn the turn initiator is pinned via
-    // `operatorOverride`; after the turn ends `chatOperators` carries the last
-    // known sender as a fallback. The cardAction verify re-checks the actual
-    // clicker against the token's `o` field at click time.
-    const chatOperators = yield* Ref.make<ReadonlyMap<string, string>>(new Map());
+    // Session-operator map (security: pin-drift → `initiator`-mode bypass).
+    // `feishuInitiators` maps a session `threadId` → the Feishu open_id of the
+    // session's CURRENT operator: whoever most recently DROVE a turn or took over.
+    // `initiator` approval mode is DEFINED at session grain, not per-turn (see
+    // `authz.ts` SEMANTICS): the current operator approves the session's turns.
+    // Written ONLY by Feishu-side actions that establish/renew operatorship:
+    // `driveTurn` (a Feishu `@bot` turn's sender), `/resume` (the takeover command's
+    // sender), and M18 restart recovery (the durable handle's operator). It is NEVER
+    // written from a raw inbound sender, so a bystander `@`-mention cannot become
+    // operator — the only way to gain authority is to actually drive or take over.
+    //
+    // The observe / surface render paths sign an approval card's `payload.o` from
+    // THIS map (via `buildInteraction`'s `operatorOverride`), NOT from a per-chat
+    // "last sender" ref (which a bystander could drift while an observe turn keeps
+    // the chat `isChatBusy=false`). A session NO Feishu user has operated — e.g. a
+    // purely web/terminal-driven session the bot merely mirrors — has no entry →
+    // `payload.o` is signed empty → the `initiator`-mode gate rejects every non-owner
+    // click (owner-always still approves; the web end still approves via §11E). That
+    // removes the last driftable ref from the signing path, closing the escalation.
+    // The cardAction verify still re-checks the actual clicker against `o` at click time.
+    //
+    // Lifecycle: entries accumulate per `threadId` (overwrite-on-rewrite — the latest
+    // Feishu-side action wins), bounded by the number of threads the bot has driven or
+    // taken over; correctness never depends on eviction (a re-driven / re-resumed
+    // thread just overwrites its entry), so there is no explicit cleanup.
+    const feishuInitiators = yield* Ref.make<ReadonlyMap<ThreadId, string>>(new Map());
 
     // P2: per-chat resolved overlay — chatId → (requestId → {@link ResolvedNoticeEntry}).
     // The cardAction handler writes a resolved entry here on a successful respond;
@@ -314,7 +334,7 @@ const runBoundSession = (
         return next;
       });
 
-    const interaction = makeInteractionBuilder({ auth, chatOperators, chatResolvedNotices });
+    const interaction = makeInteractionBuilder({ auth, chatResolvedNotices });
     const { buildInteraction } = interaction;
 
     const envAccess = makeEnvAccess({ registry, environmentId, crypto });
@@ -373,7 +393,7 @@ const runBoundSession = (
       cardHandles,
       shellCache,
       isChatBusy,
-      chatOperators,
+      feishuInitiators,
       buildInteraction,
       resolveDensity,
       subscribeThread,
@@ -431,6 +451,7 @@ const runBoundSession = (
       placeholderThread,
       genId,
       perTurnModelSelection,
+      feishuInitiators,
     });
     const { runTurn, offlineBuffer } = turnRunner;
 
@@ -544,11 +565,9 @@ const runBoundSession = (
       ownerRef,
       chatConfigsRef,
       chatDefaultsRef,
-      chatOperators,
       bindings,
       ensureLock,
       turnQueue,
-      isChatBusy,
       commandTable,
       ensureThread,
       runTurn,
@@ -572,6 +591,8 @@ const runBoundSession = (
       nonceStore,
       audit,
       bindings,
+      cardHandles,
+      feishuInitiators,
       shellCache,
       gateway,
       ownerRef,
@@ -645,7 +666,7 @@ const runBoundSession = (
       ownerRef,
       chatConfigsRef,
       chatDefaultsRef,
-      chatOperators,
+      feishuInitiators,
       buildInteraction,
       resolveDensity,
       ensureObserving,
@@ -698,7 +719,7 @@ const runBoundSession = (
 
     // M18 restart recovery (extracted to `recovery.ts`): re-render outstanding
     // approval cards with freshly-signed buttons and seed each restored chat's
-    // dedup baseline (`CardHandle.pendingRequestId` + `chatOperators` + an early
+    // dedup baseline (`CardHandle.pendingRequestId` + `feishuInitiators` + an early
     // `ensureObserving`). §5.4: this runs AFTER `gateway.connect` above and BEFORE
     // `shellWatcher.start` below, so the watcher's first frame dedups against the
     // seeded baseline instead of racing recovery into a duplicate card.

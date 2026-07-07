@@ -18,17 +18,32 @@
  *  - Empty `clicker` is never authorized (an empty operator open_id must not match).
  *  - The configured binding **owner** may ALWAYS act (owner-always overlay), in any mode.
  *  - Otherwise the per-chat approval **mode** decides:
- *      · `initiator`  — only the turn initiator (the signed `payload.o`) may act.
+ *      · `initiator`  — only the session's current Feishu operator (the signed
+ *                       `payload.o`) may act. See the SEMANTICS note below.
  *      · `designated` — only an open_id in the configured `approvers` list may act.
  *      · `all`        — any chat member may act. A cardAction can only originate
  *                       from a member of the chat the card lives in, so any
  *                       non-empty `clicker` IS a member — no roster fetch needed.
  *
  * PR2a's env/store allowlist branch is gone: authority is now `owner` (binding)
- * + per-chat mode. `initiator` correctness rests on `payload.o` = the real turn
- * initiator, which the card token now signs directly (initiator-only, in
- * `buildInteraction`) and the per-turn operator pin (idle-guarded `chatOperators`
- * + `driveTurn`'s `operatorOverride`) keeps un-flippable by a mid-turn bystander.
+ * + per-chat mode.
+ *
+ * `initiator` SEMANTICS (deliberate product definition, §11E) — "initiator" is the
+ * session's CURRENT Feishu operator: the most recent person who DROVE a turn
+ * (`@bot`) or `/resume`d/took over this thread, NOT the per-turn author. Why session
+ * grain and not per-turn: a Feishu bot cannot key approval authority per turn — a
+ * server turn carries no initiator identity and no parent-turn link (the bot runs
+ * every turn under one headless account), so the only trustworthy correlation across
+ * the driveTurn→observe boundary is the session (threadId). We therefore DEFINE the
+ * approver at session grain: whoever currently operates the Feishu side of a session
+ * approves its turns — including ones a chained subagent or the web/terminal end
+ * raises within the SAME session. This is intentional, not a per-turn leak: becoming
+ * the operator requires actually driving or taking over (a raw bystander `@`-mention
+ * writes nothing), so a non-participant can never gain authority. The signed
+ * `payload.o` is that operator, read from the per-thread trusted `feishuInitiators`
+ * map (written only by `driveTurn` / `/resume` / M18, never a raw inbound). A session
+ * no Feishu user has operated signs `payload.o` empty → `initiator` rejects every
+ * non-owner (approve on the web / as owner). See `feishuInitiators` in bot.ts.
  */
 import { FEISHU_COMMAND_FLOOR } from "@t3tools/contracts";
 
@@ -44,7 +59,11 @@ export interface ApprovalClickAuthzInput {
   readonly approvers: ReadonlyArray<string>;
   /** The open_id of whoever clicked the card button (`evt.operator.openId`). */
   readonly clicker: string;
-  /** The signed initiator open_id embedded in the verified card payload (`payload.o`). */
+  /**
+   * The signed open_id embedded in the verified card payload (`payload.o`) — the
+   * session's current Feishu operator (see the module SEMANTICS note), NOT the
+   * per-turn author. Empty when no Feishu user has operated this session.
+   */
   readonly initiator: string;
 }
 
@@ -64,6 +83,9 @@ export const authorizeApprovalClick = (input: ApprovalClickAuthzInput): boolean 
   }
   switch (mode) {
     case "initiator":
+      // Session-operator match: `initiator` is the session's current Feishu operator
+      // (module SEMANTICS). Empty (no operator) never matches a non-empty clicker,
+      // so an un-operated session's card is owner-only / web-only.
       return clicker === initiator;
     case "designated":
       return approvers.includes(clicker);
