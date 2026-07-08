@@ -45,6 +45,7 @@ describe("collectFeishuChatDirectory", () => {
               ? [{ openId: "ou_a", name: "Alice" }, { openId: "ou_b" }]
               : [{ openId: "ou_c", name: "Carol" }],
           ),
+        getBotIdentity: Effect.succeed(undefined),
       };
 
       const entries = yield* collectFeishuChatDirectory(source);
@@ -82,6 +83,7 @@ describe("collectFeishuChatDirectory", () => {
             ? Effect.fail(larkError("chat.get failed"))
             : Effect.succeed({ chatMode: "group", memberCount: 1 }),
         listChatMembers: () => Effect.succeed([{ openId: "ou_x" }]),
+        getBotIdentity: Effect.succeed(undefined),
       };
 
       const entries = yield* collectFeishuChatDirectory(source);
@@ -108,6 +110,7 @@ describe("collectFeishuChatDirectory", () => {
         getChatInfo: () =>
           Effect.succeed({ chatMode: "group", ownerOpenId: "ou_o", memberCount: 3 }),
         listChatMembers: () => Effect.fail(larkError("members failed")),
+        getBotIdentity: Effect.succeed(undefined),
       };
 
       const entries = yield* collectFeishuChatDirectory(source);
@@ -131,6 +134,7 @@ describe("collectFeishuChatDirectory", () => {
         listChats: Effect.fail(larkError("chat.list failed")),
         getChatInfo: () => Effect.die("unreachable"),
         listChatMembers: () => Effect.die("unreachable"),
+        getBotIdentity: Effect.succeed(undefined),
       };
 
       const exit = yield* Effect.exit(collectFeishuChatDirectory(source));
@@ -144,17 +148,24 @@ describe("reportFeishuChatDirectory", () => {
   it.effect("does NOT report when the roster can't be enumerated (listChats fails)", () =>
     Effect.gen(function* () {
       const { registry, calls } = makeRecordingRegistry();
+      let botIdentityReads = 0;
       yield* reportFeishuChatDirectory({
         source: {
           listChats: Effect.fail(larkError("down")),
           getChatInfo: () => Effect.die("unreachable"),
           listChatMembers: () => Effect.die("unreachable"),
+          getBotIdentity: Effect.sync(() => {
+            botIdentityReads += 1;
+            return undefined;
+          }),
         },
         registry,
         environmentId: EnvironmentId.make("environment-test"),
       });
-      // No full-replace wipe: a failed enumeration must not send an empty roster.
+      // No full-replace wipe: a failed enumeration must not send an empty roster,
+      // and identity is never even collected (the report is skipped upstream).
       assert.equal(calls(), 0);
+      assert.equal(botIdentityReads, 0);
     }),
   );
 
@@ -166,6 +177,73 @@ describe("reportFeishuChatDirectory", () => {
           listChats: Effect.succeed([{ chatId: "oc_1", name: "One" }]),
           getChatInfo: () => Effect.succeed({ chatMode: "group" }),
           listChatMembers: () => Effect.succeed([]),
+          getBotIdentity: Effect.succeed({ appId: "cli_1", name: "Bot" }),
+        },
+        registry,
+        environmentId: EnvironmentId.make("environment-test"),
+      });
+      assert.equal(calls(), 1);
+    }),
+  );
+
+  it.effect("still reports (with identity) when the roster is empty but enumeration succeeds", () =>
+    Effect.gen(function* () {
+      // The承重 case: a p2p-only / brand-new binding enumerates to an empty roster,
+      // yet the report must still fire so the bot's identity reaches the server —
+      // it is the only carrier that surfaces the bot name/avatar with no groups.
+      const { registry, calls } = makeRecordingRegistry();
+      let botIdentityReads = 0;
+      yield* reportFeishuChatDirectory({
+        source: {
+          listChats: Effect.succeed([]),
+          getChatInfo: () => Effect.die("unreachable"),
+          listChatMembers: () => Effect.die("unreachable"),
+          getBotIdentity: Effect.sync(() => {
+            botIdentityReads += 1;
+            return { appId: "cli_1", name: "Bot", avatarUrl: "https://cdn/x.png" };
+          }),
+        },
+        registry,
+        environmentId: EnvironmentId.make("environment-test"),
+      });
+      assert.equal(calls(), 1);
+      assert.equal(botIdentityReads, 1);
+    }),
+  );
+
+  it.effect("still reports the roster when identity resolution yields undefined", () =>
+    Effect.gen(function* () {
+      const { registry, calls } = makeRecordingRegistry();
+      yield* reportFeishuChatDirectory({
+        source: {
+          listChats: Effect.succeed([{ chatId: "oc_1", name: "One" }]),
+          getChatInfo: () => Effect.succeed({ chatMode: "group" }),
+          listChatMembers: () => Effect.succeed([]),
+          getBotIdentity: Effect.succeed(undefined),
+        },
+        registry,
+        environmentId: EnvironmentId.make("environment-test"),
+      });
+      assert.equal(calls(), 1);
+    }),
+  );
+
+  it.effect("still reports the roster when identity resolution DEFECTS (red line)", () =>
+    Effect.gen(function* () {
+      // A DEFECT (not a typed failure) — e.g. a malformed raw `bot/v3/info` shape
+      // throwing in the avatar mapper. `getBotIdentity`'s typed error channel is
+      // `never`, so only a defect can reach here; it must NOT skip the report
+      // (the report-site `catchCause` swallows it), or an empty-but-successful
+      // roster would be lost whenever identity collection defects.
+      const { registry, calls } = makeRecordingRegistry();
+      yield* reportFeishuChatDirectory({
+        source: {
+          listChats: Effect.succeed([]),
+          getChatInfo: () => Effect.die("unreachable"),
+          listChatMembers: () => Effect.die("unreachable"),
+          getBotIdentity: Effect.die(
+            new TypeError("cannot read properties of null (reading 'bot')"),
+          ),
         },
         registry,
         environmentId: EnvironmentId.make("environment-test"),

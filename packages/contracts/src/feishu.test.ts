@@ -1,9 +1,11 @@
+import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
   FEISHU_COMMAND_FLOOR,
   FEISHU_COMMAND_REGISTRY,
   FEISHU_CONFIGURABLE_COMMANDS,
+  FeishuChatDirectorySnapshot,
 } from "./feishu.ts";
 
 describe("Feishu slash-command registry (M-3 PR-C)", () => {
@@ -37,5 +39,42 @@ describe("Feishu slash-command registry (M-3 PR-C)", () => {
       expect(command.token.startsWith("/")).toBe(true);
       expect(command.label.length).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("FeishuChatDirectorySnapshot botIdentity (M-3 PR-C4)", () => {
+  const decode = Schema.decodeUnknownSync(FeishuChatDirectorySnapshot);
+
+  it("decodes a snapshot carrying a full bot identity", () => {
+    const decoded = decode({
+      chats: [],
+      reportedAt: "2026-07-07T00:00:00Z",
+      botIdentity: { appId: "cli_abc", name: "Client Bot", avatarUrl: "https://cdn/a.png" },
+    });
+    expect(decoded.botIdentity).toEqual({
+      appId: "cli_abc",
+      name: "Client Bot",
+      avatarUrl: "https://cdn/a.png",
+    });
+  });
+
+  it("decodes an identity without an avatar (avatar is optional)", () => {
+    const decoded = decode({ chats: [], botIdentity: { appId: "cli_abc", name: "Client Bot" } });
+    expect(decoded.botIdentity).toEqual({ appId: "cli_abc", name: "Client Bot" });
+    expect("avatarUrl" in decoded.botIdentity!).toBe(false);
+  });
+
+  it("decodes an identity with an empty name (name may be empty)", () => {
+    const decoded = decode({ chats: [], botIdentity: { appId: "cli_abc", name: "" } });
+    expect(decoded.botIdentity).toEqual({ appId: "cli_abc", name: "" });
+  });
+
+  it("back-compat: decodes an older snapshot with no botIdentity at all", () => {
+    const decoded = decode({ chats: [], reportedAt: "2026-07-07T00:00:00Z" });
+    expect("botIdentity" in decoded).toBe(false);
+  });
+
+  it("rejects an identity with an empty appId (the re-bind association key)", () => {
+    expect(() => decode({ chats: [], botIdentity: { appId: "", name: "Bot" } })).toThrow();
   });
 });

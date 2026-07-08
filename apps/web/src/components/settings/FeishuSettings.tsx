@@ -6,7 +6,16 @@ import type {
   FeishuChatMember,
 } from "@t3tools/contracts";
 import { FEISHU_COMMAND_REGISTRY, FEISHU_CONFIGURABLE_COMMANDS } from "@t3tools/contracts";
-import { ChevronRightIcon, CopyIcon, LinkIcon, PlusIcon, UsersIcon, XIcon } from "lucide-react";
+import {
+  ChevronRightIcon,
+  CopyIcon,
+  EllipsisIcon,
+  LinkIcon,
+  PlusIcon,
+  UserIcon,
+  UsersIcon,
+  XIcon,
+} from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 
 import { cn } from "~/lib/utils";
@@ -17,9 +26,11 @@ import { serverEnvironment } from "~/state/server";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { usePrimarySettings, useUpdatePrimarySettings } from "../../hooks/useSettings";
 import { RightPanelSheet } from "../RightPanelSheet";
+import { Avatar } from "../ui/avatar";
 import { Badge } from "../ui/badge";
 import { SheetTitle } from "../ui/sheet";
 import { Button } from "../ui/button";
+import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Checkbox } from "../ui/checkbox";
 import { Input } from "../ui/input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
@@ -95,6 +106,14 @@ export function FeishuSettingsPanel() {
 function FeishuBindingSection() {
   const binding = usePrimarySettings((s) => s.feishuBinding);
   const environmentId = usePrimaryEnvironment()?.environmentId ?? null;
+  // The bot's display identity (name/avatar) and owner name ride the chat-directory
+  // snapshot, not `feishuBinding` (which carries only bare ids). Same query the
+  // per-chat section uses — the query atom family de-dupes by key, so subscribing
+  // here too shares one in-flight request. `botIdentity`/`chats` are absent until
+  // the bot has reported; every field below falls back to the bare id.
+  const { data: directory } = useEnvironmentQuery(
+    environmentId === null ? null : serverEnvironment.feishuListChats({ environmentId, input: {} }),
+  );
   const clearBinding = useAtomCommand(serverEnvironment.feishuClearBinding, "feishu unbind");
   const [dialogOpen, setDialogOpen] = useState(false);
   const [clearing, setClearing] = useState(false);
@@ -113,42 +132,99 @@ function FeishuBindingSection() {
     // section back to the unbound state on its own.
   }, [clearBinding, environmentId]);
 
+  // Bot display identity, gated on the app match: the snapshot refreshes only
+  // once per bot connect, so after a re-bind (app A → B) the stored identity may
+  // still be A's until B reports. Show name/avatar ONLY when the reported appId
+  // matches the CURRENT binding — otherwise fall back to the bare appId so a
+  // stale identity is never shown against the new binding.
+  const botIdentity = directory?.botIdentity;
+  const botIdentityMatches =
+    botIdentity !== undefined && binding !== undefined && botIdentity.appId === binding.appId;
+  const botName =
+    botIdentity !== undefined && botIdentityMatches && botIdentity.name.trim().length > 0
+      ? botIdentity.name
+      : null;
+  const botAvatarUrl =
+    botIdentity !== undefined && botIdentityMatches ? botIdentity.avatarUrl : undefined;
+
+  // Owner display name: reverse-lookup the CURRENT binding owner's open_id in the
+  // live roster's member lists (免疫 re-bind 过期 — always the current owner). The
+  // binding owner (the scan authoriser) need not be a member of any group, so a
+  // miss falls back to the bare open_id (never a fabricated name). Owner avatar is
+  // descoped (needs a contact scope + re-bind), so the owner shows an initial chip.
+  const ownerOpenId = binding?.ownerOpenId;
+  const ownerName =
+    ownerOpenId !== undefined
+      ? (directory?.chats.flatMap((chat) => chat.members).find((m) => m.openId === ownerOpenId)
+          ?.name ?? null)
+      : null;
+
   return (
     <SettingsSection title="飞书 Bot 绑定" icon={<LinkIcon className="size-3" />}>
       <div className="px-4 py-3 sm:px-5">
         {binding ? (
-          <div className="space-y-3">
-            <dl className="space-y-1.5 text-xs">
-              <div className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-3">
-                <dt className="text-muted-foreground">App ID</dt>
-                <dd className="truncate text-right font-mono text-foreground/90">
-                  {binding.appId}
-                </dd>
+          <div className="space-y-2.5">
+            {/* Bot identity banner: avatar + name (falls back to the bare appId),
+                with the appId as a secondary, copyable line. A "Lark" tag rides
+                the name only when the tenant is the international edition — the
+                common 飞书 case is already implied by the section title, so no
+                redundant "部署: 飞书" row. */}
+            <div className="flex items-center gap-3">
+              <Avatar
+                src={botAvatarUrl}
+                name={botName ?? undefined}
+                fallbackId={binding.appId}
+                size="md"
+              />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-1.5">
+                  <span className="truncate text-sm font-medium text-foreground">
+                    {botName ?? binding.appId}
+                  </span>
+                  {binding.tenant === "lark" ? (
+                    <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                      Lark
+                    </span>
+                  ) : null}
+                  {/* Binding owner (the scan authoriser, always allowed to approve)
+                      as a compact chip: person icon + name, falling back to the
+                      bare open_id. Replaces the standalone "Bot Owner" row. */}
+                  <span
+                    className="inline-flex min-w-0 shrink items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+                    title={`Bot Owner: ${binding.ownerOpenId}`}
+                  >
+                    <UserIcon className="size-2.5 shrink-0" />
+                    <span className={cn("truncate", ownerName ? "" : "font-mono")}>
+                      {ownerName ?? binding.ownerOpenId}
+                    </span>
+                  </span>
+                </div>
+                <div className="flex items-center gap-1">
+                  <span className="truncate font-mono text-[11px] text-muted-foreground">
+                    {binding.appId}
+                  </span>
+                  <CopyIdButton value={binding.appId} />
+                </div>
               </div>
-              <div className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-3">
-                <dt className="text-muted-foreground">部署</dt>
-                <dd className="text-right text-foreground/90">
-                  {binding.tenant === "lark" ? "Lark" : "飞书"}
-                </dd>
-              </div>
-              <div className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-3">
-                <dt className="text-muted-foreground">授权人</dt>
-                <dd className="truncate text-right font-mono text-foreground/90">
-                  {binding.ownerOpenId}
-                </dd>
-              </div>
-            </dl>
-            <div className="flex items-center justify-end gap-2">
-              {error ? <span className="mr-auto text-xs text-destructive">{error}</span> : null}
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={handleUnbind}
-                disabled={clearing || !environmentId}
-              >
-                {clearing ? "解绑中…" : "解绑"}
-              </Button>
+              <Menu>
+                <MenuTrigger
+                  disabled={!environmentId}
+                  render={<Button aria-label="更多操作" size="icon-xs" variant="ghost" />}
+                >
+                  <EllipsisIcon />
+                </MenuTrigger>
+                <MenuPopup align="end">
+                  <MenuItem
+                    variant="destructive"
+                    disabled={clearing || !environmentId}
+                    onClick={handleUnbind}
+                  >
+                    {clearing ? "解绑中…" : "解绑"}
+                  </MenuItem>
+                </MenuPopup>
+              </Menu>
             </div>
+            {error ? <p className="text-xs text-destructive">{error}</p> : null}
           </div>
         ) : (
           <div className="space-y-3">
