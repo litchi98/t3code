@@ -131,6 +131,20 @@ interface RawChatMembersClient {
   };
 }
 
+/**
+ * Narrow structural view of `channel.rawClient.request` for the bot-info probe
+ * (`GET /open-apis/bot/v3/info`). The SDK already calls this endpoint at connect
+ * to populate `channel.botIdentity`, but it only keeps `open_id` / `app_name`
+ * and discards `avatar_url`; we re-issue the same call through the raw client to
+ * recover the avatar (no extra scope — same rationale as {@link RawContactClient}).
+ */
+interface RawBotInfoClient {
+  readonly request: (payload: {
+    readonly url: string;
+    readonly method: "GET";
+  }) => Promise<{ readonly bot?: { readonly avatar_url?: string; readonly app_name?: string } }>;
+}
+
 /** Feishu caps chat-member pages at 100 rows. */
 const MEMBER_PAGE_SIZE = 100;
 
@@ -513,6 +527,60 @@ export const larkGatewayLayer = (config: FeishuCredentials): Layer.Layer<LarkGat
           return members;
         });
 
+      // Bot display identity for the web binding area (M-3 PR-C4). `appId` is the
+      // bound app's id (always present, the re-bind association key); `name` and
+      // `avatarUrl` both come from the SAME raw `bot/v3/info` call (the SDK keeps
+      // neither faithfully — it discards `avatar_url`, and its `channel.botIdentity
+      // .name` is already defaulted to the literal `"bot"` when the API omits
+      // `app_name`, which would FABRICATE a display name and violate the best-effort
+      // red line). Reading the raw `app_name` directly degrades a missing name to
+      // `""` (web then falls back to the bare appId), never a fabricated value. No
+      // extra scope. Fully fail-safe: the probe degrades to `{ appId, name: "" }`,
+      // and an empty appId yields `undefined` so a malformed identity never fails
+      // the whole `reportChats` decode.
+      const rawBotInfo = channel.rawClient as unknown as RawBotInfoClient;
+      const getBotIdentity: Effect.Effect<
+        { readonly appId: string; readonly name: string; readonly avatarUrl?: string } | undefined
+      > = Effect.gen(function* () {
+        const appId = config.appId.trim();
+        if (appId.length === 0) {
+          return undefined;
+        }
+        const info = yield* sdkCall("bot info", () =>
+          rawBotInfo.request({ url: "/open-apis/bot/v3/info", method: "GET" }),
+        ).pipe(
+          // The response is a raw SDK value (`as unknown as` view), so treat it as
+          // untrusted: a null / primitive / unexpected shape must degrade to
+          // empty name + no-avatar, NEVER throw (a defect here would escape
+          // `Effect.catch` — it only recovers typed failures — and bubble up to
+          // skip the whole report).
+          Effect.map((raw) => {
+            const shape = raw as {
+              readonly bot?: { readonly app_name?: unknown; readonly avatar_url?: unknown };
+            } | null;
+            const appName = shape?.bot?.app_name;
+            const avatar = shape?.bot?.avatar_url;
+            return {
+              name: typeof appName === "string" ? appName.trim() : "",
+              avatarUrl:
+                typeof avatar === "string" && avatar.trim().length > 0 ? avatar.trim() : undefined,
+            };
+          }),
+          // Best-effort — a probe failure must not block the report; degrade to a
+          // nameless, avatarless identity (web falls back to the bare appId).
+          Effect.catch(() =>
+            Effect.succeed({ name: "", avatarUrl: undefined as string | undefined }),
+          ),
+        );
+        return {
+          appId,
+          name: info.name,
+          ...(info.avatarUrl !== undefined && info.avatarUrl.length > 0
+            ? { avatarUrl: info.avatarUrl }
+            : {}),
+        };
+      });
+
       const addReaction = (messageId: string, emojiType: string) =>
         sdkCall("add reaction", () => channel.addReaction(messageId, emojiType));
 
@@ -534,6 +602,7 @@ export const larkGatewayLayer = (config: FeishuCredentials): Layer.Layer<LarkGat
         listChats,
         getChatInfo,
         listChatMembers,
+        getBotIdentity,
       });
     }),
   );

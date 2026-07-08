@@ -144,18 +144,51 @@ export const FeishuChatDirectoryEntry = Schema.Struct({
 export type FeishuChatDirectoryEntry = typeof FeishuChatDirectoryEntry.Type;
 
 /**
+ * The bound bot's display identity, collected by the bot at connect time and
+ * carried alongside the roster so the web binding area can show the bot's name
+ * and avatar instead of the bare `appId`.
+ *
+ * - `appId` is the association key: the snapshot refreshes only once per connect,
+ *   so between a re-bind (app A → app B) and B's first report the stored identity
+ *   still belongs to A. The web gates on `botIdentity.appId === binding.appId`
+ *   before showing the name/avatar, falling back to the bare appId when they
+ *   diverge so a stale identity is never shown against the new binding.
+ * - `name` is the app's display name (`bot/v3/info` `app_name`); may be empty.
+ * - `avatarUrl` is the bot's avatar (`bot/v3/info` `avatar_url`); best-effort —
+ *   absent when the field is missing or the fetch failed, so the web falls back
+ *   to an initial-letter avatar.
+ *
+ * All optional so an older `feishu-chat-directory.json` (written before this
+ * field existed) decodes unchanged.
+ */
+export const FeishuBotIdentity = Schema.Struct({
+  appId: TrimmedNonEmptyString,
+  name: TrimmedString,
+  avatarUrl: Schema.optionalKey(TrimmedNonEmptyString),
+});
+export type FeishuBotIdentity = typeof FeishuBotIdentity.Type;
+
+/**
  * A full roster snapshot. `reportedAt` (ISO 8601, server-stamped on save) is
- * absent until the bot has reported at least once. Returned by `feishu.listChats`.
+ * absent until the bot has reported at least once. `botIdentity` (bot name /
+ * avatar) is absent until the bot has reported at least once with it. Returned
+ * by `feishu.listChats`.
  */
 export const FeishuChatDirectorySnapshot = Schema.Struct({
   chats: Schema.Array(FeishuChatDirectoryEntry),
   reportedAt: Schema.optionalKey(Schema.String),
+  botIdentity: Schema.optionalKey(FeishuBotIdentity),
 });
 export type FeishuChatDirectorySnapshot = typeof FeishuChatDirectorySnapshot.Type;
 
-/** Payload of `feishu.reportChats` (bot → server): the full current roster. */
+/**
+ * Payload of `feishu.reportChats` (bot → server): the full current roster plus
+ * the bot's display identity (best-effort; absent when the bot couldn't resolve
+ * it — the roster still reports).
+ */
 export const FeishuReportChatsInput = Schema.Struct({
   chats: Schema.Array(FeishuChatDirectoryEntry),
+  botIdentity: Schema.optionalKey(FeishuBotIdentity),
 });
 export type FeishuReportChatsInput = typeof FeishuReportChatsInput.Type;
 

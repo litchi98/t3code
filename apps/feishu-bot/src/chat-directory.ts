@@ -41,7 +41,7 @@ import type { LarkGateway, LarkGatewayError } from "./lark/index.ts";
  */
 export type ChatDirectorySource = Pick<
   LarkGateway["Service"],
-  "listChats" | "getChatInfo" | "listChatMembers"
+  "listChats" | "getChatInfo" | "listChatMembers" | "getBotIdentity"
 >;
 
 /** The slice of {@link EnvironmentRegistry} the report needs (for stubbing). */
@@ -56,6 +56,15 @@ const UNKNOWN_CHAT_MODE = "unknown";
  * limit and drops the bot's whole connection. Real rosters are far smaller.
  */
 const MAX_TOTAL_MEMBER_ENTRIES = 50_000;
+
+/**
+ * Hard bound on bot-identity resolution at the report boundary. `getBotIdentity`
+ * is best-effort display metadata; it must never DELAY the one-shot roster report
+ * (a hung `bot/v3/info` probe has no HTTP timeout of its own) nor, via a defect,
+ * SKIP it. Combined with the `catchCause` at the call site, a timeout OR any
+ * defect degrades identity to `undefined` and the roster reports regardless.
+ */
+const BOT_IDENTITY_REPORT_TIMEOUT = "5 seconds";
 
 /**
  * Resolve one chat into a directory entry. Never fails: if `getChatInfo` fails
@@ -164,22 +173,38 @@ export const reportFeishuChatDirectory = (deps: {
   readonly environmentId: EnvironmentId;
 }): Effect.Effect<void> =>
   collectFeishuChatDirectory(deps.source).pipe(
-    Effect.flatMap((entries) => {
-      const { chats, truncated } = capRoster(entries);
-      const warn = truncated
-        ? Effect.logWarning(
+    Effect.flatMap((entries) =>
+      Effect.gen(function* () {
+        const { chats, truncated } = capRoster(entries);
+        if (truncated) {
+          yield* Effect.logWarning(
             `[feishu-bot] feishu chat directory: roster exceeded ${MAX_TOTAL_MEMBER_ENTRIES} member entries; truncated before report.`,
-          )
-        : Effect.void;
-      return warn.pipe(
-        Effect.andThen(
-          deps.registry.run(
-            deps.environmentId,
-            EnvironmentRpc.request(WS_METHODS.feishuReportChats, { chats }),
-          ),
-        ),
-      );
-    }),
+          );
+        }
+        // Bot display identity (name/avatar) for the web binding area (M-3
+        // PR-C4). Red line: identity collection must NEVER block or skip the
+        // roster report. `getBotIdentity`'s typed error channel is already
+        // `never`, but this yields INSIDE the `catchCause`-guarded report block,
+        // so a DEFECT (a malformed raw SDK shape) or a HUNG probe would otherwise
+        // skip/stall even an empty `{chats:[]}` report. Bound both here: `timeout`
+        // caps a hang and `catchCause` swallows the timeout failure AND any defect,
+        // degrading to `undefined` so the roster ALWAYS reports. Only member
+        // entries are capped; botIdentity is unaffected. Crucially this rides an
+        // EMPTY-but-successful roster too (p2p-only / brand-new binding), which is
+        // the only carrier that surfaces the bot's name/avatar with no groups.
+        const botIdentity = yield* deps.source.getBotIdentity.pipe(
+          Effect.timeout(BOT_IDENTITY_REPORT_TIMEOUT),
+          Effect.catchCause(() => Effect.succeed(undefined)),
+        );
+        yield* deps.registry.run(
+          deps.environmentId,
+          EnvironmentRpc.request(WS_METHODS.feishuReportChats, {
+            chats,
+            ...(botIdentity !== undefined ? { botIdentity } : {}),
+          }),
+        );
+      }),
+    ),
     Effect.catchCause((cause) =>
       Effect.logWarning(
         "[feishu-bot] feishu chat directory: report skipped (roster unavailable or RPC failed).",

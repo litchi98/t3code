@@ -194,5 +194,17 @@ export class LarkGateway extends Context.Service<
       ReadonlyArray<{ readonly openId: string; readonly name?: string }>,
       LarkGatewayError
     >;
+    /**
+     * Resolve the bound bot's display identity for the web binding area:
+     * `appId` (the bound app's id, always present), `name` (the app display name
+     * from `bot/v3/info` `app_name`, free — already fetched by the SDK at
+     * connect), and best-effort `avatarUrl` (`bot/v3/info` `avatar_url`, one raw
+     * call, no scope). Fully fail-safe: NEVER fails — an avatar fetch error
+     * degrades to `{ appId, name }`, and any deeper failure yields `undefined`,
+     * so it never blocks the chat-directory report. (M-3 PR-C4.)
+     */
+    readonly getBotIdentity: Effect.Effect<
+      { readonly appId: string; readonly name: string; readonly avatarUrl?: string } | undefined
+    >;
   }
 >()("@t3tools/feishu-bot/lark/LarkGateway") {}

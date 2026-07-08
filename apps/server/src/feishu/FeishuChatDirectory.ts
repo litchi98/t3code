@@ -20,8 +20,11 @@
  *
  * @module feishu/FeishuChatDirectory
  */
-import type { FeishuChatDirectorySnapshot } from "@t3tools/contracts";
-import { FeishuChatDirectoryEntry } from "@t3tools/contracts";
+import type { FeishuBotIdentity, FeishuChatDirectorySnapshot } from "@t3tools/contracts";
+import {
+  FeishuBotIdentity as FeishuBotIdentitySchema,
+  FeishuChatDirectoryEntry,
+} from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -44,6 +47,9 @@ const PersistedFeishuChatDirectory = Schema.Struct({
   version: Schema.Literal(1),
   chats: Schema.Array(FeishuChatDirectoryEntry),
   reportedAt: Schema.String,
+  // Bot display identity (M-3 PR-C4). optionalKey → an older file written before
+  // this field decodes unchanged; `version` stays `1` (no migration needed).
+  botIdentity: Schema.optionalKey(FeishuBotIdentitySchema),
 });
 type PersistedFeishuChatDirectory = typeof PersistedFeishuChatDirectory.Type;
 
@@ -74,11 +80,15 @@ export class FeishuChatDirectory extends Context.Service<
   {
     /**
      * Persist the full roster (full-replace). Stamps `reportedAt` from the
-     * server clock. Fails with {@link FeishuChatDirectoryError} on a write error
-     * — the RPC handler catches and logs it (the report loop is best-effort).
+     * server clock. `botIdentity` (bot name/avatar) is stored when the bot
+     * reported it (absent → the field is omitted, leaving any prior value
+     * cleared since this is a full replace). Fails with
+     * {@link FeishuChatDirectoryError} on a write error — the RPC handler catches
+     * and logs it (the report loop is best-effort).
      */
     readonly save: (
       chats: ReadonlyArray<FeishuChatDirectoryEntry>,
+      botIdentity?: FeishuBotIdentity,
     ) => Effect.Effect<void, FeishuChatDirectoryError>;
     /**
      * Read the persisted roster. Boot-tolerant: a missing file yields an empty
@@ -99,7 +109,7 @@ export const make = Effect.gen(function* () {
   // encode + atomic-write could race. Mirrors serverSettings' write semaphore.
   const writeLock = yield* Semaphore.make(1);
 
-  const save: FeishuChatDirectory["Service"]["save"] = (chats) =>
+  const save: FeishuChatDirectory["Service"]["save"] = (chats, botIdentity) =>
     writeLock
       .withPermits(1)(
         Effect.gen(function* () {
@@ -108,6 +118,7 @@ export const make = Effect.gen(function* () {
             version: 1,
             chats,
             reportedAt: DateTime.formatIso(now),
+            ...(botIdentity !== undefined ? { botIdentity } : {}),
           };
           const encoded = yield* encodePersistedFeishuChatDirectory(snapshot).pipe(
             Effect.mapError(
@@ -156,7 +167,11 @@ export const make = Effect.gen(function* () {
         (cause) => new FeishuChatDirectoryError({ operation: "decode", path: filePath, cause }),
       ),
     );
-    return { chats: decoded.chats, reportedAt: decoded.reportedAt };
+    return {
+      chats: decoded.chats,
+      reportedAt: decoded.reportedAt,
+      ...(decoded.botIdentity !== undefined ? { botIdentity: decoded.botIdentity } : {}),
+    };
   }).pipe(
     Effect.catchTag("FeishuChatDirectoryError", (error) =>
       Effect.logWarning(error.message).pipe(

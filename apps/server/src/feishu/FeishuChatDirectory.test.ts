@@ -65,6 +65,42 @@ describe("FeishuChatDirectory", () => {
     }).pipe(Effect.provide(makeStoreLayer())),
   );
 
+  it.effect("persists and reads back the bot identity when reported (M-3 PR-C4)", () =>
+    Effect.gen(function* () {
+      const store = yield* FeishuChatDirectory.FeishuChatDirectory;
+      const identity = { appId: "cli_abc", name: "Client Bot", avatarUrl: "https://cdn/a.png" };
+      yield* store.save(SAMPLE_CHATS, identity);
+
+      const snapshot = yield* store.read;
+      assert.deepEqual(snapshot.botIdentity, identity);
+      assert.deepEqual(snapshot.chats, SAMPLE_CHATS);
+    }).pipe(Effect.provide(makeStoreLayer())),
+  );
+
+  it.effect("omits botIdentity when the bot did not report one (back-compat)", () =>
+    Effect.gen(function* () {
+      const store = yield* FeishuChatDirectory.FeishuChatDirectory;
+      yield* store.save(SAMPLE_CHATS);
+
+      const snapshot = yield* store.read;
+      // optionalKey → absent, not `undefined`, so an older file decodes unchanged.
+      assert.isUndefined(snapshot.botIdentity);
+      assert.isFalse("botIdentity" in snapshot);
+    }).pipe(Effect.provide(makeStoreLayer())),
+  );
+
+  it.effect("clears a previously-reported identity on a report without one", () =>
+    Effect.gen(function* () {
+      const store = yield* FeishuChatDirectory.FeishuChatDirectory;
+      yield* store.save(SAMPLE_CHATS, { appId: "cli_abc", name: "Client Bot" });
+      yield* store.save(SAMPLE_CHATS);
+
+      const snapshot = yield* store.read;
+      // Full-replace: a later report without identity leaves it cleared.
+      assert.isUndefined(snapshot.botIdentity);
+    }).pipe(Effect.provide(makeStoreLayer())),
+  );
+
   it.effect("full-replaces the roster on a second save", () =>
     Effect.gen(function* () {
       const store = yield* FeishuChatDirectory.FeishuChatDirectory;

@@ -1263,7 +1263,7 @@ const makeWsRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
         [WS_METHODS.feishuReportChats]: (input) =>
           observeRpcEffect(
             WS_METHODS.feishuReportChats,
-            feishuChatDirectory.save(input.chats).pipe(
+            feishuChatDirectory.save(input.chats, input.botIdentity).pipe(
               Effect.catch((error) =>
                 Effect.logWarning("Failed to persist feishu chat directory report.").pipe(
                   Effect.annotateLogs({ cause: error }),
