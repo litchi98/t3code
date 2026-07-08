@@ -60,6 +60,7 @@ import {
   setConfigApprovalMode,
   setConfigCommands,
   setConfigDensity,
+  setP2pDensity,
   setConfigWorkspaces,
   setDefaultsApprovalMode,
   SOURCE_LABELS,
@@ -87,11 +88,104 @@ interface WorkspaceOption {
  * approve regardless of these settings (owner-always overlay in the bot).
  */
 export function FeishuSettingsPanel() {
+  // `feishuChatDefaults` is edited by TWO sibling sections — the private-chat section
+  // (`p2pDensity`) and the group section's defaults drawer (approval/commands/…/
+  // `density`). Both write the WHOLE object, so a per-section optimistic overlay
+  // could clobber the other's just-made edit during the write round-trip. Own ONE
+  // shared overlay here and pass it down, so every defaults edit accumulates on a
+  // single draft (same one-draft-ref pattern the group section uses for
+  // `feishuChatConfigs`).
+  const serverDefaults = usePrimarySettings((s) => s.feishuChatDefaults);
+  const update = useUpdatePrimarySettings();
+  const writeDefaults = useCallback(
+    (next: FeishuChatConfig) => update({ feishuChatDefaults: next }),
+    [update],
+  );
+  const [defaults, commitDefaults] = useOptimisticSetting(serverDefaults, writeDefaults);
   return (
     <SettingsPageContainer>
       <FeishuBindingSection />
-      <FeishuChatConfigSection />
+      <FeishuP2pSection defaults={defaults} commitDefaults={commitDefaults} />
+      <FeishuChatConfigSection defaults={defaults} commitDefaults={commitDefaults} />
     </SettingsPageContainer>
+  );
+}
+
+/** The updater form both defaults-editing sections use to commit to the shared overlay. */
+type CommitDefaults = (updater: (config: FeishuChatConfig) => FeishuChatConfig) => void;
+
+/**
+ * Private-chat (p2p) settings — a flat, always-visible section (NO drawer): the
+ * binding owner is the only p2p peer, and the only per-private-chat knob is the
+ * render density (approval / commands / workspace are owner-always, so免配). Renders
+ * only when a bot is bound. Data source is the BINDING owner (private chats are not
+ * in the roster / directory), with the owner's display name reverse-looked-up from
+ * the live chat directory (falls back to the bare open_id — never a fabricated name).
+ */
+function FeishuP2pSection({
+  defaults,
+  commitDefaults,
+}: {
+  defaults: FeishuChatConfig;
+  commitDefaults: CommitDefaults;
+}) {
+  const binding = usePrimarySettings((s) => s.feishuBinding);
+  const environmentId = usePrimaryEnvironment()?.environmentId ?? null;
+  // Same chat-directory query the binding + group sections use — the query atom
+  // family de-dupes by key, so this shares one in-flight request. Only needed for the
+  // owner's display name; absent until the bot reports.
+  const { data: directory } = useEnvironmentQuery(
+    environmentId === null ? null : serverEnvironment.feishuListChats({ environmentId, input: {} }),
+  );
+
+  // Unbound → nothing to configure (mirrors the binding section's unbound state; the
+  // owner id lives on the binding).
+  if (!binding) return null;
+
+  const ownerOpenId = binding.ownerOpenId;
+  const ownerName =
+    directory?.chats.flatMap((chat) => chat.members).find((m) => m.openId === ownerOpenId)?.name ??
+    null;
+  // `??` coalesce is REQUIRED: `DensityDimension` highlights the segment where
+  // `value === option.value`, and with `includeInherit={false}` there is no
+  // `undefined` option — so an unset `p2pDensity` must render as the built-in `card`
+  // (matching the bot's `resolveP2pDensity`), or no segment would highlight and a
+  // hard refresh would show nothing selected.
+  const density = defaults.p2pDensity ?? "card";
+
+  return (
+    <SettingsSection title="私聊" icon={<UserIcon className="size-3" />}>
+      <div className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-5">
+        <div className="min-w-0 flex-1 space-y-1">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="truncate font-medium text-[13px] text-foreground">
+              {ownerName ?? ownerOpenId}
+            </span>
+            <span className="inline-flex shrink-0 items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+              <UserIcon className="size-2.5 shrink-0" />
+              授权人
+            </span>
+            {ownerName ? (
+              <span className="truncate font-mono text-[10px] text-muted-foreground/70">
+                {ownerOpenId}
+              </span>
+            ) : null}
+          </div>
+          <p className="text-[11px] text-muted-foreground/80">
+            私聊仅授权人可用 —— 审批 / 命令 / 工作区由{" "}
+            <span className="font-mono">owner-always</span> 规则免配,仅「消息密度」可个性化。
+          </p>
+        </div>
+        <div className="shrink-0">
+          <DensityDimension
+            value={density}
+            includeInherit={false}
+            ariaLabel="私聊消息密度"
+            onChange={(next) => commitDefaults((current) => setP2pDensity(current, next))}
+          />
+        </div>
+      </div>
+    </SettingsSection>
   );
 }
 
@@ -335,20 +429,27 @@ type DrawerTarget =
  * Master-detail per-chat config: a group section whose card lists a "默认配置"
  * baseline entry plus one quiet resting-summary row per group. Clicking a row (or
  * the baseline) slides out a right-hand drawer with that config's dimension
- * editors. The section owns BOTH optimistic overlays (`feishuChatConfigs` and
- * `feishuChatDefaults`) so the baseline summary, per-chat resting summaries, and
- * the drawer editors all read one consistent in-flight value — and so the drawer
- * renders the LIVE config (never a snapshot frozen at click time, which would show
- * stale/empty after a hard refresh; see the hydration note on `useOptimisticSetting`).
+ * editors. The section owns the `feishuChatConfigs` optimistic overlay itself and
+ * receives the SHARED `feishuChatDefaults` overlay (`defaults`/`commitDefaults`) as
+ * props from `FeishuSettingsPanel` (also written by the private-chat section) — so
+ * the baseline summary, per-chat resting summaries, and the drawer editors all read
+ * one consistent in-flight value, and the drawer renders the LIVE config (never a
+ * snapshot frozen at click time, which would show stale/empty after a hard refresh;
+ * see the hydration note on `useOptimisticSetting`).
  */
-function FeishuChatConfigSection() {
+function FeishuChatConfigSection({
+  defaults,
+  commitDefaults,
+}: {
+  defaults: FeishuChatConfig;
+  commitDefaults: CommitDefaults;
+}) {
   const environmentId = usePrimaryEnvironment()?.environmentId ?? null;
   const { data, error, isPending } = useEnvironmentQuery(
     environmentId === null ? null : serverEnvironment.feishuListChats({ environmentId, input: {} }),
   );
 
   const serverConfigs = usePrimarySettings((s) => s.feishuChatConfigs) as FeishuChatConfigMap;
-  const serverDefaults = usePrimarySettings((s) => s.feishuChatDefaults);
   const update = useUpdatePrimarySettings();
   const writeConfigs = useCallback(
     (next: FeishuChatConfigMap) => update({ feishuChatConfigs: next }),
@@ -361,11 +462,9 @@ function FeishuChatConfigSection() {
     },
     [commitConfigs],
   );
-  const writeDefaults = useCallback(
-    (next: FeishuChatConfig) => update({ feishuChatDefaults: next }),
-    [update],
-  );
-  const [defaults, commitDefaults] = useOptimisticSetting(serverDefaults, writeDefaults);
+  // `defaults` / `commitDefaults` are the SHARED `feishuChatDefaults` overlay owned by
+  // `FeishuSettingsPanel` (also written by the private-chat section) — passed in so
+  // both sections accumulate onto one draft instead of clobbering each other.
 
   // Workspace-allowlist options: the projects on THIS (primary) environment — the
   // one the bot is bound to. `useProjects()` aggregates every environment, so
@@ -376,8 +475,9 @@ function FeishuChatConfigSection() {
       ? []
       : allProjects.filter((project) => project.environmentId === environmentId);
 
-  // Group/topic chats only — p2p (single-user) chats have no approval roster and
-  // always fall back to the initiator/owner path, so there is nothing to configure.
+  // Group/topic chats only — p2p (single-user) chats have no approval roster (approval
+  // is owner-always) and, in practice, are not in the roster at all; their one knob
+  // (message density) lives in the separate private-chat section above.
   const chats = (data?.chats ?? []).filter((chat) => chat.chatMode !== "p2p");
 
   // The drawer stores only its TARGET (a chatId or the defaults sentinel), never a
@@ -813,7 +913,7 @@ function DefaultsDrawer({
         />
         <DensityDimension
           title="默认消息密度"
-          description="未单独配置的群聊都用这个密度(私聊始终用卡片)。"
+          description="未单独配置的群聊都用这个密度(私聊密度在上方「私聊」区单独配置)。"
           value={defaults.density ?? DEFAULT_GROUP_DENSITY}
           includeInherit={false}
           ariaLabel="默认消息密度"
@@ -942,11 +1042,12 @@ function ModeSelect({
 }
 
 /**
- * Render-density dimension: a segmented control (design-spec form) over a label +
- * description. `includeInherit` prepends a "继承默认" option (per-chat) that maps to
- * `undefined`; the defaults editor omits it (density is always an explicit value
- * there). This dimension is group-only — the bot forces p2p private chats to 卡片
- * regardless — so only group/topic drawers render it.
+ * Render-density dimension: a segmented control (design-spec form), optionally over
+ * a label + description. `includeInherit` prepends a "继承默认" option (per-chat) that
+ * maps to `undefined`; the defaults editor omits it (density is always an explicit
+ * value there). Used by BOTH the group/topic drawers (with a title/description) and
+ * the private-chat section (bare control — the section's owner line is its label;
+ * the bot renders p2p at the configurable `p2pDensity`, M-3 p2p-density).
  */
 function DensityDimension({
   title,
@@ -956,8 +1057,8 @@ function DensityDimension({
   ariaLabel,
   onChange,
 }: {
-  title: string;
-  description: string;
+  title?: string;
+  description?: string;
   value: RenderDensity | undefined;
   includeInherit: boolean;
   ariaLabel: string;
@@ -977,10 +1078,16 @@ function DensityDimension({
   ];
   return (
     <div className="space-y-2">
-      <div className="min-w-0">
-        <p className="font-medium text-foreground/90 text-xs">{title}</p>
-        <p className="text-[11px] text-muted-foreground/80">{description}</p>
-      </div>
+      {title !== undefined || description !== undefined ? (
+        <div className="min-w-0">
+          {title !== undefined ? (
+            <p className="font-medium text-foreground/90 text-xs">{title}</p>
+          ) : null}
+          {description !== undefined ? (
+            <p className="text-[11px] text-muted-foreground/80">{description}</p>
+          ) : null}
+        </div>
+      ) : null}
       {/* Segmented control: connected buttons, selected = bg-accent (design spec).
           A radiogroup so density is a single-select choice with keyboard semantics. */}
       <div role="radiogroup" aria-label={ariaLabel} className="inline-flex w-fit">

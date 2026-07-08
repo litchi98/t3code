@@ -404,9 +404,19 @@ export const FeishuChatConfig = Schema.Struct({
   ),
   // Group-chat render density (M-3 PR-C3 consumes). Absent → field-level fallback
   // resolved by the bot's `resolveDensity` (per-chat → defaults → bind-time
-  // binding density → the group default `card`). p2p private chats are always
-  // `card` regardless; only a group/topic chat honours a lowered density.
+  // binding density → the group default `card`). Only a group/topic chat honours
+  // this field; a p2p private chat's density is `p2pDensity` below.
   density: Schema.optional(Schema.Literals(FEISHU_RENDER_DENSITIES)),
+  // Private-chat (p2p) render density (M-3 p2p-density). Meaningful ONLY on
+  // `feishuChatDefaults` — a per-chat (group) config entry ignores it, since p2p
+  // chats never carry a per-chat entry (they are not in the roster). INDEPENDENT
+  // of `density` (the group default): editing one never moves the other, so the
+  // owner can lower private-chat noise without touching group chats. Absent →
+  // `card` (the bot's `resolveP2pDensity`), preserving the pre-M3 "p2p always
+  // card" default while letting the owner opt a private chat down to
+  // `markdown` / `text` (approval buttons survive every density — the interaction
+  // section is injected unconditionally by the renderer).
+  p2pDensity: Schema.optional(Schema.Literals(FEISHU_RENDER_DENSITIES)),
 });
 export type FeishuChatConfig = typeof FeishuChatConfig.Type;
 

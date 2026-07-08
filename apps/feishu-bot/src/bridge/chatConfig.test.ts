@@ -3,7 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 import { FEISHU_RENDER_DENSITIES } from "@t3tools/contracts";
 
 import { DEFAULT_APPROVAL_MODE, effectiveChatConfig } from "./chatConfig.ts";
-import { resolveRenderDensity } from "./chatThreadMap.ts";
+import { rendersAtP2pDensity, resolveP2pDensity, resolveRenderDensity } from "./chatThreadMap.ts";
 import { RENDER_DENSITIES } from "./eventRenderer.ts";
 
 const CHAT = "oc_group_a";
@@ -75,23 +75,52 @@ describe("effectiveChatConfig — field-level fallback", () => {
   });
 });
 
-describe("resolveRenderDensity — p2p gate + group precedence (PR-C3)", () => {
-  it("forces p2p (full-access) to card REGARDLESS of config or binding density", () => {
-    // The invariant that a group default / per-chat density must NEVER lower a
-    // private chat below `card` (M3b, mirrored by densityForRuntime).
-    expect(resolveRenderDensity("full-access", "text", "markdown", "text")).toBe("card");
-    expect(resolveRenderDensity("full-access", undefined, undefined, "text")).toBe("card");
+describe("resolveP2pDensity — private-chat density (M-3 p2p-density)", () => {
+  it("returns the configured p2pDensity when set (放开 p2p 硬门:所见=所判)", () => {
+    // The old M3b invariant FORCED every private chat to `card`; p2p density is now
+    // configurable via `feishuChatDefaults.p2pDensity`, and the bot renders whatever
+    // is set — so the web control and the bot agree.
+    expect(resolveP2pDensity("text")).toBe("text");
+    expect(resolveP2pDensity("markdown")).toBe("markdown");
+    expect(resolveP2pDensity("card")).toBe("card");
   });
 
+  it("defaults to card when unset (preserves the pre-M3 p2p-always-card default)", () => {
+    expect(resolveP2pDensity(undefined)).toBe("card");
+  });
+});
+
+describe("rendersAtP2pDensity — density follows the CHAT not the thread (M-3 p2p-density)", () => {
+  it("the stamped chatIsP2p is AUTHORITATIVE over the (web-mutable) thread runtimeMode", () => {
+    // A stamped p2p chat is p2p even if its thread was flipped to approval-required
+    // (cross-context /resume, or a web composer mode change).
+    expect(rendersAtP2pDensity("approval-required", true)).toBe(true);
+    expect(rendersAtP2pDensity("full-access", true)).toBe(true);
+    // A stamped GROUP chat is NOT p2p even if its thread was flipped to full-access on
+    // the web — the stamp VETOes the runtime-mode heuristic (the #A regression fix).
+    expect(rendersAtP2pDensity("full-access", false)).toBe(false);
+    expect(rendersAtP2pDensity("approval-required", false)).toBe(false);
+  });
+
+  it("an unstamped (legacy) binding falls back to the full-access ⟹ p2p heuristic", () => {
+    // Correct for the common fresh-p2p case (full-access thread); a stale
+    // approval-required-in-p2p legacy binding self-heals on next use (see ensureThread).
+    expect(rendersAtP2pDensity("full-access", undefined)).toBe(true);
+    expect(rendersAtP2pDensity("approval-required", undefined)).toBe(false);
+  });
+});
+
+describe("resolveRenderDensity — group/topic precedence (PR-C3)", () => {
   it("group/topic precedence: config > binding > groupChatDensity", () => {
+    // p2p is resolved separately (`resolveP2pDensity`); this function only handles
+    // group/topic chats now, so there is no full-access branch — a group default can
+    // never cross into a private chat because the two paths never meet.
     // per-chat/defaults config wins
-    expect(resolveRenderDensity("approval-required", "text", "markdown", "card")).toBe("text");
+    expect(resolveRenderDensity("text", "markdown", "card")).toBe("text");
     // no config → the bind-time binding density
-    expect(resolveRenderDensity("approval-required", undefined, "markdown", "card")).toBe(
-      "markdown",
-    );
+    expect(resolveRenderDensity(undefined, "markdown", "card")).toBe("markdown");
     // no config, no binding → the env group default
-    expect(resolveRenderDensity("approval-required", undefined, undefined, "text")).toBe("text");
+    expect(resolveRenderDensity(undefined, undefined, "text")).toBe("text");
   });
 });
 

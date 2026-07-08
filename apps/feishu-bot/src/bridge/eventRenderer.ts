@@ -61,6 +61,7 @@ import {
   renderErrorBannerFirstLine,
   renderHeader,
   renderStatusLine,
+  runtimeBadgeSuffix,
   statusMetaSuffix,
   turnDuration,
 } from "./render/status.ts";
@@ -197,11 +198,19 @@ export const renderThreadCard = (
 
   // 1. Header (title + runtime badge; always renderable). Skipped when
   // `opts.chrome === false` (notice/status cards that carry only a short text
-  // body and have no meaningful title to surface).
+  // body and have no meaningful title to surface). Only `card` renders the header;
+  // the low-noise `markdown` / `text` densities drop the title header and instead
+  // append the runtime badge to the END of the status line (see `badgeSuffix`
+  // below) — a full-access (`bypass`) / auto-accept-edits (`editable`) mode is a
+  // security signal that must stay visible at every density, without its own row.
   const withChrome = opts.chrome !== false;
   if (density === "card" && withChrome) {
     elements.push(renderHeader(thread));
   }
+  // The runtime badge suffix for the low-noise densities (card carries it in the
+  // header instead; chrome=false notice cards suppress it like the header). Folded
+  // onto the status line / error-fallback line below.
+  const badgeSuffix = density !== "card" && withChrome ? runtimeBadgeSuffix(thread) : "";
 
   // 2. Top error banner (session.lastError). Above the body; kept even when
   // chrome=false (a hard session error still surfaces on a notice card). Turn
@@ -233,16 +242,19 @@ export const renderThreadCard = (
     // latestTurn, and a streaming-but-snapshot-lagging turn is "running" (not
     // "done"), so this filters only the genuine never-run case. (#11 follow-up)
     const suppressIdleDone = thread.latestTurn === null && turnStatus === "done";
-    // Low-noise densities drop the ` · 📁 ws · 🌿 branch` meta suffix; only `card`
-    // carries it (workspace/branch are low value in a noisy group thread).
-    const statusMeta = density === "card" ? statusMetaSuffix(thread) : "";
+    // Low-noise densities drop the ` · 📁 ws · 🌿 branch` meta suffix (only `card`
+    // carries it — workspace/branch are low value in a noisy group thread) but fold
+    // the runtime badge onto the status line's end instead of a dedicated row.
+    const statusMeta = density === "card" ? statusMetaSuffix(thread) : badgeSuffix;
     const statusLine = suppressIdleDone
       ? null
       : renderStatusLine(turnStatus, turnDuration(thread), statusMeta);
     if (statusLine) {
       elements.push(statusLine);
     } else if (turnStatus === "error" && banner === null) {
-      elements.push(markdown("⚠️ 出错"));
+      // ERROR emits no status line; the ⚠️ fallback carries the badge suffix so a
+      // full-access errored turn still surfaces `bypass` at the low-noise densities.
+      elements.push(markdown(`⚠️ 出错${badgeSuffix}`));
     }
   }
 

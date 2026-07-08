@@ -90,6 +90,10 @@ export interface ObserveMirrorHandle {
   readonly startMirror: (
     chatId: string,
     threadId: ThreadId,
+    // M-3 p2p-density: whether the resuming chat is p2p (from `/resume`'s chatType),
+    // stamped onto the re-bound binding so `resolveDensity` keeps honouring
+    // `p2pDensity` even though the adopted thread is `approval-required`.
+    chatIsP2p: boolean,
     replyToMessageId?: string,
     initiatorOpenId?: string,
   ) => Effect.Effect<void>;
@@ -149,6 +153,10 @@ export const makeObserveMirror = (deps: ObserveMirrorDeps): Effect.Effect<Observ
     const startMirror = (
       chatId: string,
       threadId: ThreadId,
+      // M-3 p2p-density: whether the resuming chat is p2p (from the `/resume`
+      // message's chatType). Stamped onto the re-bound binding below so a private
+      // chat that adopts an `approval-required` thread still renders at `p2pDensity`.
+      chatIsP2p: boolean,
       // M3b path A: the `/resume` command message id (belongs to the resumed topic).
       // Used as the in-thread reply anchor for the takeover approval card and stored
       // on the binding as `topicAnchorMessageId` so later topic-anchored cards land
@@ -191,6 +199,10 @@ export const makeObserveMirror = (deps: ObserveMirrorDeps): Effect.Effect<Observ
         yield* bindings.bind(chatId, {
           threadId,
           origin: "resumed",
+          // M-3 p2p-density: stamp the resuming chat's private-ness (from chatType) so
+          // `resolveDensity` renders this p2p chat at `p2pDensity` even though the
+          // adopted thread stays `approval-required` (density follows the chat).
+          chatIsP2p,
           ...(replyToMessageId !== undefined ? { topicAnchorMessageId: replyToMessageId } : {}),
         });
         const shell = yield* shellCache.threadById(threadId);
@@ -789,10 +801,13 @@ export const makeObserveMirror = (deps: ObserveMirrorDeps): Effect.Effect<Observ
             captureCurrentTurnId(thread).pipe(
               Effect.andThen(Ref.get(currentTurnIdRef)),
               Effect.flatMap((currentTurnId) =>
-                // M-3 PR-C3: resolve density per tick from the REAL `thread.runtimeMode`
-                // (p2p ⇒ full-access ⇒ card, via `resolveDensity`'s gate) so a per-chat
-                // override lands AND the p2p-always-card invariant holds — the synthetic
-                // placeholder's runtimeMode must never decide the live card's density.
+                // M-3 PR-C3 / p2p-density: resolve density per tick from the REAL
+                // `thread.runtimeMode` (`resolveDensity` maps a private chat → the
+                // configurable `p2pDensity` and a group/topic → the per-chat/defaults/env
+                // precedence; it reads the binding's `chatIsP2p` so a p2p chat that
+                // adopted an approval-required thread still gets `p2pDensity`) so a
+                // per-chat override lands — the synthetic placeholder's runtimeMode must
+                // never decide the live card's density.
                 Effect.all({
                   interaction: buildInteraction(chatId, thread, operatorOverride),
                   density: resolveDensity(chatId, thread.runtimeMode),
@@ -1041,12 +1056,20 @@ export const makeObserveMirror = (deps: ObserveMirrorDeps): Effect.Effect<Observ
             // the turn reaches a terminal state (the `cardDone` released below). A
             // failed start must NOT crash the fiber — skip the render and exit; the
             // watcher re-triggers on the next frame if the turn is still running.
-            // M-3 PR-C3: resolve the placeholder first-frame density through the same
-            // per-chat > binding > runtime overlay the real frames use, so a per-chat
-            // override matches from the very first frame (no card→low-noise jump). The
-            // binding read below still supplies the topic reply anchor.
+            // M-3 PR-C3 / p2p-density: resolve the placeholder first-frame density
+            // through the SAME overlay the real frames use, keyed on the thread's REAL
+            // runtime mode — `firstCurrent.runtimeMode` (the authoritative folded
+            // thread already read above), NOT the synthetic `placeholderThread`'s
+            // hard-coded `approval-required`. Otherwise a p2p chained-subagent turn
+            // would render its first observe frame at the group density and flicker to
+            // the configured `p2pDensity` on the real frame. `firstCurrent` is null
+            // only when the first snapshot timed out (rare) → fall back to the
+            // placeholder mode. The binding read below still supplies the topic anchor.
             const binding = yield* bindings.get(chatId);
-            const placeholderDensity = yield* resolveDensity(chatId, placeholderThread.runtimeMode);
+            const placeholderDensity = yield* resolveDensity(
+              chatId,
+              firstCurrent?.runtimeMode ?? placeholderThread.runtimeMode,
+            );
             const initial = renderThreadCard(placeholderThread, {
               streaming: true,
               density: placeholderDensity,

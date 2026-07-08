@@ -120,6 +120,9 @@ export interface CommandDeps {
   readonly startMirror: (
     chatId: string,
     threadId: ThreadId,
+    // M-3 p2p-density: whether the resuming chat is p2p (from the `/resume` message's
+    // chatType), stamped onto the re-bound binding so density follows the chat.
+    chatIsP2p: boolean,
     replyToMessageId?: string,
     // The `/resume` command sender — the takeover initiator. Recorded as the trusted
     // Feishu initiator for this thread so observe/surface sign approval cards for the
@@ -916,7 +919,15 @@ export const buildCommandTable = (deps: CommandDeps): ReadonlyMap<string, Comman
       // Hand off to mirror-light: it does the re-bind + takeover snapshot card.
       // M3b path A: pass the `/resume` command message id (belongs to this topic) so
       // the takeover/approval cards anchor inside the topic and the binding records it.
-      yield* deps.startMirror(chatKey, target, ctx.message.messageId, ctx.message.senderId);
+      yield* deps.startMirror(
+        chatKey,
+        target,
+        // M-3 p2p-density: the resuming chat's private-ness, so a p2p `/resume` of an
+        // approval-required thread still renders at `p2pDensity` (density follows the chat).
+        ctx.message.chatType === "p2p",
+        ctx.message.messageId,
+        ctx.message.senderId,
+      );
     });
 
   const resume: CommandHandler = (ctx) => {

@@ -68,8 +68,9 @@ export const DENSITY_LABELS: Record<RenderDensity, string> = {
 /**
  * Built-in group render density when neither the chat nor the defaults set one.
  * Mirrors the bot's `densityForRuntime` group default (`card`) so "what the editor
- * shows == what the bot renders". (p2p is always `card` in the bot, but p2p chats
- * are not configurable here — the group section only.)
+ * shows == what the bot renders". Private chats resolve independently
+ * (`feishuChatDefaults.p2pDensity`, also defaulting to `card`; edited in the
+ * private-chat section) — this constant is the GROUP default only.
  */
 export const DEFAULT_GROUP_DENSITY: RenderDensity = "card";
 
@@ -217,6 +218,26 @@ export const setConfigDensity = (
     return normalizeConfig(rest);
   }
   return normalizeConfig({ ...config, density });
+};
+
+/**
+ * Set the PRIVATE-chat (p2p) render density on the DEFAULTS config (M-3 p2p-density,
+ * mirrors the bot's `resolveP2pDensity`). `card` is the built-in p2p default
+ * (`p2pDensity ?? "card"`), so an explicit `card` is byte-equivalent to "unset" —
+ * drop the field either way to keep the defaults object free of redundant defaults
+ * (静息态干净 / drop-empty consistency). `markdown` / `text` are real overrides kept
+ * in the config. `p2pDensity` is meaningful ONLY on `feishuChatDefaults`; a group
+ * per-chat entry never carries it (the bot ignores it there).
+ */
+export const setP2pDensity = (
+  defaults: FeishuChatConfig,
+  density: RenderDensity | undefined,
+): FeishuChatConfig => {
+  if (density === undefined || density === "card") {
+    const { p2pDensity: _dropped, ...rest } = defaults;
+    return normalizeConfig(rest);
+  }
+  return normalizeConfig({ ...defaults, p2pDensity: density });
 };
 
 /**

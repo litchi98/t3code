@@ -181,6 +181,16 @@ export const makeEnsureThread = (deps: EnsureThreadDeps): Effect.Effect<EnsureTh
         // origin is honoured here by using the binding's threadId verbatim.
         const existing = yield* bindings.get(chatKey);
         if (existing !== null) {
+          // NOTE (M-3 p2p-density): a legacy binding that predates `chatIsP2p` is
+          // deliberately NOT re-stamped here. A read-modify-write on this hot path is
+          // not atomic w.r.t. a concurrent `/resume` re-bind (which does not hold
+          // `ensureLock`; see the offer comment below), so it could clobber a fresh
+          // takeover binding with a stale snapshot — a real data loss to fix a merely
+          // cosmetic gap. Unstamped bindings resolve density via the `full-access ⟹
+          // p2p` heuristic (`rendersAtP2pDensity`), which is correct for the common
+          // fresh-p2p case; the only residual is a pre-PR binding whose thread mode was
+          // later flipped on the web — a narrow density mismatch that clears when the
+          // binding is next re-created. New bindings are all stamped at bind time.
           return existing.threadId;
         }
 
@@ -261,6 +271,9 @@ export const makeEnsureThread = (deps: EnsureThreadDeps): Effect.Effect<EnsureTh
             origin: "self-created",
             topicAnchorMessageId: message.messageId,
             density: densityForRuntime(runtimeMode, groupChatDensity),
+            // M-3 p2p-density: stamp private-ness from the chat's native mode (see
+            // `ensureThreadForChat`), so `resolveDensity` keeps honouring `p2pDensity`.
+            chatIsP2p: runtimeMode === "full-access",
           });
           yield* Console.log(
             `[feishu-bot] re-bound chat ${message.chatId} to its existing thread ${threadId}.`,
@@ -363,6 +376,8 @@ export const makeEnsureThread = (deps: EnsureThreadDeps): Effect.Effect<EnsureTh
                 origin: "self-created",
                 topicAnchorMessageId: message.messageId,
                 density: densityForRuntime(runtimeMode, groupChatDensity),
+                // M-3 p2p-density: stamp private-ness from the chat's native mode.
+                chatIsP2p: runtimeMode === "full-access",
               }),
               isEnvReady,
               clearPendingCreate,

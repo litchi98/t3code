@@ -218,6 +218,19 @@ export const renderHeader = (thread: OrchestrationThread): MarkdownElement => {
 };
 
 /**
+ * The runtime badge as a trailing SUFFIX (two leading spaces), or "" when the mode
+ * carries no badge (`approval-required`, the safe default). `card` density folds the
+ * badge into {@link renderHeader}; the low-noise `markdown` / `text` densities drop
+ * the title header and instead append this to the END of the status line — a
+ * `full-access` (`bypass`) / `auto-accept-edits` (`editable`) mode is a security
+ * signal that must stay visible at every density, but without spending its own row.
+ */
+export const runtimeBadgeSuffix = (thread: OrchestrationThread): string => {
+  const badge = runtimeBadge(effectiveRuntimeMode(thread));
+  return badge.length > 0 ? `  ${badge}` : "";
+};
+
+/**
  * Status-line meta suffix: ` · 📁 <workspace> · 🌿 <branch>`. Each segment is
  * included only when its source field is present (missing workspace / null
  * branch gracefully omitted). Folded into the status line instead of a separate
