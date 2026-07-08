@@ -15,6 +15,7 @@ import {
   setConfigApprovalMode,
   setConfigCommands,
   setConfigDensity,
+  setP2pDensity,
   setConfigWorkspaces,
   setDefaultsApprovalMode,
   toggleApprover,
@@ -305,6 +306,41 @@ describe("setConfigDensity / density override (M-3 PR-C3)", () => {
     expect(
       writeChatConfig({ [CHAT]: { density: "text" } }, CHAT, setConfigDensity({}, undefined)),
     ).toEqual({});
+  });
+});
+
+describe("setP2pDensity — private-chat density on defaults (M-3 p2p-density)", () => {
+  it("keeps a non-default value (markdown / text)", () => {
+    expect(setP2pDensity({}, "markdown")).toEqual({ p2pDensity: "markdown" });
+    expect(setP2pDensity({}, "text")).toEqual({ p2pDensity: "text" });
+  });
+
+  it("drops the field for the built-in card default (explicit card ≡ unset)", () => {
+    // `card` is the bot's `resolveP2pDensity` default, so an explicit `card` is
+    // byte-equivalent to unset — 归一 to a dropped field (静息态干净).
+    expect(setP2pDensity({ p2pDensity: "text" }, "card")).toEqual({});
+    expect(setP2pDensity({}, "card")).toEqual({});
+  });
+
+  it("clears the field with undefined", () => {
+    expect(setP2pDensity({ p2pDensity: "text" }, undefined)).toEqual({});
+  });
+
+  it("is INDEPENDENT of the group density and preserves sibling fields", () => {
+    // Editing p2pDensity must not touch the group `density` (nor any other field).
+    expect(setP2pDensity({ approvalMode: "all", density: "markdown" }, "text")).toEqual({
+      approvalMode: "all",
+      density: "markdown",
+      p2pDensity: "text",
+    });
+  });
+
+  it("keeps the designated approvers invariant while editing p2pDensity", () => {
+    expect(setP2pDensity({ approvalMode: "designated", approvers: [] }, "text")).toEqual({
+      approvalMode: "designated",
+      approvers: [],
+      p2pDensity: "text",
+    });
   });
 });
 

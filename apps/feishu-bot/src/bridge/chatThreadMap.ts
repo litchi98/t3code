@@ -99,13 +99,16 @@ export const refusesFullAccessTakeover = (
 ): boolean => requiredMode === "approval-required" && threadMode === "full-access";
 
 /**
- * M3b: render density per runtime mode. A p2p 1:1 chat (`full-access`) is always
- * the full `card` layout; a group / topic chat (`approval-required`) honours the
- * configured `groupChatDensity` (default `card`; opt-in `markdown` / `text`).
- * Pure function of `(runtimeMode, groupChatDensity)` — lives here next to
- * `runtimeModeForChatType` so the turn pipeline and renderer derive density from
- * one place. Default-no-auto-downgrade: only an explicit
- * config lowers a group below `card`, so p2p noise control is never affected.
+ * M3b: the BIND-TIME / env-default group density. A p2p 1:1 chat (`full-access`)
+ * stores `card`; a group / topic chat (`approval-required`) stores the configured
+ * `groupChatDensity` (default `card`; opt-in `markdown` / `text`). Pure function of
+ * `(runtimeMode, groupChatDensity)` — lives here next to `runtimeModeForChatType`.
+ *
+ * NOTE (M-3 p2p-density): this is the bind-time STORE layer only. The RENDER path
+ * resolves p2p density via `resolveP2pDensity` (reading `feishuChatDefaults
+ * .p2pDensity`), not through here — so a p2p chat's stored `binding.density` (`card`)
+ * is now an inert value the render path never consults. Left unchanged so the group
+ * bind-time fallback and the persisted binding schema stay byte-identical.
  */
 export const densityForRuntime = (
   runtimeMode: RuntimeMode,
@@ -113,26 +116,62 @@ export const densityForRuntime = (
 ): RenderDensity => (runtimeMode === "full-access" ? "card" : groupChatDensity);
 
 /**
- * M-3 PR-C3: resolve a chat's effective render density, layering the per-chat /
- * `feishuChatDefaults` config over the legacy fallbacks — but keeping p2p
- * (`full-access`) ALWAYS `card`. The full-access gate sits ABOVE the config so an
- * inherited group default can never lower a private chat below `card` (the M3b
- * invariant, mirrored by `densityForRuntime`, and promised by the contract +
- * editor copy). For a group/topic chat the precedence is
- * `configDensity (per-chat > defaults) → bindingDensity → groupChatDensity`.
+ * M-3 p2p-density: resolve a PRIVATE (p2p, `full-access`) chat's render density.
+ * The density is configured on `feishuChatDefaults.p2pDensity` (the web private-chat
+ * section), defaulting to `card` when unset — preserving the pre-M3 "p2p always card"
+ * default while letting the owner opt a private chat down to `markdown` / `text`
+ * (approval buttons survive: the renderer injects the interaction section for every
+ * density). INDEPENDENT of the group `density` precedence (`resolveRenderDensity`) —
+ * a group default can never leak into a private chat and vice-versa.
+ *
+ * Pure so the bot's `resolveDensity` (which supplies the live `p2pDensity` read)
+ * stays a thin wrapper and this is unit tested.
+ */
+export const resolveP2pDensity = (p2pDensity: RenderDensity | undefined): RenderDensity =>
+  p2pDensity ?? "card";
+
+/**
+ * M-3 p2p-density: whether a chat should render at PRIVATE (p2p) density. Density
+ * follows the CHAT, not the thread. The binding's stamped `chatIsP2p` (from chatType
+ * at bind time) is AUTHORITATIVE: a thread's `runtimeMode` is NOT a reliable p2p
+ * signal because a shared session's mode is mutable from the web composer
+ * (`thread.runtime-mode.set`), so a GROUP thread can be flipped to `full-access` and
+ * a p2p thread to `approval-required` without changing what the CHAT is. Hence:
+ *  - `chatIsP2p === true`  → p2p (even if its thread was flipped to approval-required);
+ *  - `chatIsP2p === false` → group/topic (even if its thread was flipped to
+ *    full-access — this is why the stamp must VETO the runtime-mode heuristic);
+ *  - `chatIsP2p === undefined` (legacy binding predating the stamp) → fall back to
+ *    the `full-access ⟹ p2p` heuristic. Correct for the common fresh-p2p case; the
+ *    only residual is a pre-PR binding whose thread mode was later flipped on the web
+ *    (a narrow, cosmetic density mismatch that clears on the next re-bind). New
+ *    bindings are all stamped at bind time.
+ * A group/topic chat renders at the group precedence (`resolveRenderDensity`). Pure
+ * so `resolveDensity` stays a thin wrapper and this disambiguation is unit tested.
+ */
+export const rendersAtP2pDensity = (
+  threadRuntimeMode: RuntimeMode,
+  chatIsP2p: boolean | undefined,
+): boolean => chatIsP2p ?? threadRuntimeMode === "full-access";
+
+/**
+ * M-3 PR-C3: resolve a GROUP / topic (`approval-required`) chat's effective render
+ * density, layering the per-chat / `feishuChatDefaults` config over the legacy
+ * fallbacks. Precedence: `configDensity (per-chat > defaults) → bindingDensity →
+ * groupChatDensity`. p2p (`full-access`) is NOT resolved here — the bot's
+ * `resolveDensity` routes private chats to `resolveP2pDensity` and only reaches this
+ * function for group/topic chats — so there is no full-access branch (a group
+ * default therefore cannot lower a private chat: the two paths never cross).
  *
  * Pure so the bot's `resolveDensity` (which supplies the live config/binding reads)
- * stays a thin wrapper and this precedence — especially the p2p gate — is unit
- * tested. `configDensity` is `effectiveChatConfig(chatId).density`; `bindingDensity`
- * is the bind-time stored `binding.density`.
+ * stays a thin wrapper and this precedence is unit tested. `configDensity` is
+ * `effectiveChatConfig(chatId).density`; `bindingDensity` is the bind-time stored
+ * `binding.density`.
  */
 export const resolveRenderDensity = (
-  runtimeMode: RuntimeMode,
   configDensity: RenderDensity | undefined,
   bindingDensity: RenderDensity | undefined,
   groupChatDensity: RenderDensity,
-): RenderDensity =>
-  runtimeMode === "full-access" ? "card" : (configDensity ?? bindingDensity ?? groupChatDensity);
+): RenderDensity => configDensity ?? bindingDensity ?? groupChatDensity;
 
 /**
  * M3a: the chat-key anchor for a Feishu inbound message.
@@ -331,6 +370,10 @@ export const ensureThreadForChat = (
       origin: "self-created",
       topicAnchorMessageId: message.messageId,
       density,
+      // M-3 p2p-density: stamp the chat's private-ness from chatType (a full-access
+      // native mode ⟺ p2p) so `resolveDensity` can honour `p2pDensity` even after a
+      // later cross-context `/resume` re-points this chat at an approval-required thread.
+      chatIsP2p: runtimeMode === "full-access",
     });
     return { threadId, created: true } satisfies EnsuredThread;
   });

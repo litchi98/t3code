@@ -95,10 +95,11 @@ export interface FeishuAppConfig {
   /**
    * Render density for group / topic chats (M3b). From `FEISHU_GROUP_CHAT_DENSITY`
    * (`card` | `markdown` | `text`). Like `appId`, this is bot-own config — not
-   * shared with the server. p2p 1:1 chats are always `card` regardless of this
-   * value (see `densityForRuntime`); this seam only lowers group/topic noise when
-   * set explicitly. Defaults to `card` (no auto-downgrade); an unrecognised value
-   * falls back to `card` (non-fatal).
+   * shared with the server. This seam does NOT affect p2p 1:1 chats — their density
+   * resolves independently from `feishuChatDefaults.p2pDensity` (M-3 p2p-density, see
+   * `resolveP2pDensity`); this value only lowers group/topic noise when set
+   * explicitly. Defaults to `card` (no auto-downgrade); an unrecognised value falls
+   * back to `card` (non-fatal).
    */
   readonly groupChatDensity: RenderDensity;
 }

@@ -37,9 +37,10 @@ export interface EffectiveChatConfig {
   readonly commands: ReadonlyArray<string> | undefined;
   readonly toolPolicy: FeishuChatConfig["toolPolicy"];
   // PR-C3: `undefined` = "not configured" here; the render read points (via
-  // `resolveDensity`) apply the further binding / runtime-mode fallback, which is
-  // why the built-in `card` is NOT baked in at this layer (it depends on the
-  // chat's runtimeMode — p2p is always `card`).
+  // `resolveDensity`) apply the further binding / env fallback, which is why the
+  // built-in `card` is NOT baked in at this layer. This field feeds ONLY the
+  // group/topic density path — a p2p chat's density resolves from
+  // `feishuChatDefaults.p2pDensity` (`resolveP2pDensity`), never through here.
   readonly density: FeishuChatConfig["density"];
 }
 

@@ -303,6 +303,18 @@ export interface ChatBinding {
    * entries (→ `undefined`, callers fall back to their computed default).
    */
   readonly density?: RenderDensity;
+  /**
+   * Whether the bound chat is a p2p (1:1 private) chat, stamped from `chatType` at
+   * bind/re-bind time (M-3 p2p-density). This is a stable property of the CHAT, and
+   * unlike a thread's pinned `runtimeMode` it does NOT diverge when a p2p chat adopts
+   * an `approval-required` thread via cross-context `/resume`. `resolveDensity` reads
+   * it so a private chat renders at `feishuChatDefaults.p2pDensity` even for such an
+   * adopted thread (所见=所判). Optional: absent on legacy on-disk entries and on any
+   * bind path that didn't stamp it (→ `undefined`, treated as "not known p2p", so the
+   * density falls back to the thread-runtimeMode path — which is correct for the
+   * common case since a full-access thread only ever lives in a p2p chat).
+   */
+  readonly chatIsP2p?: boolean;
 }
 
 /**
@@ -433,7 +445,8 @@ export const loadBackedMap = <V>(
  * M1 ever produced); a current object is narrowed to the live fields (`threadId`,
  * `origin`, plus the M3b-optional `topicAnchorMessageId` / `density`), dropping
  * any extraneous keys an older build may have written (e.g. the now-removed
- * `lastSequence`). The two M3b fields are optional: legacy entries that pre-date
+ * `lastSequence`). The optional fields (M3b `topicAnchorMessageId`/`density`, M-3
+ * `chatIsP2p`) are carried through only when present: legacy entries that pre-date
  * them simply carry `undefined`, preserving the M3a "zero re-bind" invariant
  * (`threadId`/`origin` are never lost). Pure; runs once per entry at load time.
  */
@@ -454,6 +467,7 @@ const migrateChatBinding = (raw: unknown): ChatBinding => {
       ? { topicAnchorMessageId: binding.topicAnchorMessageId }
       : {}),
     ...(binding.density !== undefined ? { density: binding.density } : {}),
+    ...(binding.chatIsP2p !== undefined ? { chatIsP2p: binding.chatIsP2p } : {}),
   };
 };
 

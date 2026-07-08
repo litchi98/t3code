@@ -40,7 +40,12 @@ import type { BridgeHandlers, InboundMessage } from "./lark/types.ts";
 import { effectiveChatConfig } from "./bridge/chatConfig.ts";
 import { CallbackAuth } from "./bridge/callbackAuth.ts";
 import { type ResolvedNoticeEntry } from "./bridge/interactionCard.ts";
-import { resolveRenderDensity, splitChatKey } from "./bridge/chatThreadMap.ts";
+import {
+  rendersAtP2pDensity,
+  resolveP2pDensity,
+  resolveRenderDensity,
+  splitChatKey,
+} from "./bridge/chatThreadMap.ts";
 import { type RenderDensity } from "./bridge/eventRenderer.ts";
 import { TurnQueue, turnQueueLayer } from "./bridge/turnQueue.ts";
 import { OutboundQueue, outboundQueueLayer } from "./bridge/outbound.ts";
@@ -239,49 +244,57 @@ const runBoundSession = (
       nonces: nonceProbe,
     });
 
-    // M3b: render density for group / topic chats, captured once from config
-    // (bot-side) so every `renderThreadCard` call site below
-    // derives its layout from one place via `densityForRuntime(runtimeMode, …)`.
-    // p2p (`full-access`) is always `card`; only an explicit
-    // `FEISHU_GROUP_CHAT_DENSITY` lowers a group/topic below `card`.
+    // M3b: the env-default render density for group / topic chats, captured once
+    // from config so every group render below derives its layout from one place.
+    // Only an explicit `FEISHU_GROUP_CHAT_DENSITY` lowers a group/topic below `card`
+    // (private chats resolve independently via `resolveP2pDensity`, M-3 p2p-density).
     const groupChatDensity = config.feishu.groupChatDensity;
 
-    // M-3 PR-C3: resolve the effective render density for a chat, layering the
-    // per-chat config over the legacy fallbacks. Server-managed spawn scrubs
-    // `FEISHU_GROUP_CHAT_DENSITY`, so the web per-chat/defaults `density` field is
-    // now the live control surface for GROUP/topic chats. Precedence (mirrors the
-    // web's `effectiveConfig` so what the editor shows == what the bot renders):
-    //   0. p2p (`full-access`) is ALWAYS `card` — a hard M3b invariant that
-    //      per-chat / `feishuChatDefaults` density must NOT lower (the private-chat
-    //      section is not configurable here; the contract + editor copy promise it).
-    //      This gate mirrors `densityForRuntime`'s full-access force and must sit
-    //      ABOVE the config so an inherited group default can't leak into a p2p chat.
-    //   1. per-chat / defaults `density` (`effectiveChatConfig`, keyed by BARE
-    //      chatId — the authz grain — so split the composite chatKey first);
-    //   2. the bind-time `binding.density` (legacy stored value);
-    //   3. `densityForRuntime(runtimeMode, groupChatDensity)` (env default).
-    // Requires the REAL thread `runtimeMode` (p2p ⇒ full-access) — callers pass the
-    // live thread's mode, NOT the synthetic placeholder's, or the p2p gate misfires.
-    // Every render read point derives density through here so an override wins on the
-    // *stable terminal* card. `chatKey` is the ambient composite key
-    // (`chatId[:larkThreadId]`); bind-time STORE points keep computing
-    // `densityForRuntime` directly — this is a read-time overlay only.
+    // M-3: resolve the effective render density for a chat. Server-managed spawn
+    // scrubs `FEISHU_GROUP_CHAT_DENSITY`, so the web `feishuChatDefaults` /
+    // per-chat `density` (groups) and `p2pDensity` (private chats) are the live
+    // control surfaces. Density follows the CHAT, not the thread (mirrors the web so
+    // what the editor shows == what the bot renders):
+    //   • PRIVATE (p2p) chat → `resolveP2pDensity(feishuChatDefaults.p2pDensity)`
+    //     (M-3 p2p-density): the configurable private-chat density, defaulting to
+    //     `card`. Whether a chat is private is decided by `rendersAtP2pDensity` on the
+    //     binding's stamped `chatIsP2p` — AUTHORITATIVE over the thread `runtimeMode`,
+    //     which is mutable from the web composer (`thread.runtime-mode.set`), so a
+    //     group thread flipped to `full-access` must NOT be mistaken for p2p, and a
+    //     p2p chat that adopted an `approval-required` thread via `/resume` must still
+    //     be p2p. Only a legacy binding with no stamp falls back to the
+    //     `full-access ⟹ p2p` heuristic (correct for the common fresh-p2p case; new
+    //     bindings are all stamped at bind time).
+    //   • group / topic → `resolveRenderDensity` precedence:
+    //     1. per-chat / defaults `density` (`effectiveChatConfig`, keyed by BARE
+    //        chatId — the authz grain — so split the composite chatKey first);
+    //     2. the bind-time `binding.density` (legacy stored value);
+    //     3. `groupChatDensity` (env default).
+    // `runtimeMode` is the REAL thread mode (callers pass the live thread's, NOT the
+    // synthetic placeholder's — the flicker fix threads it to the two placeholder
+    // points); it is only the fallback for an unstamped legacy binding. The binding is
+    // read once (supplying `chatIsP2p` and the legacy `binding.density`). `chatKey` is
+    // the ambient composite key (`chatId[:larkThreadId]`); bind-time STORE points keep
+    // computing `densityForRuntime` directly — this is a read-time overlay only.
     const resolveDensity = (
       chatKey: string,
       runtimeMode: RuntimeMode,
     ): Effect.Effect<RenderDensity> =>
       Effect.gen(function* () {
-        // Fast p2p path: `full-access` is always `card` (see `resolveRenderDensity`),
-        // so skip the config/binding reads entirely for private chats.
-        if (runtimeMode === "full-access") return "card";
+        const defaults = yield* Ref.get(chatDefaultsRef);
+        const binding = yield* bindings.get(chatKey);
+        // Density follows the chat: the stamped `chatIsP2p` wins over the (web-mutable)
+        // thread `runtimeMode`; the mode is only the unstamped-legacy fallback.
+        if (rendersAtP2pDensity(runtimeMode, binding?.chatIsP2p)) {
+          return resolveP2pDensity(defaults.p2pDensity);
+        }
         const { chatId: bareChatId } = splitChatKey(chatKey);
         const configDensity = effectiveChatConfig(
           bareChatId,
           yield* Ref.get(chatConfigsRef),
-          yield* Ref.get(chatDefaultsRef),
+          defaults,
         ).density;
-        const binding = yield* bindings.get(chatKey);
-        return resolveRenderDensity(runtimeMode, configDensity, binding?.density, groupChatDensity);
+        return resolveRenderDensity(configDensity, binding?.density, groupChatDensity);
       });
 
     // Session-operator map (security: pin-drift → `initiator`-mode bypass).

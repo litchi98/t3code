@@ -213,6 +213,13 @@ export const makeTurnRunner = (deps: TurnRunnerDeps): Effect.Effect<TurnRunnerHa
       chatId: string,
       threadId: ThreadId,
       observation: ThreadObservation,
+      // M-3 p2p-density: the REAL runtime mode for THIS turn, derived from the
+      // triggering message's chat type (`runtimeModeForChatType`). The placeholder
+      // first frame resolves its density through `resolveDensity(chatId, this)` —
+      // NOT the synthetic `placeholderThread.runtimeMode` (hard-coded
+      // `approval-required`), which would render a p2p turn's first frame at the
+      // group density and flicker to the configured `p2pDensity` on the real frame.
+      turnRuntimeMode: RuntimeMode,
       // The Feishu message id that triggered this turn (the topic reply anchor),
       // or `undefined` (flush/replay with no live trigger) → post at the root.
       replyToMessageId?: string,
@@ -241,10 +248,12 @@ export const makeTurnRunner = (deps: TurnRunnerDeps): Effect.Effect<TurnRunnerHa
         }
         const cardDone = yield* Deferred.make<void>();
         yield* Effect.gen(function* () {
-          // M-3 PR-C3: resolve the placeholder first-frame density through the same
-          // per-chat > binding > runtime overlay the real frames use (no density jump
-          // when a per-chat override lowers this chat below `card`).
-          const placeholderDensity = yield* resolveDensity(chatId, placeholderThread.runtimeMode);
+          // M-3 PR-C3 / p2p-density: resolve the placeholder first-frame density
+          // through the SAME overlay the real frames use, keyed on the turn's REAL
+          // runtime mode (`turnRuntimeMode`) — never the synthetic placeholder mode —
+          // so neither a group per-chat override nor a lowered p2p `p2pDensity` jumps
+          // between the first frame and the real one.
+          const placeholderDensity = yield* resolveDensity(chatId, turnRuntimeMode);
           const initial = renderThreadCard(placeholderThread, {
             streaming: true,
             density: placeholderDensity,
@@ -476,6 +485,11 @@ export const makeTurnRunner = (deps: TurnRunnerDeps): Effect.Effect<TurnRunnerHa
               chatId,
               target,
               observation,
+              // M-3 p2p-density: the turn's REAL runtime mode (p2p ⇒ full-access),
+              // from the triggering message's chat type — the SAME derivation
+              // `buildTurnStart` uses for the command — so the placeholder first
+              // frame renders at the p2p `p2pDensity` (no card→low-noise flicker).
+              runtimeModeForChatType(dispatch.sources[0]?.message.chatType ?? "p2p"),
               dispatch.sources[0]?.message.messageId,
               dispatch.sources[0]?.message.senderId,
             );
