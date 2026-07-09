@@ -21,6 +21,7 @@ import {
 import * as Console from "effect/Console";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -36,6 +37,7 @@ import { type RenderDensity, renderThreadCard } from "./eventRenderer.ts";
 import { collectUploadedAttachments } from "./imageAttachments.ts";
 import { topicSendOpts } from "./notices.ts";
 import type { OutboundQueue } from "./outbound.ts";
+import { REACTION_RUNNING, terminalReactionEmoji } from "./reactionState.ts";
 import { observeThread, type ThreadObservation } from "./session.ts";
 import type { MergedDispatch, TurnQueue } from "./turnQueue.ts";
 
@@ -53,6 +55,29 @@ export type OfflineStrategy = (params: {
   readonly dispatch: MergedDispatch;
   readonly feishuMessageId: string;
 }) => Effect.Effect<void, OfflineRetry>;
+
+/**
+ * Leak backstop on the reaction daemon's wait for `driveTurn`'s terminal signal.
+ * Set beyond `session.ts`'s 10-min TURN_TIMEOUT — the finalizer that resolves the
+ * signal runs on EVERY driveTurn exit, so in practice this never fires; it only
+ * guarantees a detached daemon cannot outlive a (theoretically) missing signal.
+ */
+const REACTION_SIGNAL_TIMEOUT = Duration.minutes(15);
+
+/** Best-effort message extraction for a reaction failure (LarkGatewayError has a
+ * `message`; a `TimeoutException` carries only a `_tag`). Logging only. */
+const describeReactionError = (error: unknown): string => {
+  if (error !== null && typeof error === "object") {
+    const record = error as { readonly message?: unknown; readonly _tag?: unknown };
+    if (typeof record.message === "string" && record.message.length > 0) {
+      return record.message;
+    }
+    if (typeof record._tag === "string") {
+      return record._tag;
+    }
+  }
+  return String(error);
+};
 
 /** Dependencies for one bound session's turn runner. */
 export interface TurnRunnerDeps {
@@ -215,6 +240,86 @@ export const makeTurnRunner = (deps: TurnRunnerDeps): Effect.Effect<TurnRunnerHa
           }),
         ),
       );
+
+    /**
+     * Batch B — turn-status reaction lifecycle, run as a DETACHED daemon so it
+     * can never sit on the turn's critical path. It adds the `running` receipt on
+     * the triggering message, waits for the settled turn's terminal emoji
+     * (handed in via `terminalSignal`, resolved by `driveTurn`'s finalizer from
+     * the SAME authoritative folded thread the card status line uses — never a
+     * local optimistic guess), then swaps the receipt for that emoji.
+     *
+     * Why a detached daemon, not an inline await: a slow/hung Feishu reaction
+     * call, awaited inline (its old shape), would block the streaming-card open
+     * AND wedge the per-chat turn lock (the settle/`onTurnComplete` runs only
+     * after the finalizer), starving every held message. Detaching it keeps the
+     * red line: a reaction failure of ANY kind — reject, unknown emoji_type,
+     * missing scope, or a hang — can never touch the turn / card / approval flow.
+     * Each reaction HTTP call is bounded at the transport layer by the gateway's
+     * `HTTP_REQUEST_TIMEOUT_MS` (the SDK's axios client is otherwise `timeout: 0`,
+     * so a half-open connection would leak the socket), which both frees the
+     * socket AND turns a hang into a normal rejection — so `tapError` + swallow is
+     * sufficient here (no fiber-level `Effect.timeout`, which would only interrupt
+     * the fiber, leaving the socket dangling and racing a late success against the
+     * terminal swap). Failures are still `tapError`-logged (the root cause of
+     * "reactions never appeared" was a *silent* best-effort) then swallowed.
+     */
+    const runReactionLifecycle = (
+      anchorMessageId: string,
+      terminalSignal: Deferred.Deferred<string | null>,
+    ): Effect.Effect<void> =>
+      Effect.gen(function* () {
+        // 1. Running receipt. The transport timeout guarantees this resolves
+        //    (success or reject) before we proceed, so a hung endpoint can never
+        //    park the daemon here and the outcome is definitive for step 3. A
+        //    failure degrades to a null reaction_id (terminal remove falls back to
+        //    remove-by-emoji).
+        const runningReactionId = yield* gateway
+          .addReaction(anchorMessageId, REACTION_RUNNING)
+          .pipe(
+            Effect.tapError((error) =>
+              Effect.logWarning(
+                `[feishu-bot] running reaction failed: ${describeReactionError(error)}`,
+              ),
+            ),
+            Effect.orElseSucceed(() => null),
+          );
+        // 2. Wait for driveTurn's finalizer to hand us the terminal emoji (or
+        //    null for a still-running / snapshot-less exit, e.g. an interrupt
+        //    before settle). Bounded generously beyond TURN_TIMEOUT purely as a
+        //    leak backstop — the finalizer runs on EVERY driveTurn exit, so this
+        //    never actually fires; it only guarantees a detached daemon cannot
+        //    outlive a (theoretically) missing signal.
+        const terminal = yield* Deferred.await(terminalSignal).pipe(
+          Effect.timeout(REACTION_SIGNAL_TIMEOUT),
+          Effect.orElseSucceed(() => null),
+        );
+        // 3. Remove the running receipt — precise by stored reaction_id when we
+        //    have one, else by emoji (the id was never captured). Then place the
+        //    terminal emoji (skipped when there is none). All swallowed.
+        const removeRunning =
+          runningReactionId !== null
+            ? gateway.removeReaction(anchorMessageId, runningReactionId)
+            : gateway.removeReactionByEmoji(anchorMessageId, REACTION_RUNNING);
+        yield* removeRunning.pipe(
+          Effect.tapError((error) =>
+            Effect.logWarning(
+              `[feishu-bot] remove running reaction failed: ${describeReactionError(error)}`,
+            ),
+          ),
+          Effect.ignore,
+        );
+        if (terminal !== null) {
+          yield* gateway.addReaction(anchorMessageId, terminal).pipe(
+            Effect.tapError((error) =>
+              Effect.logWarning(
+                `[feishu-bot] terminal reaction failed: ${describeReactionError(error)}`,
+              ),
+            ),
+            Effect.ignore,
+          );
+        }
+      });
 
     // Drive the live card + observer + completion for an already-dispatched turn.
     // `cardDone` is resolved on EVERY exit (success/failure/interrupt) so the SDK
@@ -504,6 +609,26 @@ export const makeTurnRunner = (deps: TurnRunnerDeps): Effect.Effect<TurnRunnerHa
               );
             }
 
+            // Batch B: turn-status reaction on the *triggering* Feishu message
+            // (sources[0] only — single-anchor red line: a message-rain's
+            // follow-ups carry no reaction). The whole running→terminal lifecycle
+            // runs in a DETACHED daemon (`runReactionLifecycle`) so a slow/hung
+            // Feishu reaction endpoint can never block the streaming-card open nor
+            // hold the per-chat turn lock (which would starve held messages). The
+            // daemon adds the `running` receipt and waits for `reactionTerminalSignal`,
+            // which driveTurn's finalizer resolves from the settled thread. A
+            // flush/replay with no live source (`reactionAnchor === undefined`) has
+            // no real message to react to — no daemon is forked and the finalizer
+            // is a no-op.
+            const reactionAnchor = dispatch.sources[0]?.message.messageId;
+            const reactionTerminalSignal = yield* Deferred.make<string | null>();
+            if (reactionAnchor !== undefined) {
+              yield* Effect.forkDetach(
+                runReactionLifecycle(reactionAnchor, reactionTerminalSignal),
+                { startImmediately: true },
+              );
+            }
+
             // M3a: pass the *real* triggering Feishu message id (not the commandId
             // fallback `triggerMessageId` uses for the offline receipt) as the topic
             // reply anchor — `topicSendOpts` only emits in-thread send opts when this
@@ -525,6 +650,24 @@ export const makeTurnRunner = (deps: TurnRunnerDeps): Effect.Effect<TurnRunnerHa
               runtimeModeForChatType(dispatch.sources[0]?.message.chatType ?? "p2p"),
               dispatch.sources[0]?.message.messageId,
               dispatch.sources[0]?.message.senderId,
+            ).pipe(
+              // Hand the reaction daemon the settled terminal emoji on EVERY
+              // driveTurn exit (success / failure / interrupt / defect). Just a
+              // fast `observation.current` Ref read + `Deferred.succeed` — never
+              // an IO call — so the settle / `onTurnComplete` / lock release is
+              // never delayed by a reaction. `null` (still-running / snapshot-less
+              // exit) tells the daemon to drop the running receipt without a
+              // terminal. No-op when there was no live trigger to anchor to.
+              Effect.ensuring(
+                reactionAnchor === undefined
+                  ? Effect.void
+                  : Effect.flatMap(observation.current, (thread) =>
+                      Deferred.succeed(
+                        reactionTerminalSignal,
+                        thread === null ? null : terminalReactionEmoji(thread),
+                      ),
+                    ),
+              ),
             );
           }).pipe(
             // Per-turn scope: tears down the thread subscription + card update
