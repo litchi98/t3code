@@ -493,7 +493,7 @@ const runBoundSession = (
     const { ensureThread, hasPendingCreate } = ensureThreadHandle;
 
     // Reverse-notification + reconciliation watcher. One fiber folding the shared
-    // `shellCache.changes`: it reconciles dangling bindings (thread deleted /
+    // `shellCache.snapshotAndChanges`: it reconciles dangling bindings (thread deleted /
     // archived elsewhere → unbind + notice), surfaces key blind-spot events
     // (failed/interrupted turn) and — M2b-2 修法 B — the follow-on/chained pending
     // approvals/user-inputs a resumed turn raises after takeover

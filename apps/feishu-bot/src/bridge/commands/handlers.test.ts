@@ -155,9 +155,10 @@ const makeHarness = (options: HarnessOptions = {}): Effect.Effect<Harness> =>
       ),
       threadById: (id) =>
         Effect.succeed(snapshot?.threads.find((thread) => thread.id === id) ?? null),
-      changes: (() => {
-        throw new Error("changes is not consumed by command handlers");
+      snapshotAndChanges: (() => {
+        throw new Error("snapshotAndChanges is not consumed by command handlers");
       }) as never,
+      firstSnapshot: Effect.die("firstSnapshot is not consumed by command handlers"),
     };
 
     const deps: CommandDeps = {
