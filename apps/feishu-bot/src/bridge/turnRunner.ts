@@ -14,6 +14,7 @@ import {
   type ModelSelection,
   type OrchestrationThread,
   type OrchestrationThreadStreamItem,
+  PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   type RuntimeMode,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -32,6 +33,7 @@ import type { SentCommandStore } from "../runtime/persistence.ts";
 import { runtimeModeForChatType, splitChatKey } from "./chatThreadMap.ts";
 import { OfflineRetry, turnRejectedNoticeText } from "./createIntent.ts";
 import { type RenderDensity, renderThreadCard } from "./eventRenderer.ts";
+import { collectUploadedAttachments } from "./imageAttachments.ts";
 import { topicSendOpts } from "./notices.ts";
 import type { OutboundQueue } from "./outbound.ts";
 import { observeThread, type ThreadObservation } from "./session.ts";
@@ -178,7 +180,22 @@ export const makeTurnRunner = (deps: TurnRunnerDeps): Effect.Effect<TurnRunnerHa
           startThreadTurn({
             commandId: dispatch.commandId,
             threadId,
-            message: { messageId, role: "user", text: dispatch.prompt, attachments: [] },
+            // Batch A: fill the turn's attachments from the merged dispatch's own
+            // source messages — each carries the images `prepareInboundImages`
+            // already downloaded + encoded at inbound time (bad ones dropped
+            // there). `collectUploadedAttachments` flattens them in source order;
+            // `slice` enforces the ≤8 cap the provider requires (the >8 truncation
+            // is surfaced to the user by `runTurn`). Stays a pure derivation — no
+            // gateway, no download, no `MergedDispatch` field.
+            message: {
+              messageId,
+              role: "user",
+              text: dispatch.prompt,
+              attachments: collectUploadedAttachments(dispatch.sources).slice(
+                0,
+                PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
+              ),
+            },
             ...(perTurnModelSelection === null ? {} : { modelSelection: perTurnModelSelection }),
             // M3a: per-turn runtimeMode tracks the chat type of the message(s) that
             // drove this turn — p2p stays `full-access`, group/topic is
@@ -470,6 +487,22 @@ export const makeTurnRunner = (deps: TurnRunnerDeps): Effect.Effect<TurnRunnerHa
             // Record the dispatch as sent (M9) so a later replay/flush short-circuits.
             yield* sent.add(dispatch.commandId).pipe(Effect.ignore);
             yield* Console.log(`[feishu-bot] started turn on thread ${target} for chat ${chatId}.`);
+
+            // Batch A: the turn went out with at most the first 8 images
+            // (`buildTurnStart` sliced). If this merged dispatch aggregated MORE
+            // than that (a message-rain or multi-image message over the cap), tell
+            // the user which were omitted — the bot cleansed rather than letting
+            // the server reject the whole turn. Fired only on the successful
+            // dispatch (not the `already`/offline/rejected paths), so a reconnect
+            // flush surfaces it exactly once.
+            const uploadedCount = collectUploadedAttachments(dispatch.sources).length;
+            if (uploadedCount > PROVIDER_SEND_TURN_MAX_ATTACHMENTS) {
+              yield* sendNotice(
+                chatId,
+                `已省略 ${uploadedCount - PROVIDER_SEND_TURN_MAX_ATTACHMENTS} 张图片(每轮最多 ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} 张)。`,
+                dispatch.sources[0]?.message.messageId,
+              );
+            }
 
             // M3a: pass the *real* triggering Feishu message id (not the commandId
             // fallback `triggerMessageId` uses for the offline receipt) as the topic

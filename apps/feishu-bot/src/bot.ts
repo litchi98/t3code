@@ -586,6 +586,7 @@ const runBoundSession = (
       runTurn,
       offlineBuffer,
       sendNotice,
+      downloadImage: gateway.downloadImage,
       selectedWorkspaceFor,
       workspaceGateText,
       workspaceRevokedText,

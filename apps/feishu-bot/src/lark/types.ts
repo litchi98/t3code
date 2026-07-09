@@ -9,6 +9,8 @@
  * Keep this layer thin: the bridge must never import `@larksuite/channel`
  * directly — it only sees the shapes declared here.
  */
+import type { UploadChatImageAttachment } from "@t3tools/contracts";
+
 import type {
   CardActionEvent,
   CardStreamController,
@@ -47,6 +49,15 @@ export interface InboundAttachment {
   readonly fileKey: string;
   /** Original file name, when Feishu provided one. */
   readonly fileName?: string;
+  /**
+   * Batch A: the encoded upload payload, filled in at inbound time by
+   * `bridge/imageAttachments.prepareInboundImages` (download → magic-byte sniff →
+   * byte-cap → base64 data URL) once the image has been cleansed. Absent when the
+   * image was dropped (unsupported type / oversized / download failure) or before
+   * preparation runs. Carried on the message so the downstream merge/build path
+   * stays a pure carrier — `turnRunner` reads it via `collectUploadedAttachments`.
+   */
+  readonly uploaded?: UploadChatImageAttachment;
 }
 
 /**
