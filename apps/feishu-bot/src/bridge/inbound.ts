@@ -12,11 +12,13 @@ import * as Effect from "effect/Effect";
 import * as Ref from "effect/Ref";
 import type * as Semaphore from "effect/Semaphore";
 
+import type { LarkGatewayError } from "../lark/index.ts";
 import type { InboundMessage } from "../lark/types.ts";
 import { authorizeCommand, COMMAND_FLOOR, isOwnerExempt } from "./authz.ts";
 import type { BindingState } from "./bindingState.ts";
 import { effectiveChatConfig } from "./chatConfig.ts";
 import { anchorOf, compositeChatKey } from "./chatThreadMap.ts";
+import { prepareInboundImages } from "./imageAttachments.ts";
 import type { CommandHandler } from "./commands/registry.ts";
 import { tryHandleCommand } from "./commands/registry.ts";
 import type { OfflineRetry } from "./createIntent.ts";
@@ -65,6 +67,16 @@ export interface InboundHandlerDeps {
     text: string,
     replyToMessageId?: string,
   ) => Effect.Effect<void>;
+  /**
+   * Download an image resource (batch A): pairs the owning `messageId` with a
+   * resource `fileKey`. Wired from the connected Feishu gateway; the inbound
+   * handler downloads + encodes a message's images at intake so the downstream
+   * merge/build path only carries already-prepared payloads.
+   */
+  readonly downloadImage: (
+    messageId: string,
+    fileKey: string,
+  ) => Effect.Effect<Buffer, LarkGatewayError>;
   /** Resolve the chat's `/workspace` selection against the live snapshot. */
   readonly selectedWorkspaceFor: (chatKey: string) => Effect.Effect<SelectedWorkspace>;
   /** User-facing text for a not-"ok" workspace selection. */
@@ -97,6 +109,7 @@ export const makeInboundHandler = (deps: InboundHandlerDeps): InboundHandlerHand
     runTurn,
     offlineBuffer,
     sendNotice,
+    downloadImage,
     selectedWorkspaceFor,
     workspaceGateText,
     workspaceRevokedText,
@@ -154,18 +167,21 @@ export const makeInboundHandler = (deps: InboundHandlerDeps): InboundHandlerHand
       // ONLY by turn-establishing Feishu actions (`driveTurn` / `/resume` / M18).
       // A raw inbound no longer touches any operator-signing state.
 
-      // Content filter (M16): M1 dispatches text only. A message with no text
-      // (image/file-only, or an empty body) must NOT become an empty-prompt
-      // turn — reply with an explicit "text only" notice and skip dispatch.
-      if (message.text.trim().length === 0) {
-        const what =
-          message.attachments.length > 0
-            ? "I can only act on text right now (image/file attachments aren't supported yet)."
-            : "I received an empty message — please send some text.";
+      // Content filter (M16 + batch A): a message with NO text AND no image
+      // attachments (an empty body, or a non-image file — `normalizeInbound`
+      // drops non-image resources) must NOT become an empty-prompt turn — reply
+      // with an explicit notice and skip. An image-only message (empty text but
+      // ≥1 image attachment) is now admitted: the image carries the intent, and
+      // the pictures are downloaded/encoded below before the turn is offered.
+      if (message.text.trim().length === 0 && message.attachments.length === 0) {
         // Fix 5: this reply answers a real triggering message, so anchor it into
         // the topic (composite `chatKey` + the message id) instead of the group
         // root; p2p / plain group degrade to the root (byte-identical).
-        yield* sendNotice(chatKey, what, message.messageId);
+        yield* sendNotice(
+          chatKey,
+          "I received an empty message — please send some text.",
+          message.messageId,
+        );
         return;
       }
 
@@ -237,6 +253,35 @@ export const makeInboundHandler = (deps: InboundHandlerDeps): InboundHandlerHand
         }
       }
 
+      // Batch A: download + encode this message's images HERE (inbound is the
+      // gateway-holding async edge) — and BEFORE `ensureThread`'s create/bind
+      // side effect. Doing it first means a doomed image-only message (every
+      // image dropped AND no text) bails WITHOUT leaving a spurious empty thread
+      // or, offline, a contradictory "⏳ queued" + "N 张未发送" pair — matching the
+      // pre-batch-A filter, which rejected image-only messages before any thread
+      // was touched (review finding). The download still runs at inbound, so an
+      // offline-buffered turn rides pre-encoded (Feishu resources never expire
+      // mid-flush) and the pure merge/build path downstream only carries
+      // already-prepared `uploaded` payloads. Bad images (unsupported type /
+      // oversized / download failure) are dropped and counted so we NEVER send a
+      // payload the server would reject the whole turn for; the user gets one
+      // merged notice rather than per-image spam.
+      const prepared = yield* prepareInboundImages({ downloadImage }, message);
+      if (prepared.skipped > 0) {
+        yield* sendNotice(
+          chatKey,
+          `${prepared.skipped} 张图片未发送(格式不支持 / 过大 / 下载失败)。`,
+          message.messageId,
+        );
+      }
+      // If every image was dropped AND there is no text, there is nothing to act
+      // on — the skip notice already explained; bail before `ensureThread` so no
+      // thread is created/buffered for a turn that will never run.
+      const hasUploaded = prepared.message.attachments.some((att) => att.uploaded !== undefined);
+      if (message.text.trim().length === 0 && !hasUploaded) {
+        return;
+      }
+
       // Ensure the chat↔thread binding FIRST (serialised) so the queue resolves
       // the real threadId when it merges — the stable commandId triple includes
       // the threadId, so offering before binding would derive the wrong id.
@@ -257,8 +302,9 @@ export const makeInboundHandler = (deps: InboundHandlerDeps): InboundHandlerHand
       // `offer` blocks for the idle coalescing window; concurrent offers for
       // the same chat collapse via the generation-debounce into one dispatch.
       // The returned merge carries `resolvedThreadId` — resolved at the same
-      // instant its commandId was — which `runTurn` dispatches against.
-      const merged = yield* turnQueue.offer(chatKey, message);
+      // instant its commandId was — which `runTurn` dispatches against. Offer the
+      // PREPARED message so its encoded images ride through the queue.
+      const merged = yield* turnQueue.offer(chatKey, prepared.message);
       if (merged === null) {
         return; // Coalesced into a peer offer, or held during a running turn.
       }
