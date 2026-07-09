@@ -249,3 +249,73 @@ export const statusMetaSuffix = (thread: OrchestrationThread): string => {
   }
   return segments.length > 0 ? ` · ${segments.join(" · ")}` : "";
 };
+
+// ── Token usage (batch B) ─────────────────────────────────────────────────────
+
+/**
+ * Compact token count: `<1k` verbatim, `70k` / `353.1k` in thousands (one
+ * decimal, trailing `.0` dropped), `1M` / `1.5M` in millions. Diverges from web's
+ * `formatContextWindowTokens` on purpose — the Feishu status line reads best with
+ * a one-decimal `k` and an uppercase `M` (e.g. `35% 353.1k/1M`).
+ */
+const formatTokenCount = (value: number): string => {
+  if (value < 1_000) {
+    return `${Math.round(value)}`;
+  }
+  if (value < 1_000_000) {
+    return `${(value / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
+  }
+  return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+};
+
+/** Read a finite non-negative number field from an activity's `Schema.Unknown`
+ * payload (returns null when absent / malformed). */
+const readUsageField = (payload: unknown, key: string): number | null => {
+  if (payload === null || typeof payload !== "object") {
+    return null;
+  }
+  const value = (payload as Record<string, unknown>)[key];
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+};
+
+/**
+ * Context-window usage suffix for the status line (batch B, **card density only**
+ * — the low-noise `markdown`/`text` densities carry no meta suffix, so it never
+ * shows there). The latest context-window usage rides the thread's activity
+ * stream as a `context-window.updated` activity — the SAME source web's
+ * context-window meter reads (`deriveLatestContextWindowSnapshot`), NOT a
+ * snapshot field — so no new subscription is needed; the folded thread already
+ * carries it.
+ *
+ * IMPORTANT: this is the context-window **occupancy** (how full the model's
+ * context is right now — dominated by the stable system-prompt / tools / memory
+ * baseline), NOT this turn's incremental cost. That is why it barely moves across
+ * short turns. When the provider reports the window size (`maxTokens`) we render
+ * it as ` · 35% 353.1k/1M` so the magnitude reads unambiguously as fullness, not
+ * per-turn spend; without a known window we fall back to ` · 353.1k tok`.
+ *
+ * Scans back for the most recent well-formed usage activity. Returns "" when none
+ * is present (older threads, or a turn before its first usage tick) so the status
+ * line is byte-identical to today whenever usage is absent (no-op red line).
+ */
+export const tokenUsageSuffix = (thread: OrchestrationThread): string => {
+  for (let index = thread.activities.length - 1; index >= 0; index -= 1) {
+    const activity = thread.activities[index];
+    if (!activity || activity.kind !== "context-window.updated") {
+      continue;
+    }
+    const used = readUsageField(activity.payload, "usedTokens");
+    if (used === null) {
+      // A malformed / partial usage activity — keep scanning older ones rather
+      // than giving up (mirrors web's derive loop's `continue`).
+      continue;
+    }
+    const max = readUsageField(activity.payload, "maxTokens");
+    if (max !== null && max > 0) {
+      const pct = Math.min(100, Math.round((used / max) * 100));
+      return ` · ${pct}% ${formatTokenCount(used)}/${formatTokenCount(max)}`;
+    }
+    return ` · ${formatTokenCount(used)} tok`;
+  }
+  return "";
+};

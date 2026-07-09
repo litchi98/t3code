@@ -63,6 +63,7 @@ import {
   renderStatusLine,
   runtimeBadgeSuffix,
   statusMetaSuffix,
+  tokenUsageSuffix,
   turnDuration,
 } from "./render/status.ts";
 import { latestAssistantText } from "./render/turnScope.ts";
@@ -245,7 +246,11 @@ export const renderThreadCard = (
     // Low-noise densities drop the ` · 📁 ws · 🌿 branch` meta suffix (only `card`
     // carries it — workspace/branch are low value in a noisy group thread) but fold
     // the runtime badge onto the status line's end instead of a dedicated row.
-    const statusMeta = density === "card" ? statusMetaSuffix(thread) : badgeSuffix;
+    // Batch B: `card` also appends ` · N tok` token usage after workspace/branch
+    // (card-only — the low-noise densities have no meta suffix; absent usage →
+    // "" so the line is byte-identical to today).
+    const statusMeta =
+      density === "card" ? statusMetaSuffix(thread) + tokenUsageSuffix(thread) : badgeSuffix;
     const statusLine = suppressIdleDone
       ? null
       : renderStatusLine(turnStatus, turnDuration(thread), statusMeta);

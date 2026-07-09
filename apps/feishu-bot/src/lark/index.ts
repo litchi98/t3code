@@ -106,6 +106,16 @@ export class LarkGateway extends Context.Service<
       emojiType: string,
     ) => Effect.Effect<string, LarkGatewayError>;
     /**
+     * Remove the bot's own reaction by its Feishu `reaction_id` (the value
+     * {@link addReaction} returned). Precise — deletes exactly the reaction this
+     * bot added, without a list-then-filter round trip. Used by the turn-status
+     * reaction state machine to swap the running receipt for a terminal one.
+     */
+    readonly removeReaction: (
+      messageId: string,
+      reactionId: string,
+    ) => Effect.Effect<void, LarkGatewayError>;
+    /**
      * Remove the bot's reaction matching `emojiType` from `messageId` without a
      * stored `reaction_id`. Resolves `true` when a matching reaction was removed.
      */

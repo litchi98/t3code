@@ -58,6 +58,22 @@ const SOURCE_TAG = "t3tools-feishu-bot";
 const HANDSHAKE_TIMEOUT_MS = 30_000;
 
 /**
+ * Per-request transport timeout (ms) for ALL outbound REST calls. The SDK's
+ * axios client defaults to `timeout: 0` (no bound), so a half-open / silently
+ * dropped connection would leave the request pending indefinitely — leaking the
+ * socket + promise. `Effect.timeout` at the call site only interrupts the Effect
+ * fiber, NOT the underlying axios request, so it cannot reap the socket on its
+ * own; this transport bound is what actually aborts a hung request. Generous
+ * (60s) so a legitimately slow-but-alive call — a large image download (batch A)
+ * on a poor link — is never cut off; it only reaps genuinely dead connections.
+ * The streaming card path is unaffected: it streams via discrete short
+ * `updateCard` REST calls, not one long-lived request. Applies to the SDK's
+ * process-wide `defaultHttpInstance`, which is fine — this process runs exactly
+ * one Lark client.
+ */
+const HTTP_REQUEST_TIMEOUT_MS = 60_000;
+
+/**
  * Single admission point for inbound chat types.
  *
  * M3a opens group chats alongside 1:1 private chats, so this admits `"p2p"` and
@@ -284,6 +300,7 @@ export const larkGatewayLayer = (config: FeishuCredentials): Layer.Layer<LarkGat
           transport: "websocket",
           source: SOURCE_TAG,
           handshakeTimeoutMs: HANDSHAKE_TIMEOUT_MS,
+          httpTimeoutMs: HTTP_REQUEST_TIMEOUT_MS,
           includeRawEvent: true,
           resolveChatMode: true,
           keepalive: { enabled: true },
@@ -584,6 +601,9 @@ export const larkGatewayLayer = (config: FeishuCredentials): Layer.Layer<LarkGat
       const addReaction = (messageId: string, emojiType: string) =>
         sdkCall("add reaction", () => channel.addReaction(messageId, emojiType));
 
+      const removeReaction = (messageId: string, reactionId: string) =>
+        sdkCall("remove reaction", () => channel.removeReaction(messageId, reactionId));
+
       const removeReactionByEmoji = (messageId: string, emojiType: string) =>
         sdkCall("remove reaction", () => channel.removeReactionByEmoji(messageId, emojiType));
 
@@ -595,6 +615,7 @@ export const larkGatewayLayer = (config: FeishuCredentials): Layer.Layer<LarkGat
         disconnect,
         startStreamingCard,
         addReaction,
+        removeReaction,
         removeReactionByEmoji,
         downloadImage,
         updateCard,
