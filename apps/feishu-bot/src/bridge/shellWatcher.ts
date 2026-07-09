@@ -20,8 +20,8 @@
  *      or an *interrupt* from another end (`interrupted`), each with its own
  *      text. Ordinary streaming output is still never pushed.
  *
- * Both consume the *same* `shellCache.changes` fold — one fiber, one traversal
- * over the snapshot stream — rather than two independent subscriptions.
+ * Both consume the *same* `shellCache.snapshotAndChanges` fold — one fiber, one
+ * traversal over the snapshot stream — rather than two independent subscriptions.
  *
  * ── Why per-thread/per-turn memory, NOT frame-to-frame diff ──────────────────
  * On reconnect the underlying `subscribeShell` replays a full snapshot (the
@@ -43,13 +43,19 @@
  * events (see `clearNoticeMemory`) so a later `/resume` of the same thread
  * re-evaluates from scratch — neither of these is a return to per-frame diffing.
  *
- * This module folds `shellCache.changes` and reads each bound thread's
+ * This module folds `shellCache.snapshotAndChanges` and reads each bound thread's
  * {@link OrchestrationThreadShell} out of the latest snapshot. It never derives
  * shell state itself (that is `shellCache`'s job) and performs the actual unbind
  * / mirror-teardown / notice send through injected hooks so it stays decoupled
  * from `bindingState`'s and the gateway's concrete shapes.
  */
-import type { OrchestrationThreadShell, ThreadId, TurnId } from "@t3tools/contracts";
+import type {
+  OrchestrationShellSnapshot,
+  OrchestrationThreadShell,
+  ThreadId,
+  TurnId,
+} from "@t3tools/contracts";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -232,6 +238,48 @@ export const runShellWatcherFiber = (deps: ShellWatcherDeps): Effect.Effect<Shel
     // frames notify on edges relative to that baseline.
     const firstFrame = yield* Ref.make(true);
 
+    // Observe cold-start baseline — the turnIds already running at STARTUP of this
+    // bot uptime. The observe trigger (`ensureObserving`) is the one reverse-
+    // notification that was NOT brought under the cold-start-seed discipline the rest
+    // of this module documents: without it, a turn that was already running before a
+    // restart is replayed as a fresh running edge and opens a *new* mirror card for it.
+    // For an orphaned/stuck turn (one that never reaches a terminal state, so its
+    // `session.activeTurnId` stays non-null forever) that means re-posting a frozen
+    // "处理中" card on EVERY restart — the observe fiber's own guard only skips a turn
+    // that is already terminal (`activeTurnId == null`), never a stuck-but-non-terminal
+    // one. `ensureObserving` is gated below by `isNewTurn` so a turn whose id is in this
+    // set is never auto-observed; `/resume` still re-observes explicitly (that path does
+    // not consult this set). Process-local by design: it re-seeds fresh on every restart.
+    //
+    // ── Why the TRUE startup snapshot, not `current` at `start` ───────────────────
+    // The baseline must be "turns already running before this bot uptime began". Two
+    // traps make `shellCache.current` (read at `start`) the WRONG source:
+    //   • `current` is the LATEST folded snapshot. The fold fiber runs concurrently
+    //     with connect + M18 recovery, so by the time `start` reads it a turn web
+    //     STARTED during that boot window may already be folded in — baking a genuinely
+    //     new turn into the baseline and suppressing its mirror forever.
+    //   • If `current` is still null at `start`, a check-then-subscribe race on the
+    //     `changes` PubSub can lose the startup snapshot's publish, so the first frame
+    //     the watcher processes is a later change — re-introducing the same "bake a new
+    //     turn" hole from the fallback path.
+    // Both vanish if we seed from `shellCache.firstSnapshot`: the VERY FIRST snapshot
+    // the cache folded (the full snapshot `subscribeShell` always replays first),
+    // captured deterministically by the fold fiber via a `Deferred` — race-free and
+    // never advanced past startup. `start` awaits it (bounded) before forking the loop.
+    const coldStartActiveTurnIds = yield* Ref.make<ReadonlySet<TurnId>>(new Set());
+    // Collect every non-null `session.activeTurnId` in a snapshot — the turns running
+    // at the moment the snapshot reflects (used to seed the cold-start baseline).
+    const collectActiveTurnIds = (snapshot: OrchestrationShellSnapshot): ReadonlySet<TurnId> => {
+      const set = new Set<TurnId>();
+      for (const thread of snapshot.threads) {
+        const activeTurnId = thread.session?.activeTurnId ?? null;
+        if (activeTurnId !== null) {
+          set.add(activeTurnId);
+        }
+      }
+      return set;
+    };
+
     /** One reconciliation/notification pass over the current snapshot. */
     const onFrame = Effect.gen(function* () {
       const snapshot = yield* deps.shellCache.current;
@@ -263,6 +311,20 @@ export const runShellWatcherFiber = (deps: ShellWatcherDeps): Effect.Effect<Shel
         // full resumed path below.
         const shell = yield* deps.shellCache.threadById(binding.threadId);
 
+        // ── Observe cold-start guard (see `coldStartActiveTurnIds`) ───────────────
+        // The baseline is seeded once in `start` from `shellCache.firstSnapshot` (the
+        // true startup state), NOT here — so a turn that arrives as a
+        // later change frame (a genuinely new turn started during this uptime, incl. a
+        // server-spawned subagent turn with its own fresh turnId) is correctly NOT in
+        // the set. `isNewTurn` gates every `ensureObserving` call below: true only for a
+        // turn currently running (`activeTurnId != null`) whose id was NOT running at
+        // startup. This closes the "re-post a frozen mirror card for an orphaned/stuck
+        // turn on every restart" hole without touching the M3a subagent-observe or the
+        // "mirror a turn web starts after takeover" behaviours.
+        const activeTurnId = shell?.session?.activeTurnId ?? null;
+        const isNewTurn =
+          activeTurnId !== null && !(yield* Ref.get(coldStartActiveTurnIds)).has(activeTurnId);
+
         // ── Scope gate: takeovers only (with M3a self-created observe exception) ──
         // The watcher exists primarily for `origin: "resumed"` takeovers — chats
         // loosely bound to a thread another end drives. A `self-created` binding
@@ -284,9 +346,12 @@ export const runShellWatcherFiber = (deps: ShellWatcherDeps): Effect.Effect<Shel
         //   • atomic per-chat dedup → at most one observe fiber/card per chat
         // Reconciliation and key notifications remain resumed-only (no change there).
         if (binding.origin !== "resumed") {
-          if (shell?.session?.activeTurnId != null) {
+          // Cold-start guard: only mirror a turn that STARTED during this uptime, not
+          // one orphaned by a restart (which would re-post a frozen card). See
+          // `coldStartActiveTurnIds`.
+          if (isNewTurn) {
             yield* deps
-              .ensureObserving(chatId, binding.threadId, shell.session.activeTurnId)
+              .ensureObserving(chatId, binding.threadId, activeTurnId)
               .pipe(
                 Effect.catchCause((cause) =>
                   Effect.logWarning(
@@ -311,6 +376,33 @@ export const runShellWatcherFiber = (deps: ShellWatcherDeps): Effect.Effect<Shel
           // work already done above (unbind + stopMirror + sendNotice succeeded).
           yield* store.remove(binding.threadId).pipe(Effect.ignore);
           return;
+        }
+
+        // ── M2b-3: live-mirror a turn web/terminal started AFTER the takeover ──────
+        // The user accepted "也纳入接管后 web 又起的新 turn 也要镜像": once a chat is
+        // taken over, a turn another end starts later must be mirrored just like the one
+        // running at takeover. Hand off to `ensureObserving` (forks a cross-end observe
+        // card; no-ops if already observing / if the bridge is driving this chat's own
+        // turn). Its atomic dedup is keyed on the chat's PRESENCE in the observe registry
+        // (NOT per-turn), fiber self-evicting on exit, so calling it on every running
+        // frame is safe — one fiber/card per chat, reused across consecutive turns.
+        //
+        // Placed BEFORE the cold-start notice-seed early return below (unlike the notice
+        // paths): observe is independently gated by `isNewTurn` (baseline-aware — a turn
+        // running at startup is already excluded), so it does NOT need the isFirstFrame
+        // suppression the *notices* require. Running it on the first processed frame is
+        // what lets a new turn present on that very first frame (or one whose pre-
+        // subscribe PubSub frame was lost, then reconciled by `start`'s one-shot pass)
+        // be mirrored immediately instead of only after a later frame arrives (which a
+        // turn that wedges right after starting would never produce). Best-effort wrap.
+        if (isNewTurn) {
+          yield* deps
+            .ensureObserving(chatId, binding.threadId, activeTurnId)
+            .pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("[feishu-bot] shellWatcher ensureObserving failed", cause),
+              ),
+            );
         }
 
         // ── Cold-start baseline seed ──────────────────────────────────────
@@ -353,30 +445,10 @@ export const runShellWatcherFiber = (deps: ShellWatcherDeps): Effect.Effect<Shel
         // only the user-facing `sendNotice` call is removed.
         const approvalNotified = shell.hasPendingApprovals;
 
-        // ── M2b-3: live-mirror a turn web/terminal started AFTER the takeover ──────
-        // The user accepted "也纳入接管后 web 又起的新 turn 也要镜像": once a chat is
-        // taken over, a turn another end starts later must be mirrored just like the
-        // one that was running at takeover. 修法 A/B only surface *pending approvals*;
-        // they never mirror a turn's progress/result. This resident fiber is the one
-        // observer of the resumed thread's shell, so whenever it shows a turn running
-        // (`session.activeTurnId`) we hand off to `ensureObserving`, which forks a
-        // cross-end observe card (and no-ops if already observing / if the bridge is
-        // driving this chat's own turn / if an outstanding approval card already
-        // exists). Its atomic dedup is keyed on the chat's PRESENCE in the observe
-        // registry (NOT per-turn), with the fiber self-evicting on exit, so calling it
-        // on every running frame is safe — one observe fiber/card per chat, reused
-        // across a chat's consecutive turns (continuous mirror); a fresh one starts
-        // only after the prior self-evicts. Best-effort: `ensureObserving` never
-        // fails, but wrap defensively so it cannot break this frame.
-        if (shell.session?.activeTurnId != null) {
-          yield* deps
-            .ensureObserving(chatId, binding.threadId, shell.session.activeTurnId)
-            .pipe(
-              Effect.catchCause((cause) =>
-                Effect.logWarning("[feishu-bot] shellWatcher ensureObserving failed", cause),
-              ),
-            );
-        }
+        // (Observe hand-off — `ensureObserving` for a running turn — was moved ABOVE the
+        // cold-start notice-seed early return; see that block. It is gated by `isNewTurn`
+        // so it needs no isFirstFrame suppression, and running it on the first frame lets
+        // a new takeover turn mirror immediately.)
 
         // M2b-2 (修法 B): surface follow-on / chained approvals AND user-inputs for a
         // resumed thread. After a `/resume` takeover the bridge is NOT live-mirroring,
@@ -443,16 +515,47 @@ export const runShellWatcherFiber = (deps: ShellWatcherDeps): Effect.Effect<Shel
         ),
       );
 
-    // Single fold over `shellCache.changes`; forked into the caller's scope so it
-    // is interrupted when the resident shell subscription is torn down. Deferred
-    // into `start` (not forked at construction) so the caller controls when the
-    // loop begins — the bot starts it AFTER M18 restart-recovery has seeded the
-    // per-chat dedup baseline (see {@link ShellWatcherHandle.start}).
-    const start: Effect.Effect<void, never, Scope.Scope> = deps.shellCache.changes.pipe(
-      Stream.runForEach(() => onFrame),
-      Effect.forkScoped,
-      Effect.asVoid,
-    );
+    // Single fold over `shellCache.snapshotAndChanges`; forked into the caller's scope
+    // so it is interrupted when the resident shell subscription is torn down. Deferred
+    // into `start` (not forked at construction) so the caller controls when the loop
+    // begins — the bot starts it AFTER M18 restart-recovery has seeded the per-chat
+    // dedup baseline (see {@link ShellWatcherHandle.start}).
+    //
+    // Seed the observe cold-start baseline from `shellCache.firstSnapshot` (the true
+    // startup snapshot — see `coldStartActiveTurnIds`) BEFORE forking the fold, so the
+    // baseline is in place before the first frame is processed and a turn that started
+    // during the boot window is never mistaken for pre-existing state. Awaiting it here
+    // is safe: by the time `start` runs (after connect + M18 recovery, which itself
+    // reads the cache) the first snapshot has effectively always landed, and the bounded
+    // timeout keeps a pathologically-never-delivering shell from wedging startup
+    // (falling back to `current` — best-effort, near-impossible to hit — or an empty
+    // baseline). An empty baseline only means a stale turn could be re-observed once,
+    // never a crash.
+    //
+    // The fold consumes `snapshotAndChanges`, whose FIRST frame is the current snapshot
+    // AT SUBSCRIPTION TIME (delivered atomically — the stream subscribes to the change
+    // PubSub before reading `current`). So a turn folded during the boot window, before
+    // this fold subscribes, is present in that leading frame and reconciled/observed on
+    // the watcher's first frame — no separate reconcile pass, no fold-vs-subscribe gap,
+    // and no lost pre-subscribe publish. `isNewTurn` (baseline-gated above) keeps a
+    // genuine pre-restart turn from being re-observed while still mirroring a boot-window
+    // new turn. The leading snapshot IS the first frame, so it seeds the NoticeMemory
+    // cold-start baseline (no notices) exactly as before.
+    const start: Effect.Effect<void, never, Scope.Scope> = Effect.gen(function* () {
+      const startupSnapshot = yield* deps.shellCache.firstSnapshot.pipe(
+        Effect.timeoutOrElse({
+          duration: Duration.seconds(10),
+          orElse: () => deps.shellCache.current,
+        }),
+      );
+      if (startupSnapshot !== null) {
+        yield* Ref.set(coldStartActiveTurnIds, collectActiveTurnIds(startupSnapshot));
+      }
+      yield* deps.shellCache.snapshotAndChanges.pipe(
+        Stream.runForEach(() => onFrame),
+        Effect.forkScoped,
+      );
+    });
 
     // Discrete lifecycle reset (NOT per-frame): drop a thread's dedup memory so a
     // future `/resume` of the same thread re-evaluates its notices from scratch.
