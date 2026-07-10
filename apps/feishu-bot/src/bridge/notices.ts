@@ -61,6 +61,38 @@ export const topicSendOpts = (
     ? { replyTo, replyInThread: true }
     : undefined;
 
+/**
+ * Build the SDK {@link SendOptions} for a card that *answers* a triggering
+ * message — a new-turn card ({@link makeTurnRunner} `driveTurn`) or a command /
+ * notice receipt ({@link NoticesHandle.sendNotice}) — so it posts as a Feishu
+ * *reply* (飞书「回复」) quoting that message. A strict superset of
+ * {@link topicSendOpts} — the group/topic branch is byte-identical; the ONLY
+ * addition is the p2p case:
+ *
+ * - **group / topic turn** (`larkThreadId` present, from `anchorOf`): unchanged
+ *   `{ replyTo, replyInThread: true }` — `reply_in_thread` anchors the card
+ *   inside the topic / plain-group thread (a group-only Feishu feature; error
+ *   230071 outside a thread-mode group).
+ * - **p2p turn** (`larkThreadId === undefined`, `replyTo` present): a *plain*
+ *   reply `{ replyTo }` (NO `replyInThread`) → Feishu quotes the triggering
+ *   message without a thread. p2p has no threads, so `reply_in_thread` must NOT
+ *   be set here; the SDK's `reply` call still degrades safely (it drops
+ *   `replyTo` and re-sends as a plain create) if the quoted message is gone.
+ * - **no reply anchor** (flush/replay with no live source): `undefined` → posts
+ *   at the chat root, unchanged.
+ *
+ * NB: `larkThreadId === undefined` ⟺ p2p here, because the composite chat key is
+ * built with `anchorOf`, which returns a non-empty anchor for every group/topic
+ * message and `undefined` only for p2p. So this never turns a plain-group turn
+ * into a threadless reply (they always carry a `larkThreadId`).
+ */
+export const turnReplySendOpts = (
+  larkThreadId: string | undefined,
+  replyTo: string | undefined,
+): SendOptions | undefined =>
+  topicSendOpts(larkThreadId, replyTo) ??
+  (replyTo !== undefined ? { replyTo } : undefined);
+
 /** Dependencies for constructing the notice helpers. */
 export interface NoticesDeps {
   readonly gateway: LarkGateway["Service"];
@@ -158,12 +190,15 @@ export const makeNotices = (deps: NoticesDeps): Effect.Effect<NoticesHandle> =>
     // resolved, so the SDK producer renders once and settles immediately. Failures
     // are logged and swallowed — a notice must never crash the handler.
     // M3a: `chatKey` is the composite `chatId[:larkThreadId]` (the bridge's
-    // internal conversation identity). Fix 5: when the notice answers a *triggering*
-    // message (`replyToMessageId` supplied) AND the key is a topic, `topicSendOpts`
-    // anchors the card inside that topic; for p2p / plain group / no anchor it
-    // returns `undefined` so the card posts at the chat/group root (byte-identical
-    // to pre-Fix-5). A bare `chatId` (p2p / plain group) has no `larkThreadId`, so
-    // the topic opts never fire there.
+    // internal conversation identity). When the notice answers a *triggering*
+    // message (`replyToMessageId` supplied), `turnReplySendOpts` posts the card as
+    // a Feishu reply quoting it: a group/topic key anchors it in the thread
+    // (`replyInThread: true`, unchanged); a p2p key (no `larkThreadId`) posts a
+    // *plain* reply (`{ replyTo }`) so a private-chat command receipt quotes the
+    // command message (飞书「回复」). With no anchor it stays `undefined` → posts at
+    // the chat root. Every `sendNotice` caller passes a real Feishu `message.messageId`
+    // as `replyToMessageId` (never a commandId), and the SDK drops a vanished reply
+    // target and re-sends as a plain create — so the quote never fails the notice.
     const sendNotice = (
       chatKey: string,
       text: string,
@@ -185,7 +220,7 @@ export const makeNotices = (deps: NoticesDeps): Effect.Effect<NoticesHandle> =>
             chatId,
             card,
             { done: Deferred.await(done) },
-            topicSendOpts(larkThreadId, replyToMessageId),
+            turnReplySendOpts(larkThreadId, replyToMessageId),
           )
           .pipe(
             Effect.tapError((error) =>
