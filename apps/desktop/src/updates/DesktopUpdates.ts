@@ -1,5 +1,6 @@
 import {
   DesktopUpdateChannelSchema,
+  DESKTOP_BACKEND_TERMINATE_GRACE,
   type DesktopRuntimeInfo,
   type DesktopUpdateActionResult,
   type DesktopUpdateChannel,
@@ -9,7 +10,6 @@ import {
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
-import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -458,7 +458,14 @@ export const make = Effect.gen(function* () {
     yield* Ref.set(updateInstallInFlightRef, true);
 
     return yield* Effect.gen(function* () {
-      yield* backendManager.stop({ timeout: Duration.seconds(5) });
+      // Must be at least DESKTOP_BACKEND_TERMINATE_GRACE: this is the outer
+      // bound on how long we wait for the server to gracefully exit before
+      // giving up and proceeding to quitAndInstall (which force-quits the
+      // whole app). A shorter timeout here races the server's own SIGTERM
+      // handling — including its grace period for tearing down the
+      // feishu-bot child — and can leave the bot orphaned when the update
+      // install path force-quits desktop before the server finishes.
+      yield* backendManager.stop({ timeout: DESKTOP_BACKEND_TERMINATE_GRACE });
       yield* electronWindow.destroyAll;
       yield* electronUpdater.quitAndInstall({
         isSilent: true,

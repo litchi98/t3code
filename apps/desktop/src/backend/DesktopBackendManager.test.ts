@@ -1,6 +1,7 @@
 import {
   DesktopBackendBootstrap,
   type DesktopBackendBootstrap as DesktopBackendBootstrapValue,
+  DESKTOP_BACKEND_TERMINATE_GRACE,
 } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
@@ -231,7 +232,7 @@ describe("DesktopBackendManager", () => {
         assert.isDefined(spawnedCommand.options.forceKillAfter);
         assert.equal(
           Duration.toMillis(Duration.fromInputUnsafe(spawnedCommand.options.forceKillAfter)),
-          2_000,
+          Duration.toMillis(DESKTOP_BACKEND_TERMINATE_GRACE),
         );
 
         assert.deepEqual(yield* decodeBootstrap(bootstrapJson), configWithObservability);
