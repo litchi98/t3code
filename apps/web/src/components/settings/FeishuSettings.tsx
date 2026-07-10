@@ -4,27 +4,31 @@ import type {
   FeishuChatConfig,
   FeishuChatDirectoryEntry,
   FeishuChatMember,
+  ServerSettingsPatch,
 } from "@t3tools/contracts";
 import { FEISHU_COMMAND_REGISTRY, FEISHU_CONFIGURABLE_COMMANDS } from "@t3tools/contracts";
 import {
+  ChevronDownIcon,
   ChevronRightIcon,
   CopyIcon,
   EllipsisIcon,
   LinkIcon,
   PlusIcon,
+  RotateCcwIcon,
   UserIcon,
   UsersIcon,
   XIcon,
 } from "lucide-react";
+import { useAtomValue } from "@effect/atom-react";
 import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 
 import { cn } from "~/lib/utils";
 import { useProjects } from "~/state/entities";
 import { usePrimaryEnvironment } from "~/state/environments";
 import { useEnvironmentQuery } from "~/state/query";
-import { serverEnvironment } from "~/state/server";
+import { primaryServerConfigAtom, serverEnvironment } from "~/state/server";
 import { useAtomCommand } from "~/state/use-atom-command";
-import { usePrimarySettings, useUpdatePrimarySettings } from "../../hooks/useSettings";
+import { usePrimarySettings } from "../../hooks/useSettings";
 import { RightPanelSheet } from "../RightPanelSheet";
 import { Avatar } from "../ui/avatar";
 import { Badge } from "../ui/badge";
@@ -34,10 +38,12 @@ import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Checkbox } from "../ui/checkbox";
 import { Input } from "../ui/input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
+import { stackedThreadToast, toastManager } from "../ui/toast";
 import { FeishuBindingDialog } from "./FeishuBindingDialog";
 import {
   APPROVAL_MODE_LABELS,
   APPROVAL_MODES,
+  approvalSummary,
   chatModeSelection,
   type ChatModeSelection,
   commandsSummary,
@@ -50,11 +56,13 @@ import {
   DENSITY_MODES,
   describeInheritedCommands,
   describeInheritedWorkspaces,
+  type DimensionCoverage,
+  dimensionCoverage,
+  type DimensionKey,
   type EffectiveConfig,
   effectiveConfig,
   type FeishuChatConfigMap,
   INHERIT_MODE,
-  isChatOverridden,
   type RenderDensity,
   restingChatSummary,
   setConfigApprovalMode,
@@ -96,17 +104,28 @@ export function FeishuSettingsPanel() {
   // single draft (same one-draft-ref pattern the group section uses for
   // `feishuChatConfigs`).
   const serverDefaults = usePrimarySettings((s) => s.feishuChatDefaults);
-  const update = useUpdatePrimarySettings();
+  // Whether the server settings have actually arrived over the ws (vs. the empty
+  // pre-hydration default). Every write is gated on this so a whole-value replacement
+  // is never derived from the empty placeholder — see `useOptimisticSetting`.
+  const hydrated = useServerSettingsHydrated();
+  const persist = usePersistSetting();
   const writeDefaults = useCallback(
-    (next: FeishuChatConfig) => update({ feishuChatDefaults: next }),
-    [update],
+    (next: FeishuChatConfig) => persist({ feishuChatDefaults: next }),
+    [persist],
   );
-  const [defaults, commitDefaults] = useOptimisticSetting(serverDefaults, writeDefaults);
+  const [defaults, commitDefaults] = useOptimisticSetting(serverDefaults, writeDefaults, {
+    canCommit: hydrated,
+    failure: DEFAULTS_WRITE_FAILURE,
+  });
   return (
     <SettingsPageContainer>
       <FeishuBindingSection />
       <FeishuP2pSection defaults={defaults} commitDefaults={commitDefaults} />
-      <FeishuChatConfigSection defaults={defaults} commitDefaults={commitDefaults} />
+      <FeishuChatConfigSection
+        defaults={defaults}
+        commitDefaults={commitDefaults}
+        hydrated={hydrated}
+      />
     </SettingsPageContainer>
   );
 }
@@ -370,32 +389,110 @@ function FeishuBindingSection() {
  * and mutates a ref synchronously on every commit, so each edit derives the next
  * whole map from the freshest accumulated draft rather than a render snapshot.
  */
+/** A write failure's user-facing copy: which settings failed, and how to recover. */
+type WriteFailure = { readonly title: string; readonly description: string };
+
+const DEFAULTS_WRITE_FAILURE: WriteFailure = {
+  title: "飞书默认配置未保存",
+  description:
+    "默认审批 / 命令 / 工作区 / 密度设置未能写入服务器。原有配置仍然生效——点「重试」重新保存。",
+};
+
+const CONFIGS_WRITE_FAILURE: WriteFailure = {
+  title: "飞书群聊配置未保存",
+  description:
+    "本次群聊审批 / 命令 / 工作区改动未能写入服务器。原有配置仍然生效——点「重试」重新保存。",
+};
+
+type ToastId = ReturnType<typeof toastManager.add>;
+
 /**
- * Optimistic overlay over a server-backed setting value.
+ * True once the primary server config has actually arrived over the ws — i.e. the
+ * settings this editor reads are the REAL server state, not the empty pre-hydration
+ * `DEFAULT_SERVER_SETTINGS` fallback (`primaryServerSettingsAtom` returns that until
+ * `primaryServerConfigAtom` is populated). Every write is gated on this so a
+ * whole-value replacement is never derived from the empty placeholder (which would
+ * wipe real server config). While the primary environment is absent this is `false`
+ * too (there is nothing to write to).
+ */
+function useServerSettingsHydrated(): boolean {
+  return useAtomValue(primaryServerConfigAtom) !== null;
+}
+
+/**
+ * The pure RPC writer for the two Feishu server keys. Persists a whole-value patch
+ * via the settings command directly (the same `useAtomCommand` + Result-tag pattern
+ * as `handleUnbind`) and resolves `true` on success / `false` on failure, WITHOUT
+ * surfacing anything itself — the optimistic overlay owns the user-facing toast, so
+ * it can gate the alarm on whether the write was superseded (see
+ * `useOptimisticSetting`). Both keys live in `ServerSettings`, so for them this is
+ * byte-equivalent to `useUpdateSettingsTarget` (which splits the patch and calls the
+ * same command), minus the swallowed Result. `useUpdatePrimarySettings` is
+ * fire-and-forget (voids the Result), so it can't report failure at all.
+ */
+function usePersistSetting(): (patch: ServerSettingsPatch) => Promise<boolean> {
+  const environmentId = usePrimaryEnvironment()?.environmentId ?? null;
+  const persist = useAtomCommand(serverEnvironment.updateSettings, "server settings update");
+  return useCallback(
+    (patch) => {
+      // Unreachable while `canCommit` (hydration) gates writes — hydration implies a
+      // primary environment — but fail safe (report, don't silently drop) if it ever is.
+      if (environmentId === null) return Promise.resolve(false);
+      return persist({ environmentId, input: { patch } }).then(
+        (result) => result._tag !== "Failure",
+      );
+    },
+    [environmentId, persist],
+  );
+}
+
+/**
+ * Optimistic overlay over a server-backed setting value, with a failure receipt.
  *
- * The settings write path is fire-and-forget with no local echo — the atom value
- * only advances when the server re-emits the config over the ws (which is also
- * how live-refresh + first-load HYDRATION arrive). So rendering from a seed-once
- * local copy is wrong: it freezes whatever the atom held at mount (often the
- * pre-hydration empty default), and a page refresh then shows stale/empty.
+ * The settings write path has no local echo — the atom value only advances when the
+ * server re-emits the config over the ws (which is also how live-refresh + first-load
+ * HYDRATION arrive). So rendering from a seed-once local copy is wrong: it freezes
+ * whatever the atom held at mount (often the pre-hydration empty default), and a page
+ * refresh then shows stale/empty. Instead render the SERVER value by default, and
+ * hold a local `pending` value ONLY while our own write is in flight so a rapid
+ * sequence of edits accumulates. The overlay settles back to the server value once
+ * the server catches up to our latest write (deepEqual echo) or moves to something we
+ * didn't write (external change / hydration) — both cases follow the server.
  *
- * Instead render the SERVER value by default, and hold a local `pending` value
- * ONLY while our own write is in flight so a rapid sequence of edits accumulates
- * (instead of each recomputing from a snapshot the round-trip hasn't updated yet).
- * The overlay settles back to the server value once the server catches up to our
- * latest write (deepEqual echo) or moves to something we didn't write (external
- * change / hydration) — both cases follow the server.
+ * `options.canCommit` gates writing on hydration (never derive a whole-value
+ * replacement from the empty pre-hydration snapshot — it would wipe real config).
+ * When `options.failure` is set, this hook also owns the failure toast lifecycle:
+ * - A FAILED, still-latest write rolls the overlay back to the server value (else
+ *   `pending` would show the unsaved value forever — the server never echoes it) and
+ *   raises ONE retryable error toast.
+ * - A SUPERSEDED failure is silent: a newer edit governs the overlay and settles it.
+ * - Any success closes the outstanding error toast.
+ * - Retry re-runs the ORIGINAL updater against the LIVE base (the current server /
+ *   pending value), never a stale whole-value snapshot — so it only re-applies that
+ *   one edit and can't clobber a config saved in the interim.
  */
 function useOptimisticSetting<T>(
   serverValue: T,
-  write: (next: T) => void,
+  write: (next: T) => Promise<boolean>,
+  options?: { readonly canCommit?: boolean; readonly failure?: WriteFailure },
 ): readonly [T, (updater: (current: T) => T) => void] {
+  const canCommit = options?.canCommit ?? true;
+  const failure = options?.failure;
   const [pending, setPending] = useState<T | null>(null);
   const pendingRef = useRef<T | null>(null);
   const lastWrittenRef = useRef<T | null>(null);
   const prevServerRef = useRef(serverValue);
   const serverRef = useRef(serverValue);
   serverRef.current = serverValue;
+  const errorToastRef = useRef<ToastId | null>(null);
+  const commitRef = useRef<(updater: (current: T) => T) => void>(() => {});
+
+  const closeErrorToast = useCallback(() => {
+    if (errorToastRef.current !== null) {
+      toastManager.close(errorToastRef.current);
+      errorToastRef.current = null;
+    }
+  }, []);
 
   if (prevServerRef.current !== serverValue) {
     prevServerRef.current = serverValue;
@@ -408,14 +505,54 @@ function useOptimisticSetting<T>(
 
   const commit = useCallback(
     (updater: (current: T) => T) => {
+      // Hydration gate: never derive a write from the empty pre-hydration snapshot —
+      // a whole-value replacement built on it would wipe the real server config.
+      if (!canCommit) return;
       const next = updater(pendingRef.current ?? serverRef.current);
       pendingRef.current = next;
       lastWrittenRef.current = next;
       setPending(next);
-      write(next);
+      void write(next).then((ok) => {
+        // Superseded = a newer edit landed while this write was in flight.
+        const superseded = lastWrittenRef.current !== next;
+        if (ok) {
+          // The write landed — clear any stale failure toast from a prior attempt.
+          if (!superseded) closeErrorToast();
+          return;
+        }
+        // A superseded failure is not an alarm: the newer edit governs the overlay
+        // and its own outcome settles it — so neither roll back nor toast.
+        if (superseded) return;
+        // Latest write failed: roll the overlay back to the server value (so it stops
+        // showing the unsaved value) and raise a single retryable toast. Retry re-runs
+        // THIS updater against the live base — see the hook doc.
+        lastWrittenRef.current = null;
+        pendingRef.current = null;
+        setPending(null);
+        if (failure !== undefined) {
+          closeErrorToast();
+          errorToastRef.current = toastManager.add(
+            stackedThreadToast({
+              type: "error",
+              title: failure.title,
+              description: failure.description,
+              data: {
+                hideCopyButton: true,
+                additionalActions: [
+                  {
+                    id: "feishu-settings-retry",
+                    props: { children: "重试", onClick: () => commitRef.current(updater) },
+                  },
+                ],
+              },
+            }),
+          );
+        }
+      });
     },
-    [write],
+    [write, canCommit, failure, closeErrorToast],
   );
+  commitRef.current = commit;
 
   return [pending ?? serverValue, commit];
 }
@@ -440,9 +577,11 @@ type DrawerTarget =
 function FeishuChatConfigSection({
   defaults,
   commitDefaults,
+  hydrated,
 }: {
   defaults: FeishuChatConfig;
   commitDefaults: CommitDefaults;
+  hydrated: boolean;
 }) {
   const environmentId = usePrimaryEnvironment()?.environmentId ?? null;
   const { data, error, isPending } = useEnvironmentQuery(
@@ -450,12 +589,15 @@ function FeishuChatConfigSection({
   );
 
   const serverConfigs = usePrimarySettings((s) => s.feishuChatConfigs) as FeishuChatConfigMap;
-  const update = useUpdatePrimarySettings();
+  const persist = usePersistSetting();
   const writeConfigs = useCallback(
-    (next: FeishuChatConfigMap) => update({ feishuChatConfigs: next }),
-    [update],
+    (next: FeishuChatConfigMap) => persist({ feishuChatConfigs: next }),
+    [persist],
   );
-  const [configs, commitConfigs] = useOptimisticSetting(serverConfigs, writeConfigs);
+  const [configs, commitConfigs] = useOptimisticSetting(serverConfigs, writeConfigs, {
+    canCommit: hydrated,
+    failure: CONFIGS_WRITE_FAILURE,
+  });
   const commitChat = useCallback(
     (chatId: string, updater: (config: FeishuChatConfig) => FeishuChatConfig) => {
       commitConfigs((current) => writeChatConfig(current, chatId, updater(current[chatId] ?? {})));
@@ -504,34 +646,48 @@ function FeishuChatConfigSection({
           persistent background and rows tint on hover, so their square corners would
           otherwise poke past the section's rounded (overflow-visible) border. */}
       <div className="overflow-hidden rounded-[calc(var(--radius-2xl)-1px)]">
-        <BaselineEntry defaults={defaults} onEdit={() => setDrawerTarget({ kind: "defaults" })} />
-
-        {environmentId === null ? (
-          <p className="border-t border-border/60 px-4 py-3 text-xs text-muted-foreground sm:px-5">
-            未连接环境。
-          </p>
-        ) : isPending ? (
-          <p className="border-t border-border/60 px-4 py-3 text-xs text-muted-foreground sm:px-5">
-            加载群列表…
-          </p>
-        ) : error ? (
-          <p className="border-t border-border/60 px-4 py-3 text-xs text-destructive sm:px-5">
-            群列表加载失败:{error}
-          </p>
-        ) : chats.length === 0 ? (
-          <p className="border-t border-border/60 px-4 py-3 text-xs text-muted-foreground sm:px-5">
-            暂无群聊。Bot 加入群聊后会自动同步到这里。
-          </p>
+        {!hydrated ? (
+          // Settings haven't arrived over the ws yet — the config shown would be the
+          // empty pre-hydration default, and editing it would write a whole-value
+          // replacement built on that placeholder (wiping real config). Hide the
+          // baseline + list (the only write entry points here) until the real state
+          // lands; the binding/private-chat sections are already gated by `binding`,
+          // which hydrates on the same push.
+          <p className="px-4 py-3 text-xs text-muted-foreground sm:px-5">正在同步服务器设置…</p>
         ) : (
-          chats.map((chat) => (
-            <ChatRestingRow
-              key={chat.chatId}
-              chat={chat}
-              effective={effectiveConfig(chat.chatId, configs, defaults)}
-              overridden={isChatOverridden(configs[chat.chatId])}
-              onOpen={() => setDrawerTarget({ kind: "chat", chatId: chat.chatId })}
+          <>
+            <BaselineEntry
+              defaults={defaults}
+              onEdit={() => setDrawerTarget({ kind: "defaults" })}
             />
-          ))
+
+            {environmentId === null ? (
+              <p className="border-t border-border/60 px-4 py-3 text-xs text-muted-foreground sm:px-5">
+                未连接环境。
+              </p>
+            ) : isPending ? (
+              <p className="border-t border-border/60 px-4 py-3 text-xs text-muted-foreground sm:px-5">
+                加载群列表…
+              </p>
+            ) : error ? (
+              <p className="border-t border-border/60 px-4 py-3 text-xs text-destructive sm:px-5">
+                群列表加载失败:{error}
+              </p>
+            ) : chats.length === 0 ? (
+              <p className="border-t border-border/60 px-4 py-3 text-xs text-muted-foreground sm:px-5">
+                暂无群聊。Bot 加入群聊后会自动同步到这里。
+              </p>
+            ) : (
+              chats.map((chat) => (
+                <ChatRestingRow
+                  key={chat.chatId}
+                  chat={chat}
+                  effective={effectiveConfig(chat.chatId, configs, defaults)}
+                  onOpen={() => setDrawerTarget({ kind: "chat", chatId: chat.chatId })}
+                />
+              ))
+            )}
+          </>
         )}
       </div>
 
@@ -545,6 +701,10 @@ function FeishuChatConfigSection({
           />
         ) : activeTarget?.kind === "chat" ? (
           <ChatConfigDrawer
+            // Key by chat so the accordion's open-dimension state resets when the
+            // drawer switches to a different chat (each chat opens fresh, not carrying
+            // the previous chat's expanded dimension).
+            key={activeTarget.chatId}
             chatId={activeTarget.chatId}
             chat={activeChat}
             config={configs[activeTarget.chatId]}
@@ -604,22 +764,88 @@ function BaselineEntry({ defaults, onEdit }: { defaults: FeishuChatConfig; onEdi
 }
 
 /**
- * One group's quiet resting-summary row (static blueprint). A clean chat reads a
- * muted "继承默认 · <mode>"; an overridden chat is marked with a small accent dot
- * and shows the dimensions it overrides. Clicking opens the detail drawer. The full
- * coverage fingerprint (per-dimension ○◐● + covered-dimension chips) is deferred.
+ * One coverage dot (○ / ◐ / ●), colored by the tier that supplies the dimension:
+ * `chat` = ● solid primary (本群覆盖), `default` = ◐ half primary (走默认), `builtin` =
+ * ○ empty ring (走内置). Purely decorative — the fingerprint carries the accessible
+ * label — so it is `aria-hidden`. Size comes from the caller (fingerprint vs chip).
+ */
+function CovDot({ source, className }: { source: ConfigSource; className?: string }) {
+  const base = "shrink-0 rounded-full border-[1.5px]";
+  if (source === "chat") {
+    return <span aria-hidden className={cn(base, "border-primary bg-primary", className)} />;
+  }
+  if (source === "default") {
+    return (
+      <span
+        aria-hidden
+        className={cn(base, "border-primary", className)}
+        // Half-fill (◐) — a linear-gradient split at 50% (no Tailwind utility for it).
+        style={{ background: "linear-gradient(90deg, var(--primary) 0 50%, transparent 50% 100%)" }}
+      />
+    );
+  }
+  return (
+    <span
+      aria-hidden
+      className={cn(base, "border-muted-foreground/55 bg-transparent", className)}
+    />
+  );
+}
+
+/**
+ * The list-row coverage fingerprint: one ○◐● dot per override-able dimension (审批 /
+ * 命令 / 工作区 / 密度), each colored by its source tier. A single glanceable read of
+ * which dimensions this chat overrides (●) versus inherits from the default (◐) or
+ * the built-in fallback (○). The per-dimension source names live in the title +
+ * aria-label so the dots need no individual labels.
+ */
+function CoverageFingerprint({ coverage }: { coverage: ReadonlyArray<DimensionCoverage> }) {
+  const label = coverage.map((dim) => `${dim.label} ${SOURCE_LABELS[dim.source]}`).join(" · ");
+  return (
+    <span className="inline-flex items-center gap-1" title={label} aria-label={`覆盖度:${label}`}>
+      {coverage.map((dim) => (
+        <CovDot key={dim.key} source={dim.source} className="size-3" />
+      ))}
+    </span>
+  );
+}
+
+/** A primary-tinted chip naming a dimension this chat overrides (本群覆盖). */
+function DimensionChip({ label }: { label: string }) {
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-full border border-primary/30 bg-primary/10 px-2 py-0.5 font-medium text-[11px] text-primary">
+      <CovDot source="chat" className="size-[9px] border-[1.25px]" />
+      {label}
+    </span>
+  );
+}
+
+/**
+ * One group's quiet resting-summary row. The decoration keys off whether the chat
+ * owns any of the FOUR fingerprint dimensions (审批 / 命令 / 工作区 / 密度) — NOT the
+ * broader `isChatOverridden`, so a chat whose only override is a dimension the
+ * fingerprint can't express (e.g. a paused-`toolPolicy` or a hand-edited
+ * approvers-without-mode entry) stays a quiet inherited row instead of rendering a
+ * misleading all-inherited fingerprint with zero chips ("looks changed, shows
+ * nothing"). A row that owns ≥1 fingerprint dimension is upgraded to the coverage
+ * fingerprint (per-dimension ○◐●) next to its name plus a chip per owned dimension,
+ * trailing the effective approval value; otherwise it stays the calm muted line
+ * "继承默认 · <mode>" (静息态干净). The fingerprint/chips reuse the SAME resolved
+ * `effective` (via `dimensionCoverage`) as the drawer — no second fallback (所见=所判).
+ * Clicking opens the detail drawer.
  */
 function ChatRestingRow({
   chat,
   effective,
-  overridden,
   onOpen,
 }: {
   chat: FeishuChatDirectoryEntry;
   effective: EffectiveConfig;
-  overridden: boolean;
   onOpen: () => void;
 }) {
+  const coverage = dimensionCoverage(effective);
+  const ownDimensions = coverage.filter((dim) => dim.source === "chat");
+  const hasOwnDimension = ownDimensions.length > 0;
   return (
     <button
       type="button"
@@ -628,9 +854,6 @@ function ChatRestingRow({
     >
       <div className="min-w-0 flex-1 space-y-1">
         <div className="flex items-center gap-2">
-          {overridden ? (
-            <span className="size-1.5 shrink-0 rounded-full bg-primary/70" aria-label="已覆盖" />
-          ) : null}
           <span className="truncate font-medium text-[13px] text-foreground">
             {chat.name || chat.chatId}
           </span>
@@ -639,15 +862,22 @@ function ChatRestingRow({
               话题
             </Badge>
           ) : null}
+          {hasOwnDimension ? <CoverageFingerprint coverage={coverage} /> : null}
         </div>
-        <p
-          className={cn(
-            "truncate text-xs",
-            overridden ? "text-muted-foreground/90" : "text-muted-foreground/70",
-          )}
-        >
-          {restingChatSummary(effective, overridden)}
-        </p>
+        {hasOwnDimension ? (
+          <div className="flex flex-wrap items-center gap-1.5">
+            {ownDimensions.map((dim) => (
+              <DimensionChip key={dim.key} label={dim.label} />
+            ))}
+            <span className="truncate text-[11px] text-muted-foreground/80">
+              {approvalSummary(effective.approvalMode.value, effective.approvers.value.length)}
+            </span>
+          </div>
+        ) : (
+          <p className="truncate text-xs text-muted-foreground/70">
+            {restingChatSummary(effective, false)}
+          </p>
+        )}
       </div>
       <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground/70" />
     </button>
@@ -749,12 +979,84 @@ function CopyIdButton({ value }: { value: string }) {
 }
 
 /**
+ * One collapsible dimension row in the chat drawer's accordion grid (任一时刻只展开
+ * 一维). The header shows the dimension name, its `[本群]/[默认]/[内置]` source tier, and
+ * a compact effective summary; a ⟲ reset-to-inherit control appears ONLY when the
+ * chat owns this dimension (`source === "chat"` → there is an override to clear), and
+ * the chevron toggles the editor body. The header and chevron both toggle the row.
+ */
+function DimensionRow({
+  title,
+  summary,
+  source,
+  expanded,
+  onToggle,
+  onReset,
+  children,
+}: {
+  title: string;
+  summary: string;
+  source: ConfigSource;
+  expanded: boolean;
+  onToggle: () => void;
+  onReset: (() => void) | undefined;
+  children: ReactNode;
+}) {
+  return (
+    <div className={cn("border-t border-border/60 first:border-t-0", expanded && "bg-muted/30")}>
+      <div className="flex items-center gap-1.5 px-3 py-2.5 sm:px-4">
+        <button
+          type="button"
+          onClick={onToggle}
+          aria-expanded={expanded}
+          className="flex min-w-0 flex-1 items-center gap-2 rounded-sm text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+        >
+          <div className="min-w-0 flex-1 space-y-0.5">
+            <div className="flex items-center gap-2">
+              <span className="font-medium text-foreground/90 text-xs">{title}</span>
+              <SourceBadge source={source} />
+            </div>
+            <p className="truncate text-[11px] text-muted-foreground/80">{summary}</p>
+          </div>
+        </button>
+        {onReset ? (
+          <Button
+            size="icon-xs"
+            variant="ghost"
+            aria-label={`${title}:重置为继承默认`}
+            title="重置为继承默认"
+            onClick={onReset}
+            className="shrink-0 text-muted-foreground hover:text-foreground"
+          >
+            <RotateCcwIcon className="size-3.5" />
+          </Button>
+        ) : null}
+        <Button
+          size="icon-xs"
+          variant="ghost"
+          aria-label={expanded ? `折叠 ${title}` : `展开 ${title}`}
+          onClick={onToggle}
+          className="shrink-0 text-muted-foreground"
+        >
+          <ChevronDownIcon
+            className={cn("size-4 transition-transform", expanded && "rotate-180")}
+          />
+        </Button>
+      </div>
+      {expanded ? <div className="px-3 pb-3 sm:px-4">{children}</div> : null}
+    </div>
+  );
+}
+
+/**
  * Drawer body for a single group override. Renders the effective-preview card
- * (resolved "what the bot enforces" via the shared `effectiveConfig`) above the
- * five dimension editors (approval / approvers / commands / workspaces / density) —
- * flat (the collapse-one-at-a-time grid is deferred). All config values are read
- * LIVE from the section's optimistic overlay via props, so a hard refresh mid-edit
- * never freezes a stale snapshot into the drawer.
+ * (resolved "what the bot enforces" via the shared `effectiveConfig`) above a
+ * collapse-one-at-a-time accordion grid of the four override-able dimensions (审批 /
+ * 命令 / 工作区 / 密度), each carrying its `[本群]/[默认]/[内置]` source tier and a
+ * ⟲ reset-to-inherit control when the chat owns it. All config values are read LIVE
+ * from the section's optimistic overlay via props, so a hard refresh mid-edit never
+ * freezes a stale snapshot into the drawer; the accordion's open-dimension state is
+ * ephemeral view state (reset per chat by the `key` at the call site).
  */
 function ChatConfigDrawer({
   chatId,
@@ -778,6 +1080,14 @@ function ChatConfigDrawer({
   const name = chat?.name || chatId;
   const memberCount = chat ? (chat.memberCount ?? chat.members.length) : undefined;
   const mode = chatModeSelection(config);
+
+  // Which dimension is expanded (任一时刻只展开一维). Defaults to 审批 — the primary
+  // security dimension — so opening a chat lands on the most consequential editor.
+  const [expanded, setExpanded] = useState<DimensionKey | null>("approval");
+  const toggle = useCallback(
+    (key: DimensionKey) => setExpanded((current) => (current === key ? null : key)),
+    [],
+  );
 
   return (
     <DrawerShell
@@ -805,48 +1115,101 @@ function ChatConfigDrawer({
     >
       <EffectivePreviewCard effective={effective} members={chat?.members ?? []} />
 
-      <div className="space-y-3">
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-          <div className="min-w-0">
-            <p className="font-medium text-foreground/90 text-xs">审批模式</p>
-            <p className="text-[11px] text-muted-foreground/80">谁可以点击审批卡片放行。</p>
+      <div className="overflow-hidden rounded-lg border border-border/60">
+        <DimensionRow
+          title="审批"
+          source={effective.approvalMode.source}
+          summary={approvalSummary(effective.approvalMode.value, effective.approvers.value.length)}
+          expanded={expanded === "approval"}
+          onToggle={() => toggle("approval")}
+          onReset={
+            effective.approvalMode.source === "chat"
+              ? () => onCommit((current) => setConfigApprovalMode(current, INHERIT_MODE))
+              : undefined
+          }
+        >
+          <div className="space-y-2">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <p className="text-[11px] text-muted-foreground/80">谁可以点击审批卡片放行。</p>
+              <ModeSelect
+                value={mode}
+                includeInherit
+                ariaLabel={`${name} 审批模式`}
+                onChange={(selection) =>
+                  onCommit((current) => setConfigApprovalMode(current, selection))
+                }
+              />
+            </div>
+            {mode === "designated" ? (
+              <ApproversEditor
+                approvers={config?.approvers ?? []}
+                members={chat?.members ?? []}
+                idPrefix={`feishu-chat-${chatId}`}
+                onToggle={(openId) => onCommit((current) => toggleConfigApprover(current, openId))}
+              />
+            ) : null}
           </div>
-          <ModeSelect
-            value={mode}
+        </DimensionRow>
+
+        <DimensionRow
+          title="命令"
+          source={effective.commands.source}
+          summary={commandsSummary(effective.commands.value)}
+          expanded={expanded === "commands"}
+          onToggle={() => toggle("commands")}
+          onReset={
+            effective.commands.source === "chat"
+              ? () => onCommit((current) => setConfigCommands(current, undefined))
+              : undefined
+          }
+        >
+          <CommandsEditor
+            commands={config?.commands}
+            offHint={describeInheritedCommands(defaults.commands)}
+            onChange={onCommit}
+          />
+        </DimensionRow>
+
+        <DimensionRow
+          title="工作区"
+          source={effective.workspaces.source}
+          summary={workspacesSummary(effective.workspaces.value)}
+          expanded={expanded === "workspaces"}
+          onToggle={() => toggle("workspaces")}
+          onReset={
+            effective.workspaces.source === "chat"
+              ? () => onCommit((current) => setConfigWorkspaces(current, undefined))
+              : undefined
+          }
+        >
+          <WorkspacesEditor
+            workspaces={config?.workspaces}
+            projects={projects}
+            offHint={describeInheritedWorkspaces(defaults.workspaces)}
+            onChange={onCommit}
+          />
+        </DimensionRow>
+
+        <DimensionRow
+          title="密度"
+          source={effective.density.source}
+          summary={DENSITY_LABELS[effective.density.value]}
+          expanded={expanded === "density"}
+          onToggle={() => toggle("density")}
+          onReset={
+            effective.density.source === "chat"
+              ? () => onCommit((current) => setConfigDensity(current, undefined))
+              : undefined
+          }
+        >
+          <DensityDimension
+            description="卡片信息量;低密度更适合高频刷屏的群。"
+            value={config?.density}
             includeInherit
-            ariaLabel={`${name} 审批模式`}
-            onChange={(selection) =>
-              onCommit((current) => setConfigApprovalMode(current, selection))
-            }
+            ariaLabel={`${name} 消息密度`}
+            onChange={(density) => onCommit((current) => setConfigDensity(current, density))}
           />
-        </div>
-        {mode === "designated" ? (
-          <ApproversEditor
-            approvers={config?.approvers ?? []}
-            members={chat?.members ?? []}
-            idPrefix={`feishu-chat-${chatId}`}
-            onToggle={(openId) => onCommit((current) => toggleConfigApprover(current, openId))}
-          />
-        ) : null}
-        <CommandsEditor
-          commands={config?.commands}
-          offHint={describeInheritedCommands(defaults.commands)}
-          onChange={onCommit}
-        />
-        <WorkspacesEditor
-          workspaces={config?.workspaces}
-          projects={projects}
-          offHint={describeInheritedWorkspaces(defaults.workspaces)}
-          onChange={onCommit}
-        />
-        <DensityDimension
-          title="消息密度"
-          description="卡片信息量;低密度更适合高频刷屏的群。"
-          value={config?.density}
-          includeInherit
-          ariaLabel={`${name} 消息密度`}
-          onChange={(density) => onCommit((current) => setConfigDensity(current, density))}
-        />
+        </DimensionRow>
       </div>
     </DrawerShell>
   );
