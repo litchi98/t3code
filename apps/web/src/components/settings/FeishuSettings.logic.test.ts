@@ -8,6 +8,7 @@ import {
   defaultsSummary,
   describeInheritedCommands,
   describeInheritedWorkspaces,
+  dimensionCoverage,
   effectiveConfig,
   isChatConfigEmpty,
   isChatOverridden,
@@ -433,6 +434,49 @@ describe("effectiveConfig — field-level fallback mirrors the bot (所见=所�
     const eff = effectiveConfig(CHAT, { [CHAT]: { commands: [] } }, { commands: ["/status"] });
     // empty own list wins over the non-empty default (bot enforces "only floor")
     expect(eff.commands).toEqual({ value: [], source: "chat" });
+  });
+});
+
+describe("dimensionCoverage — list-row fingerprint tiers (所见=所判)", () => {
+  it("lists the four dimensions in display order (审批 / 命令 / 工作区 / 密度)", () => {
+    expect(dimensionCoverage(effectiveConfig(CHAT, {}, {})).map((dim) => dim.label)).toEqual([
+      "审批",
+      "命令",
+      "工作区",
+      "密度",
+    ]);
+  });
+
+  it("tags each dimension with its resolved source (chat / default / builtin)", () => {
+    // approval overridden by the chat → chat; commands set at the default → default;
+    // workspaces set nowhere → builtin; density set at the default → default.
+    const eff = effectiveConfig(
+      CHAT,
+      { [CHAT]: { approvalMode: "all" } },
+      { commands: ["/status"], density: "text" },
+    );
+    expect(dimensionCoverage(eff)).toEqual([
+      { key: "approval", label: "审批", source: "chat" },
+      { key: "commands", label: "命令", source: "default" },
+      { key: "workspaces", label: "工作区", source: "builtin" },
+      { key: "density", label: "密度", source: "default" },
+    ]);
+  });
+
+  it("reuses effectiveConfig's source — approvers ride the approval dimension", () => {
+    // A designated per-chat entry owns approvalMode AND approvers, so the single
+    // approval dot faithfully covers both (source chat).
+    const eff = effectiveConfig(
+      CHAT,
+      { [CHAT]: { approvalMode: "designated", approvers: [] } },
+      {},
+    );
+    expect(dimensionCoverage(eff)[0]).toEqual({ key: "approval", label: "审批", source: "chat" });
+  });
+
+  it("marks every dimension inherited for a clean chat (no chat-sourced dots)", () => {
+    const eff = effectiveConfig(CHAT, {}, { approvalMode: "all" });
+    expect(dimensionCoverage(eff).some((dim) => dim.source === "chat")).toBe(false);
   });
 });
 

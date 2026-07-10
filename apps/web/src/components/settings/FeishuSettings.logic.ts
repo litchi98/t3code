@@ -411,6 +411,34 @@ export const effectiveConfig = (
 export const isChatOverridden = (config: FeishuChatConfig | undefined): boolean =>
   config !== undefined && !isChatConfigEmpty(config);
 
+/** The four override-able dimensions of a chat's coverage fingerprint. */
+export type DimensionKey = "approval" | "commands" | "workspaces" | "density";
+
+/** One dimension's coverage: its label + which tier supplies the effective value. */
+export interface DimensionCoverage {
+  readonly key: DimensionKey;
+  readonly label: string;
+  readonly source: ConfigSource;
+}
+
+/**
+ * Per-dimension coverage fingerprint for a chat's list row: the four override-able
+ * dimensions (审批 / 命令 / 工作区 / 密度) in display order, each tagged with the tier
+ * that supplies its effective value — `chat` (本群覆盖), `default` (走默认), or
+ * `builtin` (走内置). Reuses the SAME resolved `EffectiveConfig` the drawer and the
+ * effective-preview card consume, so the fingerprint never re-derives a second
+ * fallback (所见=所判). `approvers` rides the `approval` dimension: they always share a
+ * source because `normalizeConfig` keeps `approvers` present iff the chat owns
+ * `approvalMode` (a chat with `approvalMode` inherited never carries its own
+ * approvers), so the approval dot faithfully covers both.
+ */
+export const dimensionCoverage = (effective: EffectiveConfig): ReadonlyArray<DimensionCoverage> => [
+  { key: "approval", label: "审批", source: effective.approvalMode.source },
+  { key: "commands", label: "命令", source: effective.commands.source },
+  { key: "workspaces", label: "工作区", source: effective.workspaces.source },
+  { key: "density", label: "密度", source: effective.density.source },
+];
+
 /** Compact label for an effective approval mode (with approver count when designated). */
 export const approvalSummary = (mode: ApprovalMode, approverCount: number): string =>
   mode === "designated"
