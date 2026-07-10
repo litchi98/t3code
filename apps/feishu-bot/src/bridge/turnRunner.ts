@@ -35,7 +35,7 @@ import { runtimeModeForChatType, splitChatKey } from "./chatThreadMap.ts";
 import { OfflineRetry, turnRejectedNoticeText } from "./createIntent.ts";
 import { type RenderDensity, renderThreadCard } from "./eventRenderer.ts";
 import { collectUploadedAttachments } from "./imageAttachments.ts";
-import { topicSendOpts } from "./notices.ts";
+import { turnReplySendOpts } from "./notices.ts";
 import type { OutboundQueue } from "./outbound.ts";
 import { REACTION_RUNNING, terminalReactionEmoji } from "./reactionState.ts";
 import { observeThread, type ThreadObservation } from "./session.ts";
@@ -381,11 +381,14 @@ export const makeTurnRunner = (deps: TurnRunnerDeps): Effect.Effect<TurnRunnerHa
             density: placeholderDensity,
           }).card;
 
-          // M3a: real Feishu chatId + (topic-only) in-thread reply opts. driveTurn
-          // anchors to THIS turn's triggering message (`replyToMessageId`) — its
-          // freshest in-topic message — not the binding anchor (red line: unchanged).
+          // M3a: real Feishu chatId + reply opts. driveTurn anchors to THIS turn's
+          // triggering message (`replyToMessageId`) — its freshest in-topic message —
+          // not the binding anchor (red line: unchanged). Group/topic keep the
+          // in-thread reply (`replyInThread: true`); p2p now posts a *plain* reply
+          // (`{ replyTo }`) so the card quotes the triggering message (飞书「回复」)
+          // instead of a bare send — the only behavioural change from `topicSendOpts`.
           const { chatId: realChatId, larkThreadId } = splitChatKey(chatId);
-          const sendOpts = topicSendOpts(larkThreadId, replyToMessageId);
+          const sendOpts = turnReplySendOpts(larkThreadId, replyToMessageId);
           const card = yield* gateway
             .startStreamingCard(realChatId, initial, { done: Deferred.await(cardDone) }, sendOpts)
             .pipe(
@@ -630,10 +633,10 @@ export const makeTurnRunner = (deps: TurnRunnerDeps): Effect.Effect<TurnRunnerHa
             }
 
             // M3a: pass the *real* triggering Feishu message id (not the commandId
-            // fallback `triggerMessageId` uses for the offline receipt) as the topic
-            // reply anchor — `topicSendOpts` only emits in-thread send opts when this
-            // is a genuine message id, so a flush/replay with no live source posts at
-            // the root instead of replying to a non-message id.
+            // fallback `triggerMessageId` uses for the offline receipt) as the reply
+            // anchor — `turnReplySendOpts` only emits reply opts when this is a genuine
+            // message id, so a flush/replay with no live source posts at the root
+            // instead of replying to a non-message id.
             //
             // Fix 1(a): also pin this turn's *initiator* (the sender of the first
             // source message) as the live card's operator override, so the approval
