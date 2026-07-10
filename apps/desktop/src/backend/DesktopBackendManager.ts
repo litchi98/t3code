@@ -21,6 +21,7 @@ import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawne
 import {
   DesktopBackendBootstrap,
   type DesktopBackendBootstrap as DesktopBackendBootstrapValue,
+  DESKTOP_BACKEND_TERMINATE_GRACE,
 } from "@t3tools/contracts";
 
 import * as DesktopBackendConfiguration from "./DesktopBackendConfiguration.ts";
@@ -33,7 +34,6 @@ const MAX_RESTART_DELAY = Duration.seconds(10);
 const DEFAULT_BACKEND_READINESS_TIMEOUT = Duration.minutes(1);
 const DEFAULT_BACKEND_READINESS_INTERVAL = Duration.millis(100);
 const DEFAULT_BACKEND_READINESS_REQUEST_TIMEOUT = Duration.seconds(1);
-const DEFAULT_BACKEND_TERMINATE_GRACE = Duration.seconds(2);
 const BACKEND_READINESS_PATH = "/.well-known/t3/environment";
 
 type BackendProcessLayerServices = ChildProcessSpawner.ChildProcessSpawner | HttpClient.HttpClient;
@@ -358,7 +358,7 @@ export const runBackendProcess = Effect.fn("runBackendProcess")(function* (
       stdout: options.captureOutput ? "pipe" : "inherit",
       stderr: options.captureOutput ? "pipe" : "inherit",
       killSignal: "SIGTERM",
-      forceKillAfter: DEFAULT_BACKEND_TERMINATE_GRACE,
+      forceKillAfter: DESKTOP_BACKEND_TERMINATE_GRACE,
       additionalFds: {
         fd3: {
           type: "input",

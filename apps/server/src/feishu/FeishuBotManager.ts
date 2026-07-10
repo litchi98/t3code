@@ -40,7 +40,7 @@
  *
  * @module FeishuBotManager
  */
-import { AuthStandardClientScopes } from "@t3tools/contracts";
+import { AuthStandardClientScopes, SERVER_BOT_TERMINATE_GRACE } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
@@ -63,8 +63,6 @@ import * as PairingGrantStore from "../auth/PairingGrantStore.ts";
 
 const INITIAL_RESTART_DELAY = Duration.millis(500);
 const MAX_RESTART_DELAY = Duration.seconds(10);
-/** Grace period after SIGTERM before the child is force-killed on teardown. */
-const BOT_TERMINATE_GRACE = Duration.seconds(5);
 /**
  * How long the child must survive after spawn before we treat it as "ready"
  * and reset the restart backoff. A bot that dies inside this window is counted
@@ -395,7 +393,7 @@ const runBotProcess = Effect.fn("feishu.botManager.runBotProcess")(function* (
     stdout: "inherit",
     stderr: "inherit",
     killSignal: "SIGTERM",
-    forceKillAfter: BOT_TERMINATE_GRACE,
+    forceKillAfter: SERVER_BOT_TERMINATE_GRACE,
   });
 
   const handle = yield* spawner.spawn(command).pipe(
